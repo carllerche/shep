@@ -7,34 +7,10 @@ use std::sync::Arc;
 
 use bytes::{BufMut, Bytes, BytesMut};
 
-use crate::{Decode, DecodeError, Encode};
+use crate::{Decode, DecodeError, Decoder, Encode};
 
 /// Size of a length prefix.
 const LEN_SIZE: usize = 4;
-
-/// Splits the next `n` bytes off `buf` without copying.
-fn take(buf: &mut Bytes, n: usize) -> Result<Bytes, DecodeError> {
-    ensure(buf, n)?;
-    Ok(buf.split_to(n))
-}
-
-fn ensure(buf: &Bytes, n: usize) -> Result<(), DecodeError> {
-    if buf.len() < n {
-        return Err(DecodeError::UnexpectedEnd {
-            needed: n,
-            remaining: buf.len(),
-        });
-    }
-    Ok(())
-}
-
-fn take_array<const N: usize>(buf: &mut Bytes) -> Result<[u8; N], DecodeError> {
-    ensure(buf, N)?;
-    let mut out = [0; N];
-    out.copy_from_slice(&buf[..N]);
-    bytes::Buf::advance(buf, N);
-    Ok(out)
-}
 
 fn put_len(buf: &mut BytesMut, len: usize) {
     let len = u32::try_from(len).expect("shep-codec: length exceeds u32::MAX");
@@ -47,16 +23,22 @@ fn put_bytes(buf: &mut BytesMut, bytes: &[u8]) {
     buf.extend_from_slice(bytes);
 }
 
-fn get_len(buf: &mut Bytes) -> Result<usize, DecodeError> {
-    Ok(u32::decode(buf)? as usize)
+fn get_len(d: &mut Decoder) -> Result<usize, DecodeError> {
+    Ok(u32::decode(d)? as usize)
 }
 
-/// Capacity to reserve for `len` elements of `T` with `remaining` input bytes
-/// left. A hostile prefix can claim up to `u32::MAX` elements, so reserve no
-/// more memory than the remaining input occupies; growth past that is paid for
-/// by input actually consumed.
-fn cautious_capacity<T>(len: usize, remaining: usize) -> usize {
-    len.min(remaining / size_of::<T>().max(1))
+/// What one element of `T` in a collection is charged: its size, and at
+/// least a byte, so elements that encode to nothing still use up the budget.
+fn element_cost<T>() -> usize {
+    size_of::<T>().max(1)
+}
+
+/// Capacity to reserve for `len` elements of `T`. A hostile prefix can claim
+/// up to `u32::MAX` elements, so reserve no more memory than the remaining
+/// input occupies or the budget allows; growth past that is paid for by
+/// input actually consumed, and charged element by element.
+fn cautious_capacity<T>(len: usize, d: &Decoder) -> usize {
+    len.min(d.remaining().min(d.budget()) / element_cost::<T>())
 }
 
 macro_rules! scalar {
@@ -72,8 +54,8 @@ macro_rules! scalar {
         }
 
         impl Decode for $t {
-            fn decode(buf: &mut Bytes) -> Result<Self, DecodeError> {
-                Ok(<$t>::from_le_bytes(take_array(buf)?))
+            fn decode(d: &mut Decoder) -> Result<Self, DecodeError> {
+                Ok(<$t>::from_le_bytes(d.take_array()?))
             }
         }
     )*};
@@ -94,8 +76,8 @@ impl Encode for bool {
 /// Unlike Redpanda, which reads any nonzero byte as `true`, only 0 and 1 are
 /// accepted, so every value has exactly one encoding.
 impl Decode for bool {
-    fn decode(buf: &mut Bytes) -> Result<Self, DecodeError> {
-        match u8::decode(buf)? {
+    fn decode(d: &mut Decoder) -> Result<Self, DecodeError> {
+        match u8::decode(d)? {
             0 => Ok(false),
             1 => Ok(true),
             other => Err(DecodeError::InvalidBool(other)),
@@ -124,10 +106,11 @@ impl Encode for String {
 }
 
 impl Decode for String {
-    fn decode(buf: &mut Bytes) -> Result<Self, DecodeError> {
-        let len = get_len(buf)?;
-        let bytes = take(buf, len)?;
+    fn decode(d: &mut Decoder) -> Result<Self, DecodeError> {
+        let len = get_len(d)?;
+        let bytes = d.take(len)?;
         let s = std::str::from_utf8(&bytes).map_err(|_| DecodeError::InvalidUtf8)?;
+        d.charge(len)?;
         Ok(s.to_owned())
     }
 }
@@ -142,11 +125,11 @@ impl Encode for Bytes {
     }
 }
 
-/// Zero-copy: the result shares the input's buffer.
+/// Zero-copy: the result shares the input's buffer, so it costs no budget.
 impl Decode for Bytes {
-    fn decode(buf: &mut Bytes) -> Result<Self, DecodeError> {
-        let len = get_len(buf)?;
-        take(buf, len)
+    fn decode(d: &mut Decoder) -> Result<Self, DecodeError> {
+        let len = get_len(d)?;
+        d.take(len)
     }
 }
 
@@ -174,11 +157,12 @@ impl<T: Encode> Encode for Vec<T> {
 }
 
 impl<T: Decode> Decode for Vec<T> {
-    fn decode(buf: &mut Bytes) -> Result<Self, DecodeError> {
-        let len = get_len(buf)?;
-        let mut out = Vec::with_capacity(cautious_capacity::<T>(len, buf.len()));
+    fn decode(d: &mut Decoder) -> Result<Self, DecodeError> {
+        let len = get_len(d)?;
+        let mut out = Vec::with_capacity(cautious_capacity::<T>(len, d));
         for _ in 0..len {
-            out.push(T::decode(buf)?);
+            d.charge(element_cost::<T>())?;
+            out.push(T::decode(d)?);
         }
         Ok(out)
     }
@@ -197,10 +181,10 @@ impl<T: Encode, const N: usize> Encode for [T; N] {
 }
 
 impl<T: Decode, const N: usize> Decode for [T; N] {
-    fn decode(buf: &mut Bytes) -> Result<Self, DecodeError> {
+    fn decode(d: &mut Decoder) -> Result<Self, DecodeError> {
         let mut items = Vec::with_capacity(N);
         for _ in 0..N {
-            items.push(T::decode(buf)?);
+            items.push(T::decode(d)?);
         }
         match items.try_into() {
             Ok(array) => Ok(array),
@@ -226,9 +210,9 @@ impl<T: Encode> Encode for Option<T> {
 }
 
 impl<T: Decode> Decode for Option<T> {
-    fn decode(buf: &mut Bytes) -> Result<Self, DecodeError> {
-        if bool::decode(buf)? {
-            Ok(Some(T::decode(buf)?))
+    fn decode(d: &mut Decoder) -> Result<Self, DecodeError> {
+        if bool::decode(d)? {
+            Ok(Some(T::decode(d)?))
         } else {
             Ok(None)
         }
@@ -256,8 +240,9 @@ impl<T: Encode + ?Sized> Encode for Box<T> {
 }
 
 impl<T: Decode> Decode for Box<T> {
-    fn decode(buf: &mut Bytes) -> Result<Self, DecodeError> {
-        T::decode(buf).map(Box::new)
+    fn decode(d: &mut Decoder) -> Result<Self, DecodeError> {
+        d.charge(size_of::<T>())?;
+        T::decode(d).map(Box::new)
     }
 }
 
@@ -272,8 +257,10 @@ impl<T: Encode + ?Sized> Encode for Arc<T> {
 }
 
 impl<T: Decode> Decode for Arc<T> {
-    fn decode(buf: &mut Bytes) -> Result<Self, DecodeError> {
-        T::decode(buf).map(Arc::new)
+    fn decode(d: &mut Decoder) -> Result<Self, DecodeError> {
+        // The value and the two reference counts.
+        d.charge(size_of::<T>() + 2 * size_of::<usize>())?;
+        T::decode(d).map(Arc::new)
     }
 }
 
@@ -294,8 +281,8 @@ macro_rules! tuple {
         }
 
         impl<$($name: Decode),+> Decode for ($($name,)+) {
-            fn decode(buf: &mut Bytes) -> Result<Self, DecodeError> {
-                Ok(($($name::decode(buf)?,)+))
+            fn decode(d: &mut Decoder) -> Result<Self, DecodeError> {
+                Ok(($($name::decode(d)?,)+))
             }
         }
     };
@@ -374,12 +361,13 @@ impl<K: Encode, V: Encode> Encode for BTreeMap<K, V> {
 /// A key repeated in the input is an error rather than silently dropping one
 /// of the values.
 impl<K: Decode + Ord, V: Decode> Decode for BTreeMap<K, V> {
-    fn decode(buf: &mut Bytes) -> Result<Self, DecodeError> {
-        let len = get_len(buf)?;
+    fn decode(d: &mut Decoder) -> Result<Self, DecodeError> {
+        let len = get_len(d)?;
         let mut out = BTreeMap::new();
         for _ in 0..len {
-            let k = K::decode(buf)?;
-            let v = V::decode(buf)?;
+            d.charge(element_cost::<(K, V)>())?;
+            let k = K::decode(d)?;
+            let v = V::decode(d)?;
             if out.insert(k, v).is_some() {
                 return Err(duplicate::<Self>());
             }
@@ -399,11 +387,12 @@ impl<T: Encode> Encode for BTreeSet<T> {
 }
 
 impl<T: Decode + Ord> Decode for BTreeSet<T> {
-    fn decode(buf: &mut Bytes) -> Result<Self, DecodeError> {
-        let len = get_len(buf)?;
+    fn decode(d: &mut Decoder) -> Result<Self, DecodeError> {
+        let len = get_len(d)?;
         let mut out = BTreeSet::new();
         for _ in 0..len {
-            if !out.insert(T::decode(buf)?) {
+            d.charge(element_cost::<T>())?;
+            if !out.insert(T::decode(d)?) {
                 return Err(duplicate::<Self>());
             }
         }
@@ -429,13 +418,14 @@ where
     V: Decode,
     S: BuildHasher + Default,
 {
-    fn decode(buf: &mut Bytes) -> Result<Self, DecodeError> {
-        let len = get_len(buf)?;
-        let capacity = cautious_capacity::<(K, V)>(len, buf.len());
+    fn decode(d: &mut Decoder) -> Result<Self, DecodeError> {
+        let len = get_len(d)?;
+        let capacity = cautious_capacity::<(K, V)>(len, d);
         let mut out = HashMap::with_capacity_and_hasher(capacity, S::default());
         for _ in 0..len {
-            let k = K::decode(buf)?;
-            let v = V::decode(buf)?;
+            d.charge(element_cost::<(K, V)>())?;
+            let k = K::decode(d)?;
+            let v = V::decode(d)?;
             if out.insert(k, v).is_some() {
                 return Err(duplicate::<Self>());
             }
@@ -461,12 +451,13 @@ where
     T: Decode + Eq + Hash,
     S: BuildHasher + Default,
 {
-    fn decode(buf: &mut Bytes) -> Result<Self, DecodeError> {
-        let len = get_len(buf)?;
-        let capacity = cautious_capacity::<T>(len, buf.len());
+    fn decode(d: &mut Decoder) -> Result<Self, DecodeError> {
+        let len = get_len(d)?;
+        let capacity = cautious_capacity::<T>(len, d);
         let mut out = HashSet::with_capacity_and_hasher(capacity, S::default());
         for _ in 0..len {
-            if !out.insert(T::decode(buf)?) {
+            d.charge(element_cost::<T>())?;
+            if !out.insert(T::decode(d)?) {
                 return Err(duplicate::<Self>());
             }
         }

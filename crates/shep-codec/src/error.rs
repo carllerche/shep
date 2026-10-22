@@ -43,6 +43,11 @@ pub enum DecodeError {
     #[error("duplicate entry in {type_name}")]
     DuplicateEntry { type_name: &'static str },
 
+    /// Decoding would allocate more than the decoder's
+    /// [`Limits::max_memory`](crate::Limits::max_memory).
+    #[error("decoding exceeds the memory limit of {limit} bytes")]
+    LimitExceeded { limit: usize },
+
     /// Derived types were nested deeper than [`MAX_DEPTH`](crate::MAX_DEPTH).
     #[error("nesting exceeds the maximum depth")]
     TooDeep,

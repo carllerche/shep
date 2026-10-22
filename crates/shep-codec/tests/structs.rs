@@ -6,7 +6,7 @@ mod support;
 use std::collections::BTreeMap;
 
 use bytes::{Bytes, BytesMut};
-use shep_codec::{Decode, DecodeError, Encode, from_bytes, to_bytes};
+use shep_codec::{Decode, DecodeError, Decoder, Encode, from_bytes, to_bytes};
 use support::{decode, reencode, round_trip};
 
 // The test_msg* family from redpanda/src/v/serde/test/serde_test.cc.
@@ -579,8 +579,8 @@ fn custom_impls_compose() {
     }
 
     impl Decode for Plus2 {
-        fn decode(buf: &mut Bytes) -> Result<Self, DecodeError> {
-            let v = u32::decode(buf)?;
+        fn decode(d: &mut Decoder) -> Result<Self, DecodeError> {
+            let v = u32::decode(d)?;
             if v == 0 {
                 return Err(DecodeError::Custom("zero".into()));
             }

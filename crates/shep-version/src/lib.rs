@@ -243,8 +243,8 @@ impl Encode for Dvv {
 }
 
 impl Decode for Dvv {
-    fn decode(buf: &mut bytes::Bytes) -> Result<Dvv, DecodeError> {
-        let parts = Vec::<WirePart>::decode(buf)?;
+    fn decode(d: &mut shep_codec::Decoder) -> Result<Dvv, DecodeError> {
+        let parts = Vec::<WirePart>::decode(d)?;
         let mut v = Dvv::new();
         for p in parts {
             v.raise_prefix(p.partition, p.prefix);

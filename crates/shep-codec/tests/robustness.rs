@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, HashSet};
 use bytes::Bytes;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
-use shep_codec::{Decode, DecodeError, Encode, MAX_DEPTH, from_bytes, to_bytes};
+use shep_codec::{Decode, DecodeError, Decoder, Encode, MAX_DEPTH, from_bytes, to_bytes};
 use support::round_trip;
 
 #[derive(Encode, Decode, Debug, Clone, PartialEq)]
@@ -209,8 +209,7 @@ fn every_truncation_of_a_large_value_fails_cleanly() {
     let mut bytes = to_bytes(&value);
     while !bytes.is_empty() {
         bytes = bytes.slice(..bytes.len() - 1);
-        let mut buf = bytes.clone();
-        assert!(Record::decode(&mut buf).is_err());
+        assert!(Record::decode(&mut Decoder::new(bytes.clone())).is_err());
     }
     assert_eq!(value.encoded_len(), to_bytes(&value).len());
 }

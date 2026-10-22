@@ -3,7 +3,7 @@
 use std::fmt::Debug;
 
 use bytes::{Bytes, BytesMut};
-use shep_codec::{Decode, DecodeError, Encode, from_bytes, to_bytes};
+use shep_codec::{Decode, DecodeError, Decoder, Encode, from_bytes, to_bytes};
 
 /// Encodes `value`, checks the invariants every encoding must satisfy, and
 /// returns the bytes:
@@ -23,9 +23,9 @@ where
 
     let mut followed = BytesMut::from(&bytes[..]);
     followed.extend_from_slice(b"rest");
-    let mut followed = followed.freeze();
-    assert_eq!(&T::decode(&mut followed).unwrap(), value);
-    assert_eq!(&followed[..], b"rest");
+    let mut d = Decoder::new(followed.freeze());
+    assert_eq!(&T::decode(&mut d).unwrap(), value);
+    assert_eq!(&d.rest()[..], b"rest");
 
     assert_prefixes_fail::<T>(&bytes);
     bytes

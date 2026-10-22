@@ -1014,6 +1014,7 @@ name = "shep-codec"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "hegeltest",
  "rand 0.9.5",
  "shep-codec-derive",
  "thiserror",

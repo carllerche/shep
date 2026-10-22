@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use bytes::Bytes;
-use shep_codec::{Decode, DecodeError, from_bytes, to_bytes};
+use shep_codec::{Decode, DecodeError, Decoder, from_bytes, to_bytes};
 use support::{decode, reencode, round_trip};
 
 #[test]
@@ -282,7 +282,7 @@ fn truncation_reports_what_was_needed() {
 fn from_bytes_rejects_trailing_bytes() {
     assert_eq!(decode::<u8>(&[1, 2, 3]), Err(DecodeError::TrailingBytes(2)));
     // `decode` itself stops after one value.
-    let mut buf = Bytes::from_static(&[1, 2, 3]);
-    assert_eq!(u8::decode(&mut buf), Ok(1));
-    assert_eq!(&buf[..], [2, 3]);
+    let mut d = Decoder::new(Bytes::from_static(&[1, 2, 3]));
+    assert_eq!(u8::decode(&mut d), Ok(1));
+    assert_eq!(&d.rest()[..], [2, 3]);
 }

@@ -279,24 +279,23 @@ impl<'a> Container<'a> {
             Shape::Transparent(field) => {
                 let member = &field.member;
                 quote! {
-                    let _depth = #p::DepthGuard::enter()?;
-                    #p::Ok(Self { #member: ::shep_codec::Decode::decode(buf)? })
+                    #p::Ok(Self { #member: #p::decode_transparent(d)? })
                 }
             }
             Shape::Struct(fields) => {
                 let (version, compat) = self.versions();
                 let body = if fields.fields.is_empty() {
-                    quote!(_body)
+                    quote!(_d)
                 } else {
-                    quote!(mut body)
+                    quote!(d)
                 };
                 let decode_fields = fields.decode_each(&type_name, None);
                 let construct = fields.pattern(quote!(Self));
                 quote! {
-                    let _depth = #p::DepthGuard::enter()?;
-                    let #body = #p::decode_envelope(buf, #type_name, #version, #compat)?;
-                    #decode_fields
-                    #p::Ok(#construct)
+                    #p::decode_envelope(d, #type_name, #version, #compat, |#body| {
+                        #decode_fields
+                        #p::Ok(#construct)
+                    })
                 }
             }
             Shape::Enum(variants) => {
@@ -314,16 +313,16 @@ impl<'a> Container<'a> {
                     }
                 });
                 quote! {
-                    let _depth = #p::DepthGuard::enter()?;
-                    let mut body = #p::decode_envelope(buf, #type_name, #version, #compat)?;
-                    let tag: u8 = ::shep_codec::Decode::decode(&mut body)?;
-                    match tag {
-                        #(#arms)*
-                        tag => #p::Err(::shep_codec::DecodeError::UnknownTag {
-                            type_name: #type_name,
-                            tag,
-                        }),
-                    }
+                    #p::decode_envelope(d, #type_name, #version, #compat, |d| {
+                        let tag: u8 = ::shep_codec::Decode::decode(d)?;
+                        match tag {
+                            #(#arms)*
+                            tag => #p::Err(::shep_codec::DecodeError::UnknownTag {
+                                type_name: #type_name,
+                                tag,
+                            }),
+                        }
+                    })
                 }
             }
         };
@@ -335,7 +334,7 @@ impl<'a> Container<'a> {
             #[automatically_derived]
             impl #impl_generics ::shep_codec::Decode for #ident #ty_generics #where_clause {
                 fn decode(
-                    buf: &mut #p::Bytes,
+                    d: &mut #p::Decoder,
                 ) -> #p::Result<Self, ::shep_codec::DecodeError> {
                     #decode
                 }
@@ -474,7 +473,7 @@ impl<'a> FieldList<'a> {
             let binding = Self::binding(i);
             if f.default {
                 quote! {
-                    let #binding = ::shep_codec::__private::decode_field_or_default(&mut body)?;
+                    let #binding = ::shep_codec::__private::decode_field_or_default(d)?;
                 }
             } else {
                 let member = match &f.member {
@@ -486,7 +485,7 @@ impl<'a> FieldList<'a> {
                     None => member,
                 };
                 quote! {
-                    let #binding = ::shep_codec::__private::decode_field(&mut body, #type_name, #name)?;
+                    let #binding = ::shep_codec::__private::decode_field(d, #type_name, #name)?;
                 }
             }
         });

@@ -52,14 +52,19 @@
 //!
 //! # Robustness
 //!
-//! Decoding never panics, whatever the input, and never allocates more than
-//! the input could justify: a length prefix is checked against the bytes that
-//! remain before memory is reserved. Nesting of derived types is limited to
-//! [`MAX_DEPTH`] so recursive types can't overflow the stack.
+//! Decoding never panics, whatever the input, and is bounded in what it
+//! allocates. Every decode runs on a [`Decoder`] that carries the frame's
+//! remaining budget ([`Limits`]): containers charge what they allocate before
+//! allocating it, and fail with [`DecodeError::LimitExceeded`] past the
+//! limit, wherever in the frame they're nested. A length prefix is also
+//! checked against the bytes that remain before memory is reserved. Nesting
+//! of derived types is limited to [`MAX_DEPTH`] so recursive types can't
+//! overflow the stack.
 //!
 //! Encoding panics if a length or an envelope body exceeds `u32::MAX` bytes
 //! (Redpanda throws in the same place).
 
+mod decoder;
 mod error;
 mod impls;
 
@@ -68,6 +73,7 @@ pub mod __private;
 
 use bytes::{Bytes, BytesMut};
 
+pub use decoder::{DEFAULT_MAX_MEMORY, Decoder, Limits};
 pub use error::DecodeError;
 pub use shep_codec_derive::{Decode, Encode};
 
@@ -99,10 +105,11 @@ pub trait Encode {
 
 /// A type that can be read from the codec's wire format.
 pub trait Decode: Sized {
-    /// Reads one value from the front of `buf`, advancing past it.
+    /// Reads one value from the front of `d`'s input, advancing past it, and
+    /// charges `d` for what it allocates.
     ///
-    /// On error, how far `buf` advanced is unspecified.
-    fn decode(buf: &mut Bytes) -> Result<Self, DecodeError>;
+    /// On error, how far the input advanced is unspecified.
+    fn decode(d: &mut Decoder) -> Result<Self, DecodeError>;
 }
 
 /// Encodes `value` into a buffer of exactly the right size.
@@ -112,11 +119,17 @@ pub fn to_bytes<T: Encode + ?Sized>(value: &T) -> Bytes {
     buf.freeze()
 }
 
-/// Decodes a `T` that must span all of `bytes`.
-pub fn from_bytes<T: Decode>(mut bytes: Bytes) -> Result<T, DecodeError> {
-    let value = T::decode(&mut bytes)?;
-    if !bytes.is_empty() {
-        return Err(DecodeError::TrailingBytes(bytes.len()));
+/// Decodes a `T` that must span all of `bytes`, under the default [`Limits`].
+pub fn from_bytes<T: Decode>(bytes: Bytes) -> Result<T, DecodeError> {
+    from_bytes_with(bytes, Limits::default())
+}
+
+/// Decodes a `T` that must span all of `bytes`, under `limits`.
+pub fn from_bytes_with<T: Decode>(bytes: Bytes, limits: Limits) -> Result<T, DecodeError> {
+    let mut d = Decoder::with_limits(bytes, limits);
+    let value = T::decode(&mut d)?;
+    if !d.is_empty() {
+        return Err(DecodeError::TrailingBytes(d.remaining()));
     }
     Ok(value)
 }

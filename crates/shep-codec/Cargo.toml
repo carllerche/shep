@@ -12,5 +12,6 @@ shep-codec-derive.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+hegeltest.workspace = true
 rand.workspace = true
 trybuild.workspace = true
