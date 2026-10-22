@@ -6,7 +6,7 @@ use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufWriter};
 use tokio::sync::{OwnedSemaphorePermit, mpsc};
 
-use crate::wire::{HEADER_SIZE, Header, payload_checksum};
+use crate::wire::{HEADER_SIZE, Header, MAX_PAYLOAD, payload_checksum};
 
 /// Socket buffer size for both directions.
 pub(crate) const IO_BUFFER: usize = 64 * 1024;
@@ -71,6 +71,12 @@ pub(crate) async fn read_body<R: AsyncRead + Unpin>(
     reader: &mut R,
     header: &Header,
 ) -> io::Result<Bytes> {
+    if header.payload_size as usize > MAX_PAYLOAD {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "frame body larger than MAX_PAYLOAD",
+        ));
+    }
     let mut body = BytesMut::zeroed(header.payload_size as usize);
     reader.read_exact(&mut body).await?;
     if payload_checksum(&body) != header.payload_checksum {

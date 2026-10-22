@@ -15,7 +15,7 @@ use tokio::task::AbortHandle;
 
 use crate::error::RpcError;
 use crate::frame::{self, Frame, IO_BUFFER};
-use crate::wire::{COMPRESSION_NONE, Header, payload_checksum};
+use crate::wire::{COMPRESSION_NONE, Header, MAX_PAYLOAD, payload_checksum};
 
 type Reply = Result<Bytes, RpcError>;
 
@@ -138,7 +138,7 @@ impl Transport {
         method: u32,
         body: Bytes,
     ) -> Result<(Abandon, oneshot::Receiver<Reply>), RpcError> {
-        if u32::try_from(body.len()).is_err() {
+        if body.len() > MAX_PAYLOAD {
             return Err(RpcError::PayloadTooLarge(body.len()));
         }
         // Hash outside the lock; only the cheap header checksum needs the id.

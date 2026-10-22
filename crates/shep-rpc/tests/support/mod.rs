@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use futures::future::BoxFuture;
-use shep_rpc::wire::{HEADER_SIZE, Header};
+use shep_rpc::wire::{HEADER_SIZE, Header, MAX_PAYLOAD};
 use shep_rpc::{Request, Response, Server, ServerConfig, Status, method_id};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -29,6 +29,8 @@ pub const PANIC: u32 = method_id(SERVICE, 4);
 pub const RECORD: u32 = method_id(SERVICE, 5);
 /// Waits for a permit from `State::release`, then returns the body.
 pub const BLOCK: u32 = method_id(SERVICE, 6);
+/// Returns a body one byte over `MAX_PAYLOAD`.
+pub const OVERSIZED: u32 = method_id(SERVICE, 7);
 
 pub const LONG: Duration = Duration::from_secs(10);
 
@@ -86,6 +88,7 @@ pub fn handler(
                     state.release.acquire().await.unwrap().forget();
                     Response::ok(req.body)
                 }
+                OVERSIZED => Response::ok(Bytes::from(vec![0; MAX_PAYLOAD + 1])),
                 _ => Response::error(Status::MethodNotFound),
             }
         }) as BoxFuture<'static, Response>

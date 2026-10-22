@@ -18,7 +18,7 @@ pub enum RpcError {
     Backoff,
     #[error("connecting: {0}")]
     Connect(#[source] io::Error),
-    /// The body does not fit the frame's 32-bit length.
+    /// The body is larger than [`MAX_PAYLOAD`](crate::wire::MAX_PAYLOAD).
     #[error("request body of {0} bytes is too large")]
     PayloadTooLarge(usize),
     /// 404: no handler for the method id.

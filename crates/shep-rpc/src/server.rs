@@ -17,7 +17,7 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
 use crate::frame::{self, Frame, IO_BUFFER};
-use crate::wire::{COMPRESSION_NONE, Header, Status, VERSION};
+use crate::wire::{COMPRESSION_NONE, Header, MAX_PAYLOAD, Status, VERSION};
 
 /// How long a forced shutdown waits for the 408 responses to be written.
 const FORCED_FLUSH: Duration = Duration::from_secs(1);
@@ -274,11 +274,19 @@ where
                     }),
                     _ = forced.cancelled() => Response::error(Status::RequestTimeout),
                 };
-                let body = match response.status {
-                    Status::Success => response.body,
-                    _ => Bytes::new(),
+                let (status, body) = match response.status {
+                    Status::Success if response.body.len() > MAX_PAYLOAD => {
+                        tracing::error!(
+                            method = header.meta,
+                            bytes = response.body.len(),
+                            "rpc response larger than MAX_PAYLOAD"
+                        );
+                        (Status::ServerError, Bytes::new())
+                    }
+                    Status::Success => (Status::Success, response.body),
+                    status => (status, Bytes::new()),
                 };
-                let reply = Header::new(response.status.as_u32(), header.correlation_id, &body);
+                let reply = Header::new(status.as_u32(), header.correlation_id, &body);
                 let _ = tx.send(Frame {
                     header: reply,
                     body,

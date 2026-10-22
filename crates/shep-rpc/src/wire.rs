@@ -24,6 +24,12 @@ pub const VERSION: u8 = 1;
 /// Bytes in an encoded [`Header`].
 pub const HEADER_SIZE: usize = 26;
 
+/// The largest body a frame may carry, in either direction: room for the
+/// largest Raft entry with headroom. Senders refuse bigger bodies, and a
+/// reader that sees a header claiming one closes the connection without
+/// allocating for it.
+pub const MAX_PAYLOAD: usize = 32 << 20;
+
 /// No compression. The only body encoding implemented.
 pub const COMPRESSION_NONE: u8 = 0;
 
