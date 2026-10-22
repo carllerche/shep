@@ -13,7 +13,7 @@ use std::ops::Bound;
 use bytes::Bytes;
 use shep_wal_api::{Dot, Dvv, KeyRange, PartitionId};
 
-pub(crate) struct Table {
+pub struct Table {
     partition: PartitionId,
     /// The term the table was built for. It's only valid while this node
     /// leads in that term.
@@ -38,7 +38,7 @@ struct Slot {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum SlotIndex {
+pub enum SlotIndex {
     /// Handed to Raft; its index isn't known yet.
     Pending,
     Known(u64),
@@ -50,7 +50,7 @@ pub(crate) enum SlotIndex {
 
 impl Table {
     /// An empty table whose entries all lie above `floor`.
-    pub(crate) fn new(partition: PartitionId, term: u64, floor: u64) -> Table {
+    pub fn new(partition: PartitionId, term: u64, floor: u64) -> Table {
         Table {
             partition,
             term,
@@ -62,21 +62,25 @@ impl Table {
         }
     }
 
-    pub(crate) fn term(&self) -> u64 {
+    pub fn term(&self) -> u64 {
         self.term
     }
 
-    pub(crate) fn floor(&self) -> u64 {
+    pub fn floor(&self) -> u64 {
         self.floor
     }
 
+    /// The number of entries in the table.
+    pub fn len(&self) -> usize {
+        self.slots.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.slots.is_empty()
+    }
+
     /// Adds an entry's write set, returning its sequence number.
-    pub(crate) fn push(
-        &mut self,
-        index: SlotIndex,
-        write_set: &[KeyRange],
-        commit_time_us: u64,
-    ) -> u64 {
+    pub fn push(&mut self, index: SlotIndex, write_set: &[KeyRange], commit_time_us: u64) -> u64 {
         let seq = self.front_seq + self.slots.len() as u64;
         let mut slot = Slot {
             index,
@@ -100,7 +104,7 @@ impl Table {
         seq
     }
 
-    pub(crate) fn resolve(&mut self, seq: u64, index: SlotIndex) {
+    pub fn resolve(&mut self, seq: u64, index: SlotIndex) {
         if let Some(slot) = seq
             .checked_sub(self.front_seq)
             .and_then(|i| self.slots.get_mut(i as usize))
@@ -125,7 +129,7 @@ impl Table {
 
     /// Whether an entry in the table that `read_version` doesn't contain wrote
     /// a key in `read_set`.
-    pub(crate) fn conflicts(&self, read_set: &[KeyRange], read_version: &Dvv) -> bool {
+    pub fn conflicts(&self, read_set: &[KeyRange], read_version: &Dvv) -> bool {
         read_set.iter().filter(|r| !r.is_empty()).any(|r| {
             let points = match r.as_point() {
                 Some(k) => self
@@ -155,7 +159,7 @@ impl Table {
     /// Drops the oldest entries while they're older than `cutoff_us` or the
     /// table holds more than `max_slots`. An entry whose index isn't known yet
     /// stops it, since everything above the floor must stay.
-    pub(crate) fn evict(&mut self, cutoff_us: u64, max_slots: usize) {
+    pub fn evict(&mut self, cutoff_us: u64, max_slots: usize) {
         while let Some(front) = self.slots.front() {
             let index = match front.index {
                 SlotIndex::Known(i) | SlotIndex::Void(i) => Some(i),

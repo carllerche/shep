@@ -17,7 +17,8 @@
 mod command;
 mod controller;
 mod state_machine;
-mod table;
+#[doc(hidden)]
+pub mod table;
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
