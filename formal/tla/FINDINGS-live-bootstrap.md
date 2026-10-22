@@ -127,3 +127,43 @@ shows these paths are reachable:
 **Bootstrap:**
 - One replica per group: no quorums, no membership changes.
 - No universe creation, API keys, or quotas.
+
+## Token model
+
+| # | Severity | Finding | Evidence |
+|---|---|---|---|
+| LB7 | confirms | A topic whose reference set reads `actor` must be keyed by actor class. A lookup keyed by viewer only pushes to an agent what P2 denies it. | `LiveFrontier_cred_viewerlookup` fails (196 states); `_cred_actorclass` passes; `LiveFrontier_cred` passes (1,009,546 states, 18s) |
+
+LB5 is superseded by the token model.
+
+## Controller founding (`Bootstrap.tla` at design level, `BootstrapFound.tla` as implemented)
+
+The old system-partition model is now `BootstrapSysPart.tla` (superseded). LB2 and LB6 carry over, with production's registry replacing `sys_prod`.
+
+| # | Severity | Finding | Config |
+|---|---|---|---|
+| B1 | high | A re-imaged sole seed founds a second cluster. So does replacing or wiping every seed. Founding needs a guard that survives a disk: a conditional-create cluster claim in the object store, or an explicit `init`. | `_rf1seeds` fails |
+| B2 | high | A re-imaged member that rejoins under its old identity with an empty log can elect a leader that lacks a committed entry. A node with an empty disk needs a new identity, and its join replaces the old identity in one joint change. Adding the new identity beside the dead one makes the newcomer a single point of failure. | `_sameid`, `_addid` fail |
+| B3 | medium | The cluster UUID can't protect an empty node. Each node's configuration names its fleet, and the join handshake checks it. With identities that change per incarnation, the UUID check is defence in depth: `_nouuid_ids` reaches the same states as `Bootstrap`. | `_noenv`, `_nouuid` fail |
+| B4 | medium | Growing the cluster must promote only a live learner that holds the committed log, and must not add a voter while another voter's identity is dead. | `_rf1deadlearner`, `_adddead` fail |
+| B5 | confirms | The all-empty check, adding the second node as a learner, and the UUID check (when identity is the address) are each needed. | `_noallempty`, `_voter2`, `_nouuid` |
+| BF1 | high | HELLO is a time-of-check-to-time-of-use race. A seed-list change on restart, or a wipe just after initialization with stale AppendEntries in flight, produces two groups and two founded clusters, even with identical seed lists. | `_typo_found`, `_typo_mixlog`, `_same3` |
+| BF2 | high | Uninitialized and wiped nodes take part in controller Raft. A wiped seed is pulled back in with amnesia, and a second group can be initialized from stale answers. | `_same3_stayout`, `_same3_msg_one` |
+| BF3 | high | An id chosen at INITIALIZE and checked per message prevents log mixing, but not two clusters. An expiring pledge also fails. The candidate fix: the id is chosen at HELLO, each answering seed persists a non-expiring pledge, and a node with no id accepts controller traffic only for its pledged id. This is unverified; its configs are pending. | `_typo_msg`, `_typo_promise_expiry` fail; `_typo_msg_mix` passes |
+| BF4 | medium | A per-connection id is not equivalent to a per-message one as built. It needs two extra rules: close every connection when the node's id changes, and a node with no id accepts connections from at most one id. With those it matches per-message for mixing, but it still doesn't keep a wiped node out. | `_typo_conn_mix` fails; `_typo_connstrict_mix` passes; `_same3_conn` fails |
+
+### Results
+
+**Passing configs.**
+
+| Config | Distinct states | Time |
+|---|---|---|
+| `Bootstrap` | 68,476,245 | 22 min |
+| `_rf1` | 160,570 | |
+| `_overlap` | 78,278 | |
+| `_typo_msg_mix` | 93,562,060 | |
+| `_typo_connstrict_mix` | 27,414,254 | |
+
+**Pending re-runs.** The disk filled before these ran:
+- `BootstrapFound` with `_typo_promise`, `_typo_connpromise`, `_same3_promise` and `_same3_connpromise`, the fix validation;
+- `Bootstrap` with `_rf1seeds`, `_noallempty`, `_sameid`, `_voter2` and `_nouuid`, which ran only on an earlier spec revision.

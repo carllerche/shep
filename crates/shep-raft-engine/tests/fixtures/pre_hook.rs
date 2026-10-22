@@ -1,0 +1,20 @@
+//! Pre-hook types for intercepting RPC calls before they are sent.
+
+use openraft::base::BoxFuture;
+use openraft::errors::Infallible;
+use openraft::errors::RPCError;
+use openraft_memstore::MemNodeId;
+use openraft_memstore::TypeConfig;
+
+use crate::fixtures::MemRpcRequest;
+use crate::fixtures::TypedRaftRouter;
+
+/// Hook function called before an RPC is sent to a target node.
+///
+/// Arguments: `(router, rpc, from_id, to_id)`
+pub type PreHook = Box<dyn Fn(&TypedRaftRouter, MemRpcRequest, MemNodeId, MemNodeId) -> PreHookResult + Send + 'static>;
+
+/// Result type for pre-hook functions.
+///
+/// Pre-hooks cannot return remote errors, only local errors.
+pub type PreHookResult = BoxFuture<'static, Result<(), RPCError<TypeConfig, Infallible>>>;

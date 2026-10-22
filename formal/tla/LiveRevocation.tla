@@ -50,6 +50,23 @@
 (*      and that neither the actor nor the viewer is deleted, as well as   *)
 (*      can_op.                                                            *)
 (*                                                                         *)
+(* Tokens (§6.3 now: an external auth service issues short-lived JWTs;   *)
+(* Shep keeps no revocation list). For the subscribers in TokSubs, the     *)
+(* token a stream was opened with can expire (Expire, time passing `exp`), *)
+(* and the auth service can stop issuing tokens to it (RevokeAuth; Shep    *)
+(* never sees this). Shep sends `reauth` before `exp` (at exp - 60 s; not  *)
+(* modelled, it only prompts the client). At `exp` the stream pauses: no   *)
+(* pushes, state kept, until the client presents a fresh token for the     *)
+(* same claims (Reauth: the stream resumes at V_topic, or closes `denied`  *)
+(* if the request is now denied) or the grace period ends (GraceEnd: it    *)
+(* closes). The auth service issues a fresh token only if it hasn't        *)
+(* revoked. Download links die with the token that minted them.            *)
+(*  ExpiryCheck TRUE (design): no pushes after `exp` without a valid       *)
+(*      token; FALSE: pushes continue during the grace period.             *)
+(* Superseded: Shep-issued act-for keys, revoked in Shep's system          *)
+(* partition ("revoke" in Ops, routed if RouteRevoke). The configs         *)
+(* LiveRevocation_cred*.cfg use it.                                        *)
+(*                                                                         *)
 (* Superseded: the mapping model (§6.3 before the credential change). g1's *)
 (* viewer was its `acts_for` target, which a "remap" entry re-points. Only *)
 (* the superseded configs put "remap" in Ops; with it,                     *)
@@ -62,7 +79,7 @@ EXTENDS Integers, Sequences, FiniteSets, TLC
 
 CONSTANTS MaxEntries, MaxMsgs, Ops,
           RouteDeleted, RouteActsFor, MapRouteAt, CloseOnMapped, LinkDeletedCheck,
-          DenyDeletedViewer, RouteRevoke
+          DenyDeletedViewer, RouteRevoke, TokSubs, ExpiryCheck
 
 Users  == {"u1", "u2"}
 Agents == {"g1"}
@@ -80,7 +97,7 @@ VARIABLES
   log,      \* sequence of entries [k, x]
   hist,     \* hist[v + 1] = the state at version v (hist[1] = St0)
   Vt,       \* the topic's version
-  sub,      \* sub[a] \in {"none", "open", "closed"}
+  sub,      \* sub[a] \in {"none", "open", "reauth", "closed"}
   mapAt,    \* g1's viewer when it subscribed (superseded MapRouteAt)
   aud,      \* phase 2's cached anchor audience, intersected with subscribers
   cv,       \* cv[a]: the subscriber's client view
@@ -90,10 +107,16 @@ VARIABLES
   exactOK,  \* history: every push leaves the client = fresh eval at S (inv 3)
   closeOK,  \* history: a stream closes with denied only when a fresh
             \*   request at that version would be denied
-  linkOK    \* history: a link works only for a request that isn't denied
+  linkOK,   \* history: a link works only for a request that isn't denied
             \*   and can read (inv 2)
+  tok,      \* tok[a]: the token a's stream (and links) use is unexpired
+  auth,     \* auth[a]: the auth service still issues tokens to a
+  gone,     \* actors whose auth was revoked and whose last token expired
+  tokOK     \* history: no push or link use under an expired token, or to an
+            \*   actor in `gone`
 
-vars == <<log, hist, Vt, sub, mapAt, aud, cv, links, pushOK, exactOK, closeOK, linkOK>>
+tvars == <<tok, auth, gone, tokOK>>
+vars == <<log, hist, Vt, sub, mapAt, aud, cv, links, pushOK, exactOK, closeOK, linkOK, tvars>>
 
 Cur == hist[Len(log) + 1]
 At(v) == hist[v + 1]
@@ -124,6 +147,8 @@ Init ==
   /\ cv = [a \in Actors |-> {}]
   /\ links = {}
   /\ pushOK = TRUE /\ exactOK = TRUE /\ closeOK = TRUE /\ linkOK = TRUE
+  /\ tok = [a \in Actors |-> TRUE] /\ auth = [a \in Actors |-> TRUE]
+  /\ gone = {} /\ tokOK = TRUE
 
 (*************************** writes **************************************)
 
@@ -157,22 +182,24 @@ Write(e) ==
   /\ e.k = "post" => e.x = NextMsg(Cur)
   /\ log' = Append(log, e)
   /\ hist' = Append(hist, Apply(Cur, e))
-  /\ UNCHANGED <<Vt, sub, mapAt, aud, cv, links, pushOK, exactOK, closeOK, linkOK>>
+  /\ UNCHANGED <<Vt, sub, mapAt, aud, cv, links, pushOK, exactOK, closeOK, linkOK, tvars>>
 
 (*************************** subscribe ************************************)
 
 \* joins through the topic's loop, once it has caught up; the request is
 \* denied if the actor or viewer is deleted or the key revoked
 Subscribe(a) ==
-  /\ sub[a] /= "open"
+  /\ sub[a] \in {"none", "closed"}
   /\ Vt = Len(log)
+  /\ auth[a]
   /\ ~Denied(a, Cur)
   /\ sub' = [sub EXCEPT ![a] = "open"]
   /\ cv' = [cv EXCEPT ![a] = FreshView(a, Cur)]
   /\ aud' = IF CanOp(a, Cur) THEN aud \cup {a} ELSE aud \ {a}
   /\ mapAt' = IF a \in Agents THEN Cur.owner ELSE mapAt
   /\ links' = links \cup {<<a, m>> : m \in FreshView(a, Cur)}
-  /\ UNCHANGED <<log, hist, Vt, pushOK, exactOK, closeOK, linkOK>>
+  /\ tok' = [tok EXCEPT ![a] = TRUE]
+  /\ UNCHANGED <<log, hist, Vt, pushOK, exactOK, closeOK, linkOK, auth, gone, tokOK>>
 
 (*************************** a topic step to S ****************************)
 
@@ -186,7 +213,9 @@ Step(S) ==
   LET old == At(Vt)
       new == At(S)
       E == Entries(Vt, S)
-      open == {a \in Actors : sub[a] = "open"}
+      \* streams that step: open ones, and (without ExpiryCheck) ones in
+      \* their grace period
+      open == {a \in Actors : sub[a] = "open" \/ (~ExpiryCheck /\ sub[a] = "reauth")}
       routedDel(a) == RouteDeleted /\
                         \E e \in E : e.k \in {"del", "restore"} /\ e.x \in {a} \cup Mapped(a, new)
       routedRemap(a) == RouteActsFor /\ a \in Agents /\ \E e \in E : e.k = "remap"
@@ -218,7 +247,8 @@ Step(S) ==
                    ~Denied(a, new) /\ (newCv(a) /= {} => CanOp(a, new)))
   /\ exactOK' = (exactOK /\ \A a \in rcpt : ~ Denied(a, new) /\ newCv(a) = FreshView(a, new))
   /\ closeOK' = (closeOK /\ \A a \in closing : Denied(a, new))
-  /\ UNCHANGED <<log, hist, mapAt, linkOK>>
+  /\ tokOK' = (tokOK /\ \A a \in rcpt : tok[a] /\ a \notin gone)
+  /\ UNCHANGED <<log, hist, mapAt, linkOK, tok, auth, gone>>
 
 (*************************** links *****************************************)
 
@@ -229,7 +259,55 @@ UseLink(a, m) ==
   /\ LinkDeletedCheck => ~Denied(a, Cur)
   /\ CanOp(a, Cur) /\ m \in Cur.msgs
   /\ linkOK' = (linkOK /\ ~Denied(a, Cur) /\ CanOp(a, Cur))
-  /\ UNCHANGED <<log, hist, Vt, sub, mapAt, aud, cv, links, pushOK, exactOK, closeOK>>
+  /\ tokOK' = (tokOK /\ tok[a] /\ a \notin gone)
+  /\ UNCHANGED <<log, hist, Vt, sub, mapAt, aud, cv, links, pushOK, exactOK, closeOK,
+                 tok, auth, gone>>
+
+(*************************** tokens ****************************************)
+
+\* time passes a's token's `exp`: its stream pauses for reauth (with
+\* ExpiryCheck, no pushes) and the links it minted stop working
+Expire(a) ==
+  /\ a \in TokSubs /\ tok[a]
+  /\ tok' = [tok EXCEPT ![a] = FALSE]
+  /\ gone' = IF auth[a] THEN gone ELSE gone \cup {a}
+  /\ sub' = IF sub[a] = "open" THEN [sub EXCEPT ![a] = "reauth"] ELSE sub
+  /\ links' = {l \in links : l[1] /= a}
+  /\ UNCHANGED <<log, hist, Vt, mapAt, aud, cv, pushOK, exactOK, closeOK, linkOK, auth,
+                 tokOK>>
+
+\* the auth service stops issuing tokens to a (Shep doesn't see this)
+RevokeAuth(a) ==
+  /\ a \in TokSubs /\ auth[a]
+  /\ auth' = [auth EXCEPT ![a] = FALSE]
+  /\ gone' = IF tok[a] THEN gone ELSE gone \cup {a}
+  /\ UNCHANGED <<log, hist, Vt, sub, mapAt, aud, cv, links, pushOK, exactOK, closeOK,
+                 linkOK, tok, tokOK>>
+
+\* the client answers `reauth` with a fresh token for the same claims (the
+\* auth service issues one only if it hasn't revoked): the stream resumes
+\* at V_topic, its view caught up (or closes `denied`)
+Reauth(a) ==
+  /\ sub[a] = "reauth" /\ auth[a]
+  /\ IF ~Denied(a, At(Vt))
+     THEN /\ sub' = [sub EXCEPT ![a] = "open"]
+          /\ tok' = [tok EXCEPT ![a] = TRUE]
+          /\ cv' = [cv EXCEPT ![a] = FreshView(a, At(Vt))]
+          /\ aud' = IF CanOp(a, At(Vt)) THEN aud \cup {a} ELSE aud \ {a}
+          /\ links' = links \cup {<<a, m>> : m \in FreshView(a, At(Vt))}
+     ELSE /\ sub' = [sub EXCEPT ![a] = "closed"]
+          /\ cv' = [cv EXCEPT ![a] = {}]
+          /\ aud' = aud \ {a}
+          /\ UNCHANGED <<tok, links>>
+  /\ UNCHANGED <<log, hist, Vt, mapAt, pushOK, exactOK, closeOK, linkOK, auth, gone, tokOK>>
+
+\* the grace period ends without a fresh token: the stream closes
+GraceEnd(a) ==
+  /\ sub[a] = "reauth"
+  /\ sub' = [sub EXCEPT ![a] = "closed"]
+  /\ cv' = [cv EXCEPT ![a] = {}]
+  /\ aud' = aud \ {a}
+  /\ UNCHANGED <<log, hist, Vt, mapAt, links, pushOK, exactOK, closeOK, linkOK, tvars>>
 
 WriteAny == \E e \in Possible(Cur) : Write(e)
 StepAny == \E S \in (Vt + 1)..Len(log) : Step(S)
@@ -239,6 +317,7 @@ Next ==
   \/ \E a \in Actors : Subscribe(a)
   \/ StepAny
   \/ \E a \in Actors, m \in MsgIds : UseLink(a, m)
+  \/ \E a \in Actors : Expire(a) \/ RevokeAuth(a) \/ Reauth(a) \/ GraceEnd(a)
 
 Spec == Init /\ [][Next]_vars
 
@@ -265,6 +344,10 @@ ViewExact == \A a \in Actors : sub[a] = "open" =>
                ~ Denied(a, At(Vt)) /\ cv[a] = FreshView(a, At(Vt))
 \* A stream closes with `denied` only when a request would be denied.
 CloseOnlyIfDenied == closeOK
+\* 4. Token lifetime bounds revocation by the auth service: no push or link
+\*    use under an expired token, so none after the last token issued
+\*    before the revocation expires.
+TokenSafe == tokOK
 
 Inv == PushSafe /\ ViewSafe /\ LinkSafe /\ PushExact /\ ViewExact
 =============================================================================

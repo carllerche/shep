@@ -4,14 +4,14 @@
 Planner obligation 1, extending `Validation.serializable`. The planner leaves the reads of a
 `require p` out of the read set when `p` is Stable. We prove the committed history is still
 **outcome-serializable** in log order: every committed mutation's writes, and the outcomes of
-its `require`s, equal those at its log position.
+its `require`s (ShepQL `assert`s), equal those at its log position.
 
 ## The model
 
 The log model of `Validation.lean`. Each key has a discipline (`DiscK`):
 
 * `frozen`: a frozen field or edge of some node;
-* `permanent`: the lifecycle of a `#[permanent]` node;
+* `permanent`: the lifecycle of a `shep::Permanent` node;
 * `mutable`: everything else.
 
 A distinguished value `bot` means "absent": the node isn't created yet. A frozen field that
@@ -40,13 +40,22 @@ creation".
   discipline check, with Stable guards skipped, each committed mutation's writes equal its
   body's writes at its log position, and each guard holds there. Its validated reads agree too
   (`Validation.serializable`).
-* `stab_upClosed`: the syntactic Stable⁺ (positive inputs frozen or permanent, negative inputs
-  frozen) is upward-closed, for a CEL-like guard language with errors. Value reads error on an
-  absent key, which is the implicit lifecycle read of §7.6. `exists` applies to lifecycles,
-  which are never frozen, so `!exists` is never Stable⁺.
-* `mutableLifecycle_unsound`: **counterexample.** `require exists(x)` over a non-permanent `x`
+* `gstab_sound`, `stab_upClosed`, `stab_neg_closed`: the syntactic Stable⁺/Stable⁻ is sound,
+  **for two-valued ShepQL guards** (§4.0 item 1; restatement-round obligation 2). Positive
+  inputs are frozen or permanent, negative inputs frozen. A value read carries a `??` default
+  (totality), and that default is the implicit lifecycle read of §7.6: it reads the node's
+  absence, so Stable⁺ needs `?? false` and Stable⁻ needs `?? true`. `exists` applies to
+  lifecycles, which are never frozen, so `not exists` is never Stable⁺. The proof is a plain
+  induction over `Bool`; CEL's error absorption is gone.
+* `mutableLifecycle_unsound`: **counterexample.** `assert(exists x)` over a non-permanent `x`
   is true at `S`, and a concurrent delete makes it false at the entry's log position. Every
   hypothesis of `Validated` holds, because the guard's read isn't in the read set.
+* `trueDefault_unsound`: **counterexample (doc finding).** `assert((x.f = 1) ?? true)` over a
+  frozen `f` is true at `S`, where `x` doesn't exist yet, and false at the log position after
+  `x`'s creation sets `f = 2`. Judging a `??` default only by its field's discipline would
+  call it Stable⁺. With `?? false` it is Stable⁺ and fails at `S` already.
+* `Planner.CEL` (superseded): the earlier three-valued CEL guards, `geval`, `GStab`,
+  `gstab_sound`, `stab_upClosed`, `mutableLifecycle_unsound`, kept as history.
 -/
 import ShepZSet.Validation
 
@@ -174,7 +183,245 @@ theorem outcome_serializable (hV : Validated L init ctx n)
   rw [hbody i hi]
   exact reads_eq_serial hV hi (hsound i hi)
 
-/-! ## Syntactic Stable⁺ -/
+
+/-! ## Syntactic Stable⁺, two-valued (ShepQL)
+
+ShepQL guards are total (§4.0 item 1, `Totality.lean`): an `assert` condition has inferred
+cardinality One, so a value read of a key that may be absent carries a `??` default. -/
+
+/-- Guards: two-valued, over keys. -/
+inductive Guard (K Val : Type*)
+  | tt
+  | ff
+  /-- `(a test of k's value) ?? d`: the test `P` on `k`'s value, or `d` when `k` is absent
+  (the node doesn't exist yet: the implicit lifecycle read). `P` sees a created node's unset
+  field as its own "null" value. -/
+  | val (k : K) (P : Val → Bool) (d : Bool)
+  /-- `exists`: the lifecycle `k` is present -/
+  | ex (k : K)
+  | not (g : Guard K Val)
+  | and (g h : Guard K Val)
+  | or (g h : Guard K Val)
+
+/-- Two-valued evaluation. -/
+def geval (bot : Val) (σ : K → Val) : Guard K Val → Bool
+  | .tt => true
+  | .ff => false
+  | .val k P d => if σ k = bot then d else P (σ k)
+  | .ex k => decide (σ k ≠ bot)
+  | .not g => !geval bot σ g
+  | .and g h => geval bot σ g && geval bot σ h
+  | .or g h => geval bot σ g || geval bot σ h
+
+/-- `GStab b g`: Stable⁺ for `b = true`, Stable⁻ for `b = false`. A value read is both
+positive and negative, so it needs a frozen key; and **its `??` default must be the opposite
+of `b`** (`?? false` for Stable⁺, `?? true` for Stable⁻), since the default reads the node's
+absence, a negative lifecycle input. `exists` needs a frozen or permanent key in positive
+position and is never Stable⁻: lifecycles are never frozen. -/
+def GStab (disc : K → DiscK) : Bool → Guard K Val → Prop
+  | _, .tt => True
+  | _, .ff => True
+  | b, .val k _ d => disc k = .frozen ∧ d = !b
+  | true, .ex k => disc k ≠ .mutable
+  | false, .ex _ => False
+  | b, .not g => GStab disc (!b) g
+  | b, .and g h => GStab disc b g ∧ GStab disc b h
+  | b, .or g h => GStab disc b g ∧ GStab disc b h
+
+theorem gstab_sound {σ τ : K → Val} (hle : DLe disc bot σ τ) :
+    ∀ (g : Guard K Val) (b : Bool), GStab disc b g → geval bot σ g = b → geval bot τ g = b := by
+  intro g
+  induction g with
+  | tt => intro b _ h; exact h
+  | ff => intro b _ h; exact h
+  | val k P d =>
+    intro b hs h
+    obtain ⟨hfr, hd⟩ := hs
+    have hk : disc k ≠ .mutable := by rw [hfr]; decide
+    simp only [geval] at h ⊢
+    by_cases hb : σ k = bot
+    · simp only [hb, ↓reduceIte, hd] at h; cases b <;> simp at h
+    · simp only [hb, ↓reduceIte] at h
+      rcases hle k hk with h' | h'
+      · exact absurd h' hb
+      · rw [← h']; simp only [hb, ↓reduceIte]; exact h
+  | ex k =>
+    intro b hs h
+    cases b with
+    | false => exact absurd hs (by simp [GStab])
+    | true =>
+      simp only [geval, decide_eq_true_eq] at h ⊢
+      rcases hle k hs with h' | h'
+      · exact absurd h' h
+      · rw [← h']; exact h
+  | not g ih =>
+    intro b hs h
+    simp only [geval] at h ⊢
+    rw [ih (!b) hs (by rw [← h]; simp)]
+    simp
+  | and g h ihg ihh =>
+    intro b hs hev
+    simp only [geval] at hev ⊢
+    cases b with
+    | true =>
+      rw [Bool.and_eq_true] at hev
+      rw [ihg true hs.1 hev.1, ihh true hs.2 hev.2]; rfl
+    | false =>
+      rcases hg : geval bot σ g
+      · rw [ihg false hs.1 hg]; rfl
+      · rw [hg, Bool.true_and] at hev
+        rw [ihh false hs.2 hev, Bool.and_false]
+  | or g h ihg ihh =>
+    intro b hs hev
+    simp only [geval] at hev ⊢
+    cases b with
+    | false =>
+      rw [Bool.or_eq_false_iff] at hev
+      rw [ihg false hs.1 hev.1, ihh false hs.2 hev.2]; rfl
+    | true =>
+      rcases hg : geval bot σ g
+      · rw [hg, Bool.false_or] at hev
+        rw [ihh true hs.2 hev, Bool.or_true]
+      · rw [ihg true hs.1 hg]; rfl
+
+/-- **Syntactic Stable⁺ is upward-closed**: an `assert` that passes at `σ` passes at every
+`τ ≥_D σ`. -/
+theorem stab_upClosed {g : Guard K Val} (hs : GStab disc true g) :
+    UpClosed disc bot (fun σ => geval bot σ g = true) :=
+  fun _ _ hle h => gstab_sound hle g true hs h
+
+/-- And Stable⁻ is closed downward in the same sense: a deny-polarity guard false at `σ` stays
+false. -/
+theorem stab_neg_closed {g : Guard K Val} (hs : GStab disc false g) :
+    UpClosed disc bot (fun σ => geval bot σ g = false) :=
+  fun _ _ hle h => gstab_sound hle g false hs h
+
+/-! ## Counterexamples
+
+Both use one log. Keys: `false` is a key of node `x` (its lifecycle or a field; `0` is absent),
+and `true` is an output key. Entry `0` writes key `false` from `o` to `v`. Entry `1` runs at
+`S = ∅`, checks its guard, and writes the output key, which is its whole read set. Every
+hypothesis of `Validated` holds, because the guard's read isn't in the read set. -/
+
+def cxLog (o v : ℕ) : ℕ → Entry Bool ℕ ℕ
+  | 0 => { stamp := 0, S := ∅, hits := fun k _ => k = false,
+           wr := fun k => if k = false then some (o, v) else none }
+  | _ => { stamp := 1, S := ∅, hits := fun k _ => k = true,
+           wr := fun k => if k = true then some (0, 1) else none }
+
+def cxInit (o : ℕ) : Bool → ℕ := fun k => if k = false then o else 0
+
+theorem cxLog_validated (o v : ℕ) : Validated (cxLog o v) (cxInit o) (fun _ => ∅) 2 := by
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_⟩
+  · intro i hi j hj _ ⟨k, o', v', hw, hk⟩
+    have : i = 1 := by omega
+    subst this
+    have : j = 0 := by omega
+    subst this
+    simp only [cxLog] at hw hk
+    by_cases h : k = false
+    · subst h; simp at hk
+    · simp [h] at hw
+  · intro i hi k o' v' hw x
+    match i, hi with
+    | 0, _ => simp only [cxLog] at hw ⊢; by_contra h; simp [h] at hw
+    | 1, _ => simp only [cxLog] at hw ⊢; by_contra h; simp [h] at hw
+  · intro i hi k o' v' hw
+    match i, hi with
+    | 0, _ =>
+      simp only [cxLog] at hw
+      by_cases h : k = false
+      · subst h; simp at hw; rw [← hw.1]; simp [readAt, cxLog, cxInit]
+      · simp [h] at hw
+    | 1, _ =>
+      simp only [cxLog] at hw
+      by_cases h : k = true
+      · subst h; simp at hw; rw [← hw.1]; simp [readAt, cxLog, cxInit]
+      · simp [h] at hw
+  · intro i hi j hij hj
+    match i, j, hi, hj with
+    | 0, 0, _, _ => simp [cxLog]
+    | 0, 1, _, _ => simp [cxLog]
+    | 1, 1, _, _ => simp [cxLog]
+  · intro i hi; match i, hi with
+    | 0, _ => simp [cxLog]
+    | 1, _ => simp [cxLog]
+  · intro i hi; match i, hi with
+    | 0, _ => simp [cxLog, CausallyClosed]
+    | 1, _ => simp [cxLog, CausallyClosed]
+
+/-! ### `assert(exists x)` over a mutable lifecycle
+
+Key `false` is `x`'s lifecycle (mutable; `1` live; a deleted node reads as absent, so a delete
+writes `0`). Entry `0` deletes `x`; entry `1` asserts `exists x`. -/
+
+def mlDisc : Bool → DiscK := fun _ => .mutable
+
+def mlGuard : Guard Bool ℕ := .ex false
+
+theorem mutableLifecycle_unsound :
+    Validated (cxLog 1 0) (cxInit 1) (fun _ => ∅) 2 ∧
+    (∀ j < 2, Respects mlDisc 0 (cxLog 1 0 j)) ∧
+    -- the guard reads a mutable lifecycle, so it isn't Stable⁺
+    ¬ GStab mlDisc true mlGuard ∧
+    -- it is true at `S` and false at the entry's log position
+    geval 0 (readAt (cxLog 1 0) (cxInit 1) (cxLog 1 0 1).S 2) mlGuard = true ∧
+    geval 0 (serial (cxLog 1 0) (cxInit 1) 1) mlGuard = false := by
+  refine ⟨cxLog_validated 1 0, ?_, by simp [GStab, mlGuard, mlDisc], ?_, ?_⟩
+  · intro j _ k o v hk _
+    exact absurd rfl hk
+  · simp [geval, readAt, cxLog, cxInit, mlGuard]
+  · simp [geval, serial, apply, cxLog, mlGuard]
+
+/-! ### A `?? true` default in an `assert` (**finding**)
+
+Key `false` is the frozen field `f` of a node `x` that doesn't exist at `S` (`0`, absent).
+Entry `0` creates `x` with `f = 2`. Entry `1` asserts `(x.f = 1) ?? true`: true at `S`, where
+`x` is absent, and false at its log position. The field is frozen, so a classifier that judged
+the `??` default only by the field's discipline ("`??` defaults: both polarities", §7.6) would
+call the guard Stable⁺ and skip it. The default reads the node's *absence*, a negative
+lifecycle input, so a Stable⁺ guard needs `?? false` (and a Stable⁻ one `?? true`), the same
+default the checker suggests by polarity (§4.0 item 1). -/
+
+def tdDisc : Bool → DiscK := fun k => if k = false then .frozen else .mutable
+
+/-- `(x.f = 1) ?? d`. -/
+def tdGuard (d : Bool) : Guard Bool ℕ := .val false (fun v => decide (v = 1)) d
+
+theorem trueDefault_unsound :
+    Validated (cxLog 0 2) (cxInit 0) (fun _ => ∅) 2 ∧
+    (∀ j < 2, Respects tdDisc 0 (cxLog 0 2 j)) ∧
+    -- `f` is frozen, but the guard's default is `true`, so it isn't Stable⁺
+    tdDisc false = .frozen ∧ ¬ GStab tdDisc true (tdGuard true) ∧
+    -- true at `S`, false at the entry's log position
+    geval 0 (readAt (cxLog 0 2) (cxInit 0) (cxLog 0 2 1).S 2) (tdGuard true) = true ∧
+    geval 0 (serial (cxLog 0 2) (cxInit 0) 1) (tdGuard true) = false ∧
+    -- with `?? false` the guard is Stable⁺, and the `assert` fails at `S` already
+    GStab tdDisc true (tdGuard false) ∧
+    geval 0 (readAt (cxLog 0 2) (cxInit 0) (cxLog 0 2 1).S 2) (tdGuard false) = false := by
+  refine ⟨cxLog_validated 0 2, ?_, rfl, by simp [GStab, tdGuard], ?_, ?_, ⟨rfl, rfl⟩, ?_⟩
+  · intro j hj k o v hk hw
+    match j, hj with
+    | 0, _ =>
+      simp only [cxLog] at hw
+      by_cases h : k = false
+      · subst h; simp at hw; exact hw.1.symm
+      · simp [h] at hw
+    | 1, _ =>
+      simp only [cxLog] at hw
+      by_cases h : k = true
+      · subst h; simp [tdDisc] at hk
+      · simp [h] at hw
+  · simp [geval, readAt, cxLog, cxInit, tdGuard]
+  · simp [geval, serial, apply, cxLog, tdGuard]
+  · simp [geval, readAt, cxLog, cxInit, tdGuard]
+
+/-! ## Superseded: CEL guards
+
+The earlier model of guards as CEL, three-valued with error absorption. **Superseded** by the
+two-valued `Guard` above (§4.0 item 1); kept as history, in namespace `Planner.CEL`. -/
+
+namespace CEL
 
 /-- Guards: CEL over keys, three-valued (`none` is an error). -/
 inductive Guard (K Val : Type*)
@@ -295,77 +542,20 @@ theorem stab_upClosed {g : Guard K Val} (hs : GStab disc true g) :
     UpClosed disc bot (fun σ => geval bot σ g = some true) :=
   fun _ _ hle h => gstab_sound hle g true hs h
 
-/-! ## Counterexample: `require exists(x)` over a mutable lifecycle
-
-Keys: `false` is `x`'s lifecycle (mutable; `0` absent, `1` live; a deleted node reads as
-absent, so a delete writes `0`), and `true` is an
-output key. Entry `0` deletes `x`. Entry `1` runs at `S = ∅`, where `x` is live, checks
-`require exists(x)`, and writes the output key, which is its whole read set. Every hypothesis of
-`Validated` holds, but the guard is false at entry `1`'s log position. -/
-
-def mlDisc : Bool → DiscK := fun _ => .mutable
-
-def mlLog : ℕ → Entry Bool ℕ ℕ
-  | 0 => { stamp := 0, S := ∅, hits := fun k _ => k = false,
-           wr := fun k => if k = false then some (1, 0) else none }
-  | _ => { stamp := 1, S := ∅, hits := fun k _ => k = true,
-           wr := fun k => if k = true then some (0, 1) else none }
-
-def mlInit : Bool → ℕ := fun k => if k = false then 1 else 0
-
-def mlGuard : Guard Bool ℕ := .ex false
-
 theorem mutableLifecycle_unsound :
-    let ctx : ℕ → Finset ℕ := fun _ => ∅
-    Validated mlLog mlInit ctx 2 ∧
-    (∀ j < 2, Respects mlDisc 0 (mlLog j)) ∧
-    -- the guard reads a mutable lifecycle, so it isn't Stable⁺
-    ¬ GStab mlDisc true mlGuard ∧
-    -- it is true at `S` and false at the entry's log position
-    geval 0 (readAt mlLog mlInit (mlLog 1).S 2) mlGuard = some true ∧
-    geval 0 (serial mlLog mlInit 1) mlGuard = some false := by
-  intro ctx
-  refine ⟨⟨?_, ?_, ?_, ?_, ?_, ?_⟩, ?_, by simp [GStab, mlGuard, mlDisc], ?_, ?_⟩
-  · intro i hi j hj _ ⟨k, o, v, hw, hk⟩
-    have : i = 1 := by omega
-    subst this
-    have : j = 0 := by omega
-    subst this
-    simp only [mlLog] at hw hk
-    by_cases h : k = false
-    · subst h; simp at hk
-    · simp [h] at hw
-  · intro i hi k o v hw x
-    match i, hi with
-    | 0, _ => simp only [mlLog] at hw ⊢; by_contra h; simp [h] at hw
-    | 1, _ => simp only [mlLog] at hw ⊢; by_contra h; simp [h] at hw
-  · intro i hi k o v hw
-    match i, hi with
-    | 0, _ =>
-      simp only [mlLog] at hw
-      by_cases h : k = false
-      · subst h; simp at hw; rw [← hw.1]; simp [readAt, mlLog, mlInit]
-      · simp [h] at hw
-    | 1, _ =>
-      simp only [mlLog] at hw
-      by_cases h : k = true
-      · subst h; simp at hw; rw [← hw.1]; simp [readAt, mlLog, mlInit]
-      · simp [h] at hw
-  · intro i hi j hij hj
-    match i, j, hi, hj with
-    | 0, 0, _, _ => simp [mlLog]
-    | 0, 1, _, _ => simp [mlLog]
-    | 1, 1, _, _ => simp [mlLog]
-  · intro i hi; match i, hi with
-    | 0, _ => simp [mlLog]
-    | 1, _ => simp [mlLog]
-  · intro i hi; match i, hi with
-    | 0, _ => simp [mlLog, CausallyClosed]
-    | 1, _ => simp [mlLog, CausallyClosed]
+    Validated (cxLog 1 0) (cxInit 1) (fun _ => ∅) 2 ∧
+    (∀ j < 2, Respects mlDisc 0 (cxLog 1 0 j)) ∧
+    ¬ GStab mlDisc true (.ex false : Guard Bool ℕ) ∧
+    geval 0 (readAt (cxLog 1 0) (cxInit 1) (cxLog 1 0 1).S 2) (.ex false : Guard Bool ℕ) =
+      some true ∧
+    geval 0 (serial (cxLog 1 0) (cxInit 1) 1) (.ex false : Guard Bool ℕ) = some false := by
+  refine ⟨cxLog_validated 1 0, ?_, by simp [GStab, mlDisc], ?_, ?_⟩
   · intro j _ k o v hk _
     exact absurd rfl hk
-  · simp [geval, readAt, mlLog, mlInit, mlGuard]
-  · simp [geval, serial, apply, mlLog, mlGuard]
+  · simp [geval, readAt, cxLog, cxInit]
+  · simp [geval, serial, apply, cxLog]
+
+end CEL
 
 end Planner
 end Shep

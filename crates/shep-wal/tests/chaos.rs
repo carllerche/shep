@@ -25,8 +25,10 @@ const INCREMENTS: usize = 20;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn chaos_keeps_the_log_serializable() {
-    let mut cluster =
-        Cluster::start_with(3, &[P1], |c| c.commit_timeout = Duration::from_millis(800)).await;
+    let mut cluster = Cluster::start_with(3, &[P1], |c| {
+        c.raft.proposals.commit_timeout = Duration::from_millis(800)
+    })
+    .await;
     let regs = Registers::follow(&cluster.client, P1);
     let done = Arc::new(AtomicBool::new(false));
 

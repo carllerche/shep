@@ -1,0 +1,16 @@
+[package]
+name = "shep-smp"
+description = "Thread-per-core: one current_thread runtime per core, mailboxes, and sharded services"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+core_affinity.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+futures.workspace = true

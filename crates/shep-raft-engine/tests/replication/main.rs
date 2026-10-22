@@ -1,0 +1,22 @@
+#![cfg_attr(feature = "bt", feature(error_generic_member_access))]
+#![allow(clippy::uninlined_format_args)]
+extern crate shep_raft_engine as openraft;
+#[macro_use]
+#[path = "../fixtures/mod.rs"]
+mod fixtures;
+
+mod t10_append_entries_partial_success;
+mod t11_probe_partial_success_without_entry;
+mod t20_empty_log_entries;
+mod t50_append_entries_backoff;
+mod t50_append_entries_backoff_rejoin;
+mod t51_backoff_cleared_after_success;
+mod t52_reset_backoff;
+mod t60_feature_loosen_follower_log_revert;
+mod t61_allow_follower_log_revert;
+mod t62_follower_clear_restart_recover;
+mod t99_issue_1500_heartbeat_cause_reversion_panic;
+mod t99_issue_1795_storage_error_stops_replication;
+mod t99_issue_2004_redundant_commit_only_append;
+mod t99_issue_2085_conflict_updates_clock_progress;
+mod t99_issue_2085_partial_success_updates_clock_progress;

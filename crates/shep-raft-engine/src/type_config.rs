@@ -1,0 +1,269 @@
+//! Define the configuration of types used by the Raft, such as [`NodeId`], log [`Entry`], etc.
+//!
+//! [`NodeId`]: `RaftTypeConfig::NodeId`
+//! [`Entry`]: `RaftTypeConfig::Entry`
+
+pub mod async_runtime;
+pub(crate) mod util;
+
+use std::fmt::Debug;
+
+pub use async_runtime::AsyncRuntime;
+pub use async_runtime::OneshotSender;
+use openraft_macros::since;
+pub use util::TypeConfigExt;
+
+use crate::AppData;
+use crate::AppDataResponse;
+use crate::Node;
+use crate::NodeId;
+use crate::OptionalSend;
+use crate::OptionalSync;
+use crate::batch::Batch;
+use crate::entry::RaftEntry;
+use crate::entry::RaftPayload;
+use crate::errors::ErrorSource;
+use crate::raft::responder::Responder;
+use crate::vote::RaftLeaderId;
+use crate::vote::RaftTerm;
+use crate::vote::raft_vote::RaftVote;
+
+/// Type configuration for customizing Raft components.
+///
+/// `RaftTypeConfig` defines all pluggable types used by Raft, including application data types,
+/// node identifiers, async runtime, and internal data structures. Applications implement this
+/// trait (typically via the [`declare_raft_types!`] macro) to configure Raft for their needs.
+///
+/// # Examples
+///
+/// ## Minimal Configuration
+///
+/// Use defaults for all types except application data:
+///
+/// ```ignore
+/// openraft::declare_raft_types!(
+///     pub MyTypeConfig:
+///         D = String,
+///         R = String,
+/// );
+/// ```
+///
+/// ## Full Configuration
+///
+/// Specify all types explicitly:
+///
+/// ```ignore
+/// openraft::declare_raft_types!(
+///     pub MyTypeConfig:
+///         D                = ClientRequest,
+///         R                = ClientResponse,
+///         NodeId           = u64,
+///         Node             = openraft::impls::BasicNode,
+///         Term             = u64,
+///         LeaderId         = openraft::impls::leader_id_adv::LeaderId<Self::Term, Self::NodeId>,
+///         Vote             = openraft::impls::Vote<Self::LeaderId>,
+///         Payload          = openraft::EntryPayload<Self::D, Self::NodeId, Self::Node>,
+///         Entry            = openraft::impls::Entry<
+///             <Self::LeaderId as openraft::vote::RaftLeaderId>::Committed,
+///             Self::Payload,
+///         >,
+///         Responder<T>     = openraft::impls::OneshotResponder<Self, T>,
+///         AsyncRuntime     = openraft::impls::TokioRuntime,
+/// );
+/// ```
+///
+/// Then use your config with Raft:
+///
+/// ```ignore
+/// type MyRaft = Raft<MyTypeConfig, MyStateMachine>;
+/// let raft = MyRaft::new(id, config, network, log_store, state_machine).await?;
+/// ```
+///
+/// # See Also
+///
+/// - [`declare_raft_types!`] macro for easy type configuration
+/// - Each associated type's documentation for requirements and defaults
+///
+/// [`Raft`]: crate::Raft
+/// [`declare_raft_types!`]: crate::declare_raft_types
+#[since(version = "0.10.0", change = "added `Payload` associated type")]
+pub trait RaftTypeConfig:
+    Sized + OptionalSend + OptionalSync + Debug + Clone + Copy + Default + Eq + PartialEq + Ord + PartialOrd + 'static
+{
+    /// Application-specific request data passed to the state machine.
+    type D: AppData;
+
+    /// Application-specific response data returned by the state machine.
+    type R: AppDataResponse;
+
+    /// A Raft node's ID.
+    type NodeId: NodeId;
+
+    /// Raft application level node data
+    type Node: Node;
+
+    /// Type representing a Raft term number.
+    ///
+    /// A term is a logical clock in Raft that is used to detect obsolete information,
+    /// such as old leaders. It must be totally ordered and monotonically increasing.
+    ///
+    /// Common implementations are provided for standard integer types like `u64`, `i64`, etc.
+    ///
+    /// See: [`RaftTerm`] for the required methods.
+    type Term: RaftTerm;
+
+    /// A Leader identifier in a cluster.
+    type LeaderId: RaftLeaderId<Term = Self::Term, NodeId = Self::NodeId>;
+
+    /// Raft vote type.
+    ///
+    /// It represents a candidate's vote or a leader's vote that has been granted by a quorum.
+    #[since(
+        version = "0.10.0",
+        change = "from `RaftVote<Self>` to `RaftVote<LeaderId = Self::LeaderId>`"
+    )]
+    type Vote: RaftVote<LeaderId = Self::LeaderId>;
+
+    /// Raft log entry payload.
+    #[since(version = "0.10.0", change = "added configurable log payload type")]
+    type Payload: RaftPayload<D = Self::D, NodeId = Self::NodeId, Node = Self::Node>;
+
+    /// Raft log entry with the configured payload.
+    #[since(version = "0.10.0", change = "link entry payload to configured `Payload`")]
+    #[since(
+        version = "0.10.0",
+        change = "from `RaftEntry<Self>` to `RaftEntry` with associated type constraints"
+    )]
+    type Entry: RaftEntry<CommittedLeaderId = <Self::LeaderId as RaftLeaderId>::Committed, Payload = Self::Payload>;
+
+    /// Asynchronous runtime type.
+    type AsyncRuntime: AsyncRuntime;
+
+    /// Responder type for sending client write responses asynchronously.
+    ///
+    /// Responders send results back to the caller of [`Raft::client_write`] or to
+    /// application-defined channels. The generic parameter `T` is the type of result
+    /// being sent (e.g., [`ClientWriteResult`](crate::raft::ClientWriteResult) for client write
+    /// operations).
+    ///
+    /// Applications create responders (typically using oneshot channels) and pass them
+    /// to Raft APIs that need to send asynchronous responses.
+    ///
+    /// [`Raft::client_write`]: `crate::raft::Raft::client_write`
+    type Responder<T>: Responder<Self, T>
+    where T: OptionalSend + 'static;
+
+    type Batch<T>: Batch<T>
+    where T: OptionalSend + 'static;
+
+    /// Error wrapper type for storage and network errors.
+    ///
+    /// This type is used to wrap underlying errors in storage and network operations.
+    /// The default implementation uses [`anyerror::AnyError`].
+    ///
+    /// Custom implementations can provide:
+    /// - Enhanced diagnostic capabilities
+    /// - In-place error storage (no heap allocation)
+    /// - Robustness against out-of-memory conditions
+    ///
+    /// See [`ErrorSource`] for the required methods.
+    type ErrorSource: ErrorSource;
+}
+
+#[allow(dead_code)]
+#[allow(missing_docs)]
+/// Type alias for types used in `RaftTypeConfig`.
+///
+/// Aliases are enabled by the feature flag [`type-alias`].
+///
+/// [`type-alias`]: crate::docs::feature_flags#feature-flag-type-alias
+pub mod alias {
+    use openraft_macros::since;
+
+    use crate::EntryPayload;
+    use crate::LogId;
+    use crate::RaftTypeConfig;
+    use crate::async_runtime::Mpsc;
+    use crate::async_runtime::Oneshot;
+    use crate::async_runtime::watch;
+    use crate::raft::message::ClientWriteResult;
+    use crate::storage::RaftStateMachine;
+    use crate::type_config::AsyncRuntime;
+    use crate::vote::RaftLeaderId;
+
+    pub type DOf<C> = <C as RaftTypeConfig>::D;
+    pub type ROf<C> = <C as RaftTypeConfig>::R;
+    pub type AppDataOf<C> = <C as RaftTypeConfig>::D;
+    pub type AppResponseOf<C> = <C as RaftTypeConfig>::R;
+    pub type NodeIdOf<C> = <C as RaftTypeConfig>::NodeId;
+    pub type NodeOf<C> = <C as RaftTypeConfig>::Node;
+    pub type TermOf<C> = <C as RaftTypeConfig>::Term;
+    pub type LeaderIdOf<C> = <C as RaftTypeConfig>::LeaderId;
+    pub type VoteOf<C> = <C as RaftTypeConfig>::Vote;
+    #[since(version = "0.10.0")]
+    pub type PayloadOf<C> = <C as RaftTypeConfig>::Payload;
+    pub type EntryOf<C> = <C as RaftTypeConfig>::Entry;
+    pub type SnapshotDataOf<C, SM> = <SM as RaftStateMachine<C>>::SnapshotData;
+    pub type AsyncRuntimeOf<C> = <C as RaftTypeConfig>::AsyncRuntime;
+    pub type ResponderOf<C, T> = <C as RaftTypeConfig>::Responder<T>;
+    pub type BatchOf<C, T> = <C as RaftTypeConfig>::Batch<T>;
+    pub type ErrorSourceOf<C> = <C as RaftTypeConfig>::ErrorSource;
+    pub type WriteResponderOf<C> = ResponderOf<C, ClientWriteResult<C>>;
+
+    type Rt<C> = AsyncRuntimeOf<C>;
+
+    pub type JoinErrorOf<C> = <Rt<C> as AsyncRuntime>::JoinError;
+    pub type JoinHandleOf<C, T> = <Rt<C> as AsyncRuntime>::JoinHandle<T>;
+    pub type SleepOf<C> = <Rt<C> as AsyncRuntime>::Sleep;
+    pub type InstantOf<C> = <Rt<C> as AsyncRuntime>::Instant;
+    pub type TimeoutErrorOf<C> = <Rt<C> as AsyncRuntime>::TimeoutError;
+    pub type TimeoutOf<C, R, F> = <Rt<C> as AsyncRuntime>::Timeout<R, F>;
+
+    pub type OneshotOf<C> = <Rt<C> as AsyncRuntime>::Oneshot;
+    pub type OneshotSenderOf<C, T> = <OneshotOf<C> as Oneshot>::Sender<T>;
+    pub type OneshotReceiverErrorOf<C> = <OneshotOf<C> as Oneshot>::ReceiverError;
+    pub type OneshotReceiverOf<C, T> = <OneshotOf<C> as Oneshot>::Receiver<T>;
+
+    pub type MpscOf<C> = <Rt<C> as AsyncRuntime>::Mpsc;
+
+    // MPSC bounded
+    type MpscB<C> = MpscOf<C>;
+
+    pub type MpscSenderOf<C, T> = <MpscB<C> as Mpsc>::Sender<T>;
+    pub type MpscReceiverOf<C, T> = <MpscB<C> as Mpsc>::Receiver<T>;
+    pub type MpscWeakSenderOf<C, T> = <MpscB<C> as Mpsc>::WeakSender<T>;
+
+    pub type WatchOf<C> = <Rt<C> as AsyncRuntime>::Watch;
+    pub type WatchSenderOf<C, T> = <WatchOf<C> as watch::Watch>::Sender<T>;
+    pub type WatchReceiverOf<C, T> = <WatchOf<C> as watch::Watch>::Receiver<T>;
+
+    pub type MutexOf<C, T> = <Rt<C> as AsyncRuntime>::Mutex<T>;
+
+    // Usually used types
+    pub type LogIdOf<C> = LogId<CommittedLeaderIdOf<C>>;
+    pub type CommittedLeaderIdOf<C> = <LeaderIdOf<C> as RaftLeaderId>::Committed;
+    pub(crate) type RefLogIdOf<'a, C> = crate::log_id::ref_log_id::RefLogId<'a, CommittedLeaderIdOf<C>>;
+    pub type EntryPayloadOf<C> = EntryPayload<DOf<C>, NodeIdOf<C>, NodeOf<C>>;
+    #[since(version = "0.10.0", change = "use configured payload type")]
+    pub type DefaultEntryOf<C> = crate::Entry<CommittedLeaderIdOf<C>, PayloadOf<C>>;
+    pub type StoredMembershipOf<C> = crate::StoredMembership<CommittedLeaderIdOf<C>, NodeIdOf<C>, NodeOf<C>>;
+    pub type SnapshotSignatureOf<C> = crate::storage::SnapshotSignature<CommittedLeaderIdOf<C>>;
+    pub type SnapshotMetaOf<C> = crate::storage::SnapshotMeta<CommittedLeaderIdOf<C>, NodeIdOf<C>, NodeOf<C>>;
+    pub type SnapshotOf<C, SD> = crate::storage::Snapshot<CommittedLeaderIdOf<C>, NodeIdOf<C>, NodeOf<C>, SD>;
+    pub type SmSnapshotOf<C, SM> = SnapshotOf<C, SnapshotDataOf<C, SM>>;
+    pub type MembershipStateOf<C> = crate::MembershipState<CommittedLeaderIdOf<C>, NodeIdOf<C>, NodeOf<C>>;
+    pub type ChangeMembershipErrorOf<C> = crate::errors::ChangeMembershipError<CommittedLeaderIdOf<C>, NodeIdOf<C>>;
+    pub type InProgressOf<C> = crate::errors::InProgress<CommittedLeaderIdOf<C>>;
+    pub type SerdeInstantOf<C> = crate::metrics::SerdeInstant<InstantOf<C>>;
+
+    // Projections from a LeaderId type (LID: RaftLeaderId)
+    pub(crate) type LeaderTerm<LID> = <LID as RaftLeaderId>::Term;
+    pub(crate) type LeaderNodeId<LID> = <LID as RaftLeaderId>::NodeId;
+    pub(crate) type LeaderCommitted<LID> = <LID as RaftLeaderId>::Committed;
+
+    // Internal vote types parameterized by C
+    pub(crate) type CommittedVoteOf<C> = crate::vote::committed::CommittedVote<LeaderIdOf<C>>;
+    pub(crate) type UncommittedVoteOf<C> = crate::vote::non_committed::UncommittedVote<LeaderIdOf<C>>;
+
+    pub type LogIdListOf<C> = crate::engine::log_id_list::LogIdList<CommittedLeaderIdOf<C>>;
+}

@@ -1,0 +1,458 @@
+use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::Result;
+use maplit::btreeset;
+use openraft::Config;
+use openraft::ServerState;
+use openraft::StepDownPolicy;
+use openraft::Vote;
+use openraft::errors::ClientWriteError;
+use openraft::type_config::TypeConfigExt;
+use openraft_memstore::ClientRequest;
+use openraft_memstore::IntoMemClientRequest;
+use openraft_memstore::TypeConfig;
+
+use crate::fixtures::RaftRouter;
+use crate::fixtures::log_id;
+use crate::fixtures::ut_harness;
+
+/// Change membership from {0,1} to {1,2,3}.
+///
+/// - The leader should transfer leadership and step down after the second membership log is
+///   committed.
+/// - Check logs on other node.
+#[tracing::instrument]
+#[test_harness::test(harness = ut_harness)]
+async fn remove_leader() -> Result<()> {
+    // Setup test dependencies.
+    let config = Arc::new(
+        Config {
+            election_timeout_min: 800,
+            election_timeout_max: 1000,
+            enable_heartbeat: false,
+            ..Default::default()
+        }
+        .validate()?,
+    );
+    let mut router = RaftRouter::new(config.clone());
+
+    let mut log_index = router.new_cluster(btreeset! {0,1}, btreeset! {2,3}).await?;
+
+    // Submit a config change which adds two new nodes and removes the current leader.
+    let orig_leader = router.leader().expect("expected the cluster to have a leader");
+    assert_eq!(0, orig_leader, "expected original leader to be node 0");
+    for id in [0, 1] {
+        router.wait(&id, timeout()).applied_index(Some(log_index), "add learner").await?;
+    }
+
+    let node = router.get_raft_handle(&orig_leader)?;
+    node.change_membership([1, 2, 3], false).await?;
+    // 2 for change_membership
+    log_index += 2;
+
+    tracing::info!(log_index, "--- old leader commits 2 membership log");
+    {
+        router
+            .wait(&orig_leader, timeout())
+            .applied_index(Some(log_index), "old leader commits 2 membership log")
+            .await?;
+    }
+
+    // Another node(e.g. node-1) in the old cluster may not commit the second membership change log.
+    // Because to commit the 2nd log it only need a quorum of the new cluster.
+
+    router
+        .wait(&1, timeout())
+        .applied_index_at_least(Some(log_index), "node in old cluster commits at least 1 membership log")
+        .await?;
+
+    tracing::info!(log_index, "--- new cluster commits 2 membership logs");
+    {
+        // leader commit a new log.
+        log_index += 1;
+        tracing::debug!("--- expect log_index:{}", log_index);
+
+        for id in [2, 3] {
+            // There may be a log conflict when running with `single-term-leader` feature flag enabled.
+            // Thus wait a little bit longer for this check
+            router
+                .wait(&id, Some(Duration::from_millis(10_000)))
+                .applied_index_at_least(
+                    Some(log_index),
+                    "node in new cluster finally commit at least one blank leader-initialize log",
+                )
+                .await?;
+        }
+    }
+
+    tracing::info!(log_index, "--- check term in new cluster");
+    {
+        for id in [1, 2, 3] {
+            router
+                .wait(&id, timeout())
+                .metrics(
+                    |x| x.current_term >= 2,
+                    "new cluster has term >= 2 because of new election",
+                )
+                .await?;
+        }
+    }
+
+    tracing::info!(log_index, "--- check state of the old leader");
+    {
+        let metrics = router.wait(&0, timeout()).state(ServerState::Learner, "old leader steps down").await?;
+        let cfg = &metrics.membership_config.membership();
+
+        assert_eq!(metrics.current_term, 1);
+        assert_eq!(metrics.last_log_index, Some(8));
+        assert_eq!(metrics.last_applied, Some(log_id(1, 0, 8)));
+        assert_eq!(metrics.membership_config.membership().get_joint_config().clone(), vec![
+            btreeset![1, 2, 3]
+        ]);
+        assert_eq!(1, cfg.get_joint_config().len());
+    }
+
+    Ok(())
+}
+
+/// Change membership from {0,1} to {1,2,3}, keep node-0 as learner;
+///
+/// - The leader should NOT step down after joint log is committed.
+#[tracing::instrument]
+#[test_harness::test(harness = ut_harness)]
+async fn remove_leader_and_convert_to_learner() -> Result<()> {
+    let config = Arc::new(
+        Config {
+            election_timeout_min: 800,
+            election_timeout_max: 1000,
+            enable_elect: false,
+            enable_heartbeat: false,
+            ..Default::default()
+        }
+        .validate()?,
+    );
+    let mut router = RaftRouter::new(config.clone());
+
+    let mut log_index = router.new_cluster(btreeset! {0,1}, btreeset! {2,3}).await?;
+
+    let old_leader = 0;
+
+    tracing::info!(log_index, "--- change membership and retain removed node as learner");
+    {
+        let node = router.get_raft_handle(&old_leader)?;
+        node.change_membership([1, 2, 3], true).await?;
+        log_index += 2;
+    }
+
+    tracing::info!(log_index, "--- old leader commits 2 membership log");
+    {
+        router
+            .wait(&old_leader, timeout())
+            .applied_index(Some(log_index), "old leader commits 2 membership log")
+            .await?;
+    }
+
+    // Another node(e.g. node-1) in the old cluster may not commit the second membership change log.
+    // Because to commit the 2nd log it only need a quorum of the new cluster.
+
+    router
+        .wait(&1, timeout())
+        .applied_index_at_least(
+            Some(log_index - 1),
+            "node in old cluster commits at least 1 membership log",
+        )
+        .await?;
+
+    tracing::info!(log_index, "--- wait 1 sec, old leader(non-voter) stays as a leader");
+    {
+        TypeConfig::sleep(Duration::from_millis(1_000)).await;
+
+        router
+            .wait(&0, timeout())
+            .state(
+                ServerState::Leader,
+                "old leader is not removed from membership, it is still a leader",
+            )
+            .await?;
+    }
+
+    Ok(())
+}
+
+/// Change membership from {0,1,2} to {1,2}: the removed leader transfers leadership and steps
+/// down automatically.
+///
+/// Election is disabled: the new leader can only be established by transfer-leader.
+#[tracing::instrument]
+#[test_harness::test(harness = ut_harness)]
+async fn remove_leader_auto_transfer() -> Result<()> {
+    let config = Arc::new(
+        Config {
+            enable_heartbeat: false,
+            enable_elect: false,
+            ..Default::default()
+        }
+        .validate()?,
+    );
+    let mut router = RaftRouter::new(config.clone());
+
+    let mut log_index = router.new_cluster(btreeset! {0,1,2}, btreeset! {}).await?;
+
+    tracing::info!(log_index, "--- change membership 012 to 12");
+    {
+        let node = router.get_raft_handle(&0)?;
+        node.change_membership([1, 2], false).await?;
+        log_index += 2;
+    }
+
+    tracing::info!(
+        log_index,
+        "--- a new leader is established by transfer-leader, not by election"
+    );
+    {
+        router
+            .wait(&1, timeout())
+            .metrics(
+                |x| matches!(x.current_leader, Some(1) | Some(2)) && x.current_term >= 2,
+                "a new leader is established by transfer-leader",
+            )
+            .await?;
+    }
+
+    tracing::info!(log_index, "--- the removed leader reverts to learner");
+    {
+        let metrics = router.wait(&0, timeout()).state(ServerState::Learner, "removed leader steps down").await?;
+        assert_eq!(
+            metrics.current_term, 1,
+            "the removed leader is not disturbed by the new election"
+        );
+    }
+
+    Ok(())
+}
+
+/// Change membership from {0,1,2} to {1,2} with the automated step down disabled.
+///
+/// The removed leader keeps leading, until the application reverts it to a learner with
+/// `Trigger::refresh_server_state()`.
+#[tracing::instrument]
+#[test_harness::test(harness = ut_harness)]
+async fn remove_leader_manual_step_down() -> Result<()> {
+    let config = Arc::new(
+        Config {
+            enable_heartbeat: false,
+            enable_elect: false,
+            removed_leader_step_down: StepDownPolicy::Never,
+            ..Default::default()
+        }
+        .validate()?,
+    );
+    let mut router = RaftRouter::new(config.clone());
+
+    let mut log_index = router.new_cluster(btreeset! {0,1,2}, btreeset! {}).await?;
+
+    tracing::info!(log_index, "--- change membership 012 to 12");
+    {
+        let node = router.get_raft_handle(&0)?;
+        node.change_membership([1, 2], false).await?;
+        log_index += 2;
+    }
+
+    tracing::info!(log_index, "--- the removed leader keeps leading");
+    {
+        let res = router
+            .wait(&0, Some(Duration::from_millis(1_000)))
+            .metrics(
+                |x| x.state != ServerState::Leader,
+                "the removed leader leaves the Leader state",
+            )
+            .await;
+
+        assert!(
+            res.is_err(),
+            "the automated step down is disabled, the removed leader keeps leading"
+        );
+    }
+
+    tracing::info!(log_index, "--- manually revert the removed leader to a learner");
+    {
+        let node = router.get_raft_handle(&0)?;
+        node.trigger().refresh_server_state(None, None).await?;
+
+        router.wait(&0, timeout()).state(ServerState::Learner, "removed leader reverts to learner").await?;
+    }
+
+    Ok(())
+}
+
+/// Change membership from {0,1,2} to {1,2} with the automated step down disabled, then step down
+/// the removed leader with a fenced `Trigger::refresh_server_state()`.
+///
+/// The refresh is dropped if the expected vote or the expected membership log id does not match
+/// the current state; it proceeds when both match.
+#[tracing::instrument]
+#[test_harness::test(harness = ut_harness)]
+async fn remove_leader_fenced_step_down() -> Result<()> {
+    let config = Arc::new(
+        Config {
+            enable_heartbeat: false,
+            enable_elect: false,
+            removed_leader_step_down: StepDownPolicy::Never,
+            ..Default::default()
+        }
+        .validate()?,
+    );
+    let mut router = RaftRouter::new(config.clone());
+
+    let mut log_index = router.new_cluster(btreeset! {0,1,2}, btreeset! {}).await?;
+
+    tracing::info!(log_index, "--- change membership 012 to 12");
+    {
+        let node = router.get_raft_handle(&0)?;
+        node.change_membership([1, 2], false).await?;
+        log_index += 2;
+    }
+
+    let node = router.get_raft_handle(&0)?;
+    let metrics = router
+        .wait(&0, timeout())
+        .applied_index(Some(log_index), "the removed leader applies the membership logs")
+        .await?;
+    let vote = metrics.vote;
+    let membership_log_id =
+        (*metrics.membership_config.log_id()).expect("an initialized cluster has a membership log id");
+
+    tracing::info!(log_index, "--- mismatching expected vote: the refresh is dropped");
+    {
+        let mismatching = Vote::new(100, 100);
+        node.trigger().refresh_server_state(Some(mismatching), None).await?;
+
+        let res = router
+            .wait(&0, Some(Duration::from_millis(1_000)))
+            .metrics(
+                |x| x.state != ServerState::Leader,
+                "the removed leader leaves the Leader state",
+            )
+            .await;
+        assert!(res.is_err(), "the expected vote does not match, the refresh is dropped");
+    }
+
+    tracing::info!(
+        log_index,
+        "--- mismatching expected membership log id: the refresh is dropped"
+    );
+    {
+        let mismatching = log_id(1, 0, 1);
+        node.trigger().refresh_server_state(None, Some(mismatching)).await?;
+
+        let res = router
+            .wait(&0, Some(Duration::from_millis(1_000)))
+            .metrics(
+                |x| x.state != ServerState::Leader,
+                "the removed leader leaves the Leader state",
+            )
+            .await;
+        assert!(
+            res.is_err(),
+            "the expected membership log id does not match, the refresh is dropped"
+        );
+    }
+
+    tracing::info!(
+        log_index,
+        "--- matching vote and membership log id: the refresh proceeds"
+    );
+    {
+        node.trigger().refresh_server_state(Some(vote), Some(membership_log_id)).await?;
+
+        router.wait(&0, timeout()).state(ServerState::Learner, "removed leader reverts to learner").await?;
+    }
+
+    Ok(())
+}
+
+/// Change membership from {0,1,2} to {2}. Access {2} at once.
+///
+/// It should not respond a ForwardToLeader error that pointing to the removed leader.
+#[tracing::instrument]
+#[test_harness::test(harness = ut_harness)]
+async fn remove_leader_access_new_cluster() -> Result<()> {
+    // Setup test dependencies.
+    let config = Arc::new(
+        Config {
+            enable_heartbeat: false,
+            enable_elect: false,
+            // Disable the automated step down, to keep the new cluster leaderless.
+            removed_leader_step_down: StepDownPolicy::Never,
+            ..Default::default()
+        }
+        .validate()?,
+    );
+    let mut router = RaftRouter::new(config.clone());
+
+    let mut log_index = router.new_cluster(btreeset! {0,1,2}, btreeset! {}).await?;
+
+    let orig_leader = 0;
+
+    tracing::info!(log_index, "--- change membership 012 to 2");
+    {
+        let node = router.get_raft_handle(&orig_leader)?;
+        node.change_membership([2], false).await?;
+        // 2 change_membership logs
+        log_index += 2;
+
+        router
+            .wait(&2, timeout())
+            .metrics(
+                |x| x.last_log_index == Some(log_index),
+                "node-2 receives 2 membership logs",
+            )
+            .await?;
+    }
+
+    tracing::info!(log_index, "--- old leader commits 2 membership log");
+    {
+        router
+            .wait(&orig_leader, timeout())
+            .applied_index(Some(log_index), "old leader commits 2 membership log")
+            .await?;
+    }
+
+    let res = router.send_client_request(2, ClientRequest::make_request("foo", 1)).await;
+    match res {
+        Ok(_) => {
+            unreachable!("expect error");
+        }
+        Err(cli_err) => match cli_err.api_error().unwrap() {
+            ClientWriteError::ForwardToLeader(fwd) => {
+                assert!(fwd.leader_id.is_none());
+                assert!(fwd.leader_node.is_none());
+            }
+            _ => {
+                unreachable!("expect ForwardToLeader");
+            }
+        },
+    }
+
+    tracing::info!(log_index, "--- elect node-2, handle write");
+    {
+        let n2 = router.get_raft_handle(&2)?;
+        n2.runtime_config().elect(true);
+        n2.wait(timeout()).state(ServerState::Leader, "node-2 elect itself").await?;
+        log_index += 1;
+
+        router.send_client_request(2, ClientRequest::make_request("foo", 1)).await?;
+        log_index += 1;
+
+        n2.wait(timeout())
+            .applied_index(Some(log_index), "node-2 become leader and handle write request")
+            .await?;
+    }
+
+    Ok(())
+}
+
+fn timeout() -> Option<Duration> {
+    Some(Duration::from_millis(3_000))
+}

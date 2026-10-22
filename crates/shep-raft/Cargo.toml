@@ -1,0 +1,25 @@
+[package]
+name = "shep-raft"
+description = "Multi-raft on thread-per-core: shep-raft-engine groups on per-core runtimes, over shep-rpc and shep-storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+bytes.workspace = true
+futures.workspace = true
+rand.workspace = true
+serde.workspace = true
+shep-codec.workspace = true
+shep-raft-engine = { workspace = true, features = ["tokio-rt", "single-threaded"] }
+shep-rpc.workspace = true
+shep-smp.workspace = true
+shep-storage.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tracing-subscriber.workspace = true

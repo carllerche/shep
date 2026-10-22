@@ -12,15 +12,22 @@ use support::*;
 
 const LIMIT: usize = 64 << 10;
 
-/// Entries that each fit, but not many to a message, replicate and tail in
-/// batches under the limit.
+/// Entries that each fit in a request, but not many to one, replicate in
+/// AppendEntries bounded by bytes: a peer closes any connection that sends a
+/// request over its memory budget, so an unbounded catch-up batch would never
+/// get through. Fetches are bounded by bytes too.
 #[tokio::test(flavor = "multi_thread")]
 async fn batches_respect_the_message_limit() {
-    let mut cluster = Cluster::start_with(3, &[P1], |c| c.max_message_size = LIMIT).await;
+    let mut cluster = Cluster::start_with(3, &[P1], |c| {
+        c.raft.server.max_memory = LIMIT;
+        c.raft.max_append_bytes = LIMIT / 2;
+        c.raft.proposals.max_entry_bytes = LIMIT / 2;
+    })
+    .await;
     let small = WalClient::with_config(
         cluster.client.addrs(),
         ClientConfig {
-            max_message_size: LIMIT,
+            fetch_max_bytes: (LIMIT / 2) as u32,
             ..ClientConfig::default()
         },
     )
@@ -40,12 +47,12 @@ async fn batches_respect_the_message_limit() {
         .iter()
         .filter(|e| matches!(&e.kind, EntryKind::Mutation(m) if m.payload.len() == payload.len()));
     assert_eq!(big.count(), 30);
-    // Every replica got them, through bounded AppendEntries.
+    // Every replica got them.
     for i in 0..3 {
         read_node_log(&cluster, i, P1, last).await;
     }
 
-    // An entry that couldn't fit in half a message is refused.
+    // An entry over the leader's limit is refused.
     let huge = mutation(
         at(P1, last),
         vec![],

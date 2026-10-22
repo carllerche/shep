@@ -116,6 +116,8 @@ CONSTANTS
                  \*   flag (design); "none": ctx = S
   OpReadRule,    \* TRUE: an op on a field another consumer reads compiles to
                  \*   a validated write (design)
+  OpLifeRead,    \* TRUE: an op's proposal reads (validates) its node's
+                 \*   lifecycle key, so a concurrent delete is contended (design)
   RetryFresh,    \* TRUE: a stale false re-executes at the leaders' commit
                  \*   indexes (design); FALSE: at any materializer version
   RetryWhole     \* TRUE: the whole mutation re-executes at S' (S' becomes S
@@ -314,7 +316,8 @@ Stage(t, r, S, skip) ==
       eff == Effect(g, s)
       ops == OpsOf(g)
       W == [k \in DOMAIN eff \ ops |-> <<s[k], eff[k]>>]
-      R == ((IF skip THEN {} ELSE GuardKeys(g)) \cup DOMAIN W) \ ops
+      R == (((IF skip THEN {} ELSE GuardKeys(g)) \cup DOMAIN W) \ ops)
+             \ (IF ~ OpLifeRead /\ ops # {} THEN {"iLife"} ELSE {})
   IN IF BreaksAt(W, r)                          \* front-end enforcement
      THEN Fail(t, "discipline")
      ELSE /\ st' = [st EXCEPT ![t] = "prop"]
@@ -578,5 +581,13 @@ ReachInvalid == ~ \E t \in Reqs : why[t] = "invalid"
 ReachWindow == ~ \E j \in 1..Len(log[P2]) :
                    LET e == log[P2][j] IN
                    e.ops # {} /\ \E i \in 1..(j - 1) : i > e.S[P2] /\ "iStock" \in DOMAIN log[P2][i].W
+
+\* the self-prefix flag expands across partitions: the flagged entry's own
+\* context misses a P1 dot that its pending prev's context names
+ReachXSelfPre ==
+  ~ \E j \in 1..Len(log[P2]) :
+      LET e == log[P2][j]
+          js == {i \in 1..(j - 1) : "iStock" \in DOMAIN log[P2][i].W}
+      IN e.ops # {} /\ e.selfpre /\ js # {} /\ log[P2][MaxSet(js)].ctx[P1] > e.ctx[P1]
 
 =============================================================================

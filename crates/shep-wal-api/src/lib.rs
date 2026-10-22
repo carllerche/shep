@@ -1,29 +1,31 @@
-//! The WAL's client protocol (design §10.3).
+//! The WAL's client protocol (design §10.3), on shep-rpc.
 //!
 //! Front ends propose mutations to a partition's leader; materializers and
-//! other readers stream the committed log. This crate holds the gRPC
-//! definitions ([`proto`]) and the Rust types both sides use, with the
-//! conversions between them. The WAL itself treats an entry's content as
-//! opaque bytes: it validates only keys and key ranges.
+//! other readers fetch the committed log. This crate holds the messages, in
+//! shep-codec, and the method ids. The WAL itself treats an entry's content
+//! as opaque bytes: it validates only keys and key ranges.
 
 use bytes::{BufMut, Bytes, BytesMut};
+use shep_codec::{Decode, Encode};
 
 pub use shep_version::{Dot, Dvv, PartitionId};
-
-pub mod proto {
-    tonic::include_proto!("shep.wal.v1");
-}
 
 /// A WAL node's ID within its fleet.
 pub type NodeId = u64;
 
-/// A malformed message.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("malformed message: {0}")]
-pub struct DecodeError(pub String);
+/// The WAL service's methods (shep-rpc service 2).
+pub mod method {
+    pub const SERVICE: u16 = 2;
+    pub const PROPOSE: u32 = shep_rpc::method_id(SERVICE, 1);
+    pub const FETCH: u32 = shep_rpc::method_id(SERVICE, 2);
+    pub const STATUS: u32 = shep_rpc::method_id(SERVICE, 3);
+    pub const CREATE_PARTITION: u32 = shep_rpc::method_id(SERVICE, 4);
+    pub const INITIALIZE_PARTITION: u32 = shep_rpc::method_id(SERVICE, 5);
 
-fn missing(field: &str) -> DecodeError {
-    DecodeError(format!("missing `{field}`"))
+    /// Whether `method` belongs to the WAL service.
+    pub fn is_wal(method: u32) -> bool {
+        (method >> 16) as u16 == SERVICE
+    }
 }
 
 /// A range of keys in the WAL's conflict space: `[start, end)`, or
@@ -31,7 +33,7 @@ fn missing(field: &str) -> DecodeError {
 ///
 /// Read sets and write sets are lists of ranges. Front ends encode facts as
 /// keys so that every range predicate a mutation reads is a key range (§10.3).
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Encode, Decode)]
 pub struct KeyRange {
     start: Bytes,
     end: Option<Bytes>,
@@ -123,14 +125,14 @@ impl KeyRange {
 }
 
 /// A WAL replica's address, as Raft membership records it.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Encode, Decode)]
 pub struct Member {
     pub node_id: NodeId,
     pub addr: String,
 }
 
 /// What a front end sends a partition's leader (§10.3).
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Encode, Decode)]
 pub struct Proposal {
     /// Every proposal has one, so re-sending a proposal is always safe. A
     /// key's first decided outcome is its only outcome.
@@ -138,7 +140,7 @@ pub struct Proposal {
     pub kind: ProposalKind,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Encode, Decode)]
 pub enum ProposalKind {
     Mutation(Mutation),
     /// The request failed when re-executed. The leader records the failure
@@ -150,7 +152,7 @@ pub enum ProposalKind {
     },
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Encode, Decode)]
 pub struct Mutation {
     /// `S`: the causally closed version the mutation read at.
     pub read_version: Dvv,
@@ -163,24 +165,23 @@ pub struct Mutation {
     pub write_set: Vec<KeyRange>,
     /// The entry's content, opaque to the WAL.
     pub payload: Bytes,
-    /// What the front end returns to its client, kept with the idempotency
-    /// key for retries.
+    /// What the front end returns to its client, returned again to retries.
     pub reply: Bytes,
 }
 
 /// An idempotency key's outcome.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct Decided {
     /// The entry that decided it.
     pub dot: Dot,
-    /// The leader's clock when it appended the entry, in microseconds since
+    /// The leader's clock when it validated the entry, in microseconds since
     /// the Unix epoch. Non-decreasing in log order.
     pub commit_time_us: u64,
     pub status: DecidedStatus,
     pub reply: Bytes,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
 pub enum DecidedStatus {
     /// The mutation committed at `dot`.
     Committed,
@@ -189,7 +190,7 @@ pub enum DecidedStatus {
 }
 
 /// Why a proposal wasn't decided.
-#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error, Encode, Decode)]
 pub enum Rejection {
     /// A write the mutation didn't see touched its read set. Re-execute at a
     /// newer version.
@@ -213,7 +214,7 @@ pub enum Rejection {
 }
 
 /// A committed log entry, as readers of the log see it.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Encode, Decode)]
 pub struct LogEntry {
     pub dot: Dot,
     /// The Raft term it was appended in.
@@ -221,7 +222,7 @@ pub struct LogEntry {
     pub kind: EntryKind,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Encode, Decode)]
 pub enum EntryKind {
     /// Raft's own entries: a new leader's no-op, membership changes.
     Internal,
@@ -236,7 +237,7 @@ pub enum EntryKind {
     },
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Encode, Decode)]
 pub struct MutationEntry {
     pub context: Dvv,
     pub commit_time_us: u64,
@@ -245,318 +246,102 @@ pub struct MutationEntry {
 }
 
 /// What one node knows about one partition's Raft group.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Encode, Decode)]
 pub struct PartitionStatus {
     pub node_id: NodeId,
     pub term: u64,
     pub leader: Option<Member>,
+    /// The highest index in this replica's log.
     pub last_log_index: u64,
+    /// The highest index this replica has applied, which is committed.
     pub applied_index: Option<u64>,
-    pub voters: Vec<Member>,
+    pub voters: Vec<NodeId>,
 }
 
-// ---- conversions ----
+// ---- requests and replies ----
 
-impl From<Dot> for proto::Dot {
-    fn from(dot: Dot) -> Self {
-        proto::Dot {
-            partition: dot.partition.0,
-            index: dot.index,
+#[derive(Clone, Debug, PartialEq, Encode, Decode)]
+pub struct ProposeRequest {
+    pub partition: PartitionId,
+    pub proposal: Proposal,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub enum ProposeReply {
+    Decided(Decided),
+    Rejected(Rejection),
+}
+
+impl From<Result<Decided, Rejection>> for ProposeReply {
+    fn from(r: Result<Decided, Rejection>) -> Self {
+        match r {
+            Ok(d) => ProposeReply::Decided(d),
+            Err(r) => ProposeReply::Rejected(r),
         }
     }
 }
 
-impl From<proto::Dot> for Dot {
-    fn from(dot: proto::Dot) -> Self {
-        Dot::new(PartitionId(dot.partition), dot.index)
-    }
-}
-
-impl From<&Dvv> for proto::Dvv {
-    fn from(v: &Dvv) -> Self {
-        proto::Dvv {
-            parts: v
-                .partitions()
-                .map(|p| proto::DvvPart {
-                    partition: p.0,
-                    prefix: v.prefix(p),
-                    extras: v.extras(p).collect(),
-                })
-                .collect(),
+impl From<ProposeReply> for Result<Decided, Rejection> {
+    fn from(r: ProposeReply) -> Self {
+        match r {
+            ProposeReply::Decided(d) => Ok(d),
+            ProposeReply::Rejected(r) => Err(r),
         }
     }
 }
 
-impl From<proto::Dvv> for Dvv {
-    fn from(v: proto::Dvv) -> Self {
-        let mut out = Dvv::new();
-        for part in v.parts {
-            let p = PartitionId(part.partition);
-            out.raise_prefix(p, part.prefix);
-            for i in part.extras {
-                out.insert(Dot::new(p, i));
-            }
-        }
-        out
-    }
+/// Committed entries from `from_index` on: a long poll that waits up to
+/// `max_wait_ms` for at least one.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct FetchRequest {
+    pub partition: PartitionId,
+    pub from_index: u64,
+    /// About how many bytes of entries to return; at least one entry.
+    pub max_bytes: u32,
+    pub max_wait_ms: u32,
 }
 
-/// Decodes an optional message field that's required, as a version.
-pub fn dvv_from(v: Option<proto::Dvv>, field: &str) -> Result<Dvv, DecodeError> {
-    v.map(Dvv::from).ok_or_else(|| missing(field))
+#[derive(Clone, Debug, PartialEq, Encode, Decode)]
+pub enum FetchReply {
+    /// Contiguous entries from `from_index`, possibly none if the wait ran
+    /// out, and the replica's applied index when it answered.
+    Entries {
+        entries: Vec<LogEntry>,
+        applied_index: Option<u64>,
+    },
+    /// The replica no longer holds `from_index`; its log starts at `start`.
+    OutOfRange {
+        start: u64,
+    },
+    UnknownPartition,
 }
 
-impl From<&KeyRange> for proto::KeyRange {
-    fn from(r: &KeyRange) -> Self {
-        proto::KeyRange {
-            start: r.start.clone(),
-            end: r.end.clone(),
-        }
-    }
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct StatusRequest {
+    pub partition: PartitionId,
 }
 
-impl From<proto::KeyRange> for KeyRange {
-    fn from(r: proto::KeyRange) -> Self {
-        KeyRange {
-            start: r.start,
-            end: r.end,
-        }
-    }
+#[derive(Clone, Debug, PartialEq, Encode, Decode)]
+pub enum StatusReply {
+    Status(PartitionStatus),
+    UnknownPartition,
 }
 
-impl From<&Member> for proto::Member {
-    fn from(m: &Member) -> Self {
-        proto::Member {
-            node_id: m.node_id,
-            addr: m.addr.clone(),
-        }
-    }
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct CreatePartitionRequest {
+    pub partition: PartitionId,
 }
 
-impl From<proto::Member> for Member {
-    fn from(m: proto::Member) -> Self {
-        Member {
-            node_id: m.node_id,
-            addr: m.addr,
-        }
-    }
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct InitializePartitionRequest {
+    pub partition: PartitionId,
+    pub members: Vec<Member>,
 }
 
-impl From<&Proposal> for proto::Proposal {
-    fn from(p: &Proposal) -> Self {
-        let kind = match &p.kind {
-            ProposalKind::Mutation(m) => proto::proposal::Kind::Mutation(proto::Mutation {
-                read_version: Some((&m.read_version).into()),
-                context: Some((&m.context).into()),
-                read_set: m.read_set.iter().map(Into::into).collect(),
-                write_set: m.write_set.iter().map(Into::into).collect(),
-                payload: m.payload.clone(),
-                reply: m.reply.clone(),
-            }),
-            ProposalKind::Failure { reply } => proto::proposal::Kind::Failure(proto::Failure {
-                reply: reply.clone(),
-            }),
-        };
-        proto::Proposal {
-            idempotency_key: p.idempotency_key.clone(),
-            kind: Some(kind),
-        }
-    }
-}
-
-impl TryFrom<proto::Proposal> for Proposal {
-    type Error = DecodeError;
-
-    fn try_from(p: proto::Proposal) -> Result<Self, DecodeError> {
-        let kind = match p.kind.ok_or_else(|| missing("Proposal.kind"))? {
-            proto::proposal::Kind::Mutation(m) => ProposalKind::Mutation(Mutation {
-                read_version: dvv_from(m.read_version, "Mutation.read_version")?,
-                context: dvv_from(m.context, "Mutation.context")?,
-                read_set: m.read_set.into_iter().map(Into::into).collect(),
-                write_set: m.write_set.into_iter().map(Into::into).collect(),
-                payload: m.payload,
-                reply: m.reply,
-            }),
-            proto::proposal::Kind::Failure(f) => ProposalKind::Failure { reply: f.reply },
-        };
-        Ok(Proposal {
-            idempotency_key: p.idempotency_key,
-            kind,
-        })
-    }
-}
-
-impl From<&Decided> for proto::Decided {
-    fn from(d: &Decided) -> Self {
-        let status = match d.status {
-            DecidedStatus::Committed => proto::DecidedStatus::Committed,
-            DecidedStatus::Failed => proto::DecidedStatus::Failed,
-        };
-        proto::Decided {
-            dot: Some(d.dot.into()),
-            commit_time_us: d.commit_time_us,
-            status: status.into(),
-            reply: d.reply.clone(),
-        }
-    }
-}
-
-impl TryFrom<proto::Decided> for Decided {
-    type Error = DecodeError;
-
-    fn try_from(d: proto::Decided) -> Result<Self, DecodeError> {
-        let status = match d.status() {
-            proto::DecidedStatus::Committed => DecidedStatus::Committed,
-            proto::DecidedStatus::Failed => DecidedStatus::Failed,
-            proto::DecidedStatus::Unspecified => return Err(missing("Decided.status")),
-        };
-        Ok(Decided {
-            dot: d.dot.ok_or_else(|| missing("Decided.dot"))?.into(),
-            commit_time_us: d.commit_time_us,
-            status,
-            reply: d.reply,
-        })
-    }
-}
-
-impl From<&Rejection> for proto::Rejected {
-    fn from(r: &Rejection) -> Self {
-        use proto::RejectReason as R;
-        let (reason, leader, message) = match r {
-            Rejection::Contended => (R::Contended, None, String::new()),
-            Rejection::TooOld => (R::TooOld, None, String::new()),
-            Rejection::NotLeader { leader } => {
-                (R::NotLeader, leader.as_ref().map(Into::into), String::new())
-            }
-            Rejection::UnknownPartition => (R::UnknownPartition, None, String::new()),
-            Rejection::UnknownOutcome(m) => (R::UnknownOutcome, None, m.clone()),
-            Rejection::Invalid(m) => (R::Invalid, None, m.clone()),
-        };
-        proto::Rejected {
-            reason: reason.into(),
-            leader,
-            message,
-        }
-    }
-}
-
-impl TryFrom<proto::Rejected> for Rejection {
-    type Error = DecodeError;
-
-    fn try_from(r: proto::Rejected) -> Result<Self, DecodeError> {
-        use proto::RejectReason as R;
-        Ok(match r.reason() {
-            R::Contended => Rejection::Contended,
-            R::TooOld => Rejection::TooOld,
-            R::NotLeader => Rejection::NotLeader {
-                leader: r.leader.map(Into::into),
-            },
-            R::UnknownPartition => Rejection::UnknownPartition,
-            R::UnknownOutcome => Rejection::UnknownOutcome(r.message),
-            R::Invalid => Rejection::Invalid(r.message),
-            R::Unspecified => return Err(missing("Rejected.reason")),
-        })
-    }
-}
-
-impl From<&Result<Decided, Rejection>> for proto::ProposeResponse {
-    fn from(r: &Result<Decided, Rejection>) -> Self {
-        let result = match r {
-            Ok(d) => proto::propose_response::Result::Decided(d.into()),
-            Err(r) => proto::propose_response::Result::Rejected(r.into()),
-        };
-        proto::ProposeResponse {
-            result: Some(result),
-        }
-    }
-}
-
-impl TryFrom<proto::ProposeResponse> for Result<Decided, Rejection> {
-    type Error = DecodeError;
-
-    fn try_from(r: proto::ProposeResponse) -> Result<Self, DecodeError> {
-        Ok(
-            match r.result.ok_or_else(|| missing("ProposeResponse.result"))? {
-                proto::propose_response::Result::Decided(d) => Ok(d.try_into()?),
-                proto::propose_response::Result::Rejected(r) => Err(r.try_into()?),
-            },
-        )
-    }
-}
-
-impl LogEntry {
-    pub fn to_proto(&self) -> proto::LogEntry {
-        use proto::log_entry::Kind;
-        let kind = match &self.kind {
-            EntryKind::Internal => Kind::Internal(proto::Internal {}),
-            EntryKind::Void => Kind::Void(proto::Void {}),
-            EntryKind::Mutation(m) => Kind::Mutation(proto::MutationEntry {
-                context: Some((&m.context).into()),
-                commit_time_us: m.commit_time_us,
-                idempotency_key: m.idempotency_key.clone(),
-                payload: m.payload.clone(),
-            }),
-            EntryKind::Failure {
-                commit_time_us,
-                idempotency_key,
-            } => Kind::Failure(proto::FailureEntry {
-                commit_time_us: *commit_time_us,
-                idempotency_key: idempotency_key.clone(),
-            }),
-        };
-        proto::LogEntry {
-            index: self.dot.index,
-            term: self.term,
-            kind: Some(kind),
-        }
-    }
-
-    pub fn from_proto(partition: PartitionId, e: proto::LogEntry) -> Result<LogEntry, DecodeError> {
-        use proto::log_entry::Kind;
-        let kind = match e.kind.ok_or_else(|| missing("LogEntry.kind"))? {
-            Kind::Internal(_) => EntryKind::Internal,
-            Kind::Void(_) => EntryKind::Void,
-            Kind::Mutation(m) => EntryKind::Mutation(MutationEntry {
-                context: dvv_from(m.context, "MutationEntry.context")?,
-                commit_time_us: m.commit_time_us,
-                idempotency_key: m.idempotency_key,
-                payload: m.payload,
-            }),
-            Kind::Failure(f) => EntryKind::Failure {
-                commit_time_us: f.commit_time_us,
-                idempotency_key: f.idempotency_key,
-            },
-        };
-        Ok(LogEntry {
-            dot: Dot::new(partition, e.index),
-            term: e.term,
-            kind,
-        })
-    }
-}
-
-impl From<&PartitionStatus> for proto::StatusResponse {
-    fn from(s: &PartitionStatus) -> Self {
-        proto::StatusResponse {
-            node_id: s.node_id,
-            term: s.term,
-            leader: s.leader.as_ref().map(Into::into),
-            last_log_index: s.last_log_index,
-            applied_index: s.applied_index,
-            voters: s.voters.iter().map(Into::into).collect(),
-        }
-    }
-}
-
-impl From<proto::StatusResponse> for PartitionStatus {
-    fn from(s: proto::StatusResponse) -> Self {
-        PartitionStatus {
-            node_id: s.node_id,
-            term: s.term,
-            leader: s.leader.map(Into::into),
-            last_log_index: s.last_log_index,
-            applied_index: s.applied_index,
-            voters: s.voters.into_iter().map(Into::into).collect(),
-        }
-    }
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub enum AdminReply {
+    Ok,
+    AlreadyInitialized,
+    UnknownPartition,
+    Failed(String),
 }

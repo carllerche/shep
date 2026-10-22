@@ -49,8 +49,8 @@ async fn a_returning_leader_rebuilds_its_table() {
     // Node 0 times out first, so it wins any election it can. The elections
     // are slow, so the window is long, or `s0` would be too old.
     let cluster = Cluster::start_with_nodes(3, &[P1], |i, c| {
-        c.validation_window = Duration::from_secs(120);
-        c.election_timeout = match i {
+        c.raft.proposals.admission_window = Duration::from_secs(120);
+        c.raft.election_timeout = match i {
             0 => Duration::from_millis(300)..Duration::from_millis(400),
             _ => Duration::from_millis(1500)..Duration::from_millis(3000),
         };
@@ -149,8 +149,10 @@ async fn proposals_survive_a_leader_change() {
 /// alone is ever committed, while a re-sent proposal is decided once.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_deposed_leader_commits_nothing() {
-    let cluster =
-        Cluster::start_with(3, &[P1], |c| c.commit_timeout = Duration::from_millis(500)).await;
+    let cluster = Cluster::start_with(3, &[P1], |c| {
+        c.raft.proposals.commit_timeout = Duration::from_millis(500)
+    })
+    .await;
     let c = &cluster.client;
     let s0 = at(
         P1,

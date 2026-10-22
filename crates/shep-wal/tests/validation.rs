@@ -143,8 +143,8 @@ async fn uncommitted_writes_are_checked() {
     // A long election timeout keeps the cut-off leader's quorum lease, so it
     // keeps accepting.
     let cluster = Cluster::start_with(3, &[P1], |c| {
-        c.commit_timeout = Duration::from_millis(300);
-        c.election_timeout = Duration::from_secs(10)..Duration::from_secs(20);
+        c.raft.proposals.commit_timeout = Duration::from_millis(300);
+        c.raft.election_timeout = Duration::from_secs(10)..Duration::from_secs(20);
     })
     .await;
     let c = &cluster.client;
@@ -186,7 +186,8 @@ async fn uncommitted_writes_are_checked() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn reads_older_than_the_window_are_too_old() {
-    let cluster = Cluster::start_with(3, &[P1], |c| c.validation_window_entries = 4).await;
+    let cluster =
+        Cluster::start_with(3, &[P1], |c| c.raft.proposals.admission_window_entries = 4).await;
     let c = &cluster.client;
     let mut last = 0;
     for i in 0..10 {

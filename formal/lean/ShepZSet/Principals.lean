@@ -8,66 +8,78 @@ the viewer is part of the request.
 
 ## Two rule semantics
 
-The file has two models of the policy language, with the same pre-checks:
+Both models share the pre-checks; `UMD` is the current design.
 
 * **`UMD` (current, §6.1): union minus deny**, as in Gel and Cedar. A policy is lists of allow and
   deny guards; a request is allowed iff some allow guard holds and no deny guard holds,
-  `(∨ A) ∧ ¬ (∨ D)`. Guards are total and two-valued (no runtime errors), and an atom that reads
-  an absent viewer or actor is false.
+  `(∨ A) ∧ ¬ (∨ D)`. Guards are total and two-valued (no runtime errors), built from atoms with
+  `not`, `and`, and `or`. **Absent principals, per atom:** with no viewer (or no actor), every
+  atom that reads `global viewer` (or `global actor`) is false, and the connectives then apply
+  as usual. `exists global viewer` and `exists global actor` are ordinary atoms. No rule treats
+  the app acting as itself specially; an app-only allow is written
+  `global shep::app = 'slack' and not exists global viewer`.
 * **First match** (the top-level `Rule`/`evalRules`/`Model`, the earlier §6.1): ordered rules
-  returning Allow | Deny | Skip, the first non-Skip deciding, errors as Deny. Kept because its
-  theorems are proved and the argument is the same; `UMD` restates each one.
+  returning Allow | Deny | Skip, the first non-Skip deciding, errors as Deny, and an app-only
+  allow matching only the app acting as itself. Superseded; kept because its theorems are
+  proved, and `UMD` restates each one that still applies.
 
-Guard and rule kinds, in both:
-  - on the viewer (`allow if viewer in node.members`): reads the app, viewer, and node; false
-    (or Skip) without a viewer;
-  - on the app alone: an allow (`allow if app == slack`) matches only the app acting as itself,
-    with no actor node and no viewer; a deny (`deny if app == legacy`) applies to every request,
-    since §6.3 restricts only rules that grant by app alone;
-  - on the actor: only in schemas that declare actors (`WF`);
-  - `shep::visible(.e)` (formerly `delegate`): the target passes `can_op` for the same request
-    (same app, actor, and viewer).
+In both, `shep::visible(.e)` (formerly `delegate`) holds when the target passes `can_op` for the
+same request (same app, actor, and viewer), and is false for an empty link.
 
 `canOp app actor viewer n` (`actor = none` is the app acting as itself, `viewer = none` is no
 viewer) is, in order: the deleted-actor pre-check, the deleted-viewer pre-check, the actors
-declaration (`none` = any actor; `some D` = the declared types, `none ∈ D` meaning `app`), the
-effective viewer (a viewer not of the schema's viewer type is a Deny for that schema, never a
-fall-through to rules on `app`), then the policy. The order matters only for the error a client
-sees; the decision is their conjunction. A `visible` depth bound stands in for §6.8's rule that a
-recursive `can_read` is materialized or depth-bounded.
+declaration (`none` = any actor; `some D` = the declared types of `global actor`, `none ∈ D`
+meaning `shep::App`), the effective viewer (a viewer not of the schema's viewer type is a deny
+for that schema, before any policy runs), then the policy. The order matters only for the error
+a client sees; the decision is their conjunction. A `visible` depth bound stands in for §6.8's
+rule that a recursive `can_read` is materialized or depth-bounded.
 
-## Results (each in both models unless noted; `UMD.Model.*` is the current one)
+## Results (`UMD.*` is current; first-match names are noted)
 
 * `canOp_deleted_actor`, `canOp_deleted_viewer`: a deleted actor or viewer is denied on every
-  node, under every policy and app. `precheck_viewer_needed` (first match): soft delete keeps
-  edges, so without the viewer pre-check the rules would still allow a deleted viewer.
-* `canOp_wrongtype_viewer`: a viewer of another type is denied, whatever the policy, including
-  one with app-only allows. `canOp_appOnly_with_viewer`: an app-only allow never decides a request
-  that has a viewer, so a policy whose only allows are app-only denies every such request.
-  `fallthrough_reaches_app_grant`: under the superseded mapping semantics (no viewer → rules on
-  `app` decide), a stray viewer reached an app grant.
-* `actorsDecl_enforced` (and `canOp_asApp_undeclared_app`, first match): a schema that declares
-  actors denies any other actor, including the app as itself unless `app` is declared.
-* `visible_preserves_viewer`: `Message.read: allow if shep::visible(.channel)` admits exactly the
+  node, under every policy and app, even while its token is valid. `precheck_viewer_needed`
+  (first match): soft delete keeps edges, so without the viewer pre-check the policy would still
+  allow a deleted viewer.
+* `canOp_wrongtype_viewer`: a viewer of another type is denied, whatever the policy, so it never
+  reaches a grant to the app. `fallthrough_reaches_app_grant`: under the superseded mapping
+  semantics (no viewer → rules on `app` decide), a stray viewer did.
+* **Absent principals, per atom** (`UMD`): `eval_absent_viewer`, `eval_absent_actor`: with no
+  viewer (actor), a guard equals the guard with its viewer (actor) atoms set to false, under
+  `not`, `and`, `or`. `viewerAtom_absent`: so `allow (global viewer in .members)` never admits a
+  viewerless request and `deny (global viewer in .author.blocked)` never denies one.
+  `negated_viewer_allow_admits_asApp`: the flip side, `allow (not (global viewer in .blocked))`
+  admits the app acting as itself.
+  **Per-atom typing versus `?? false` on the whole guard:** `evalSet_present`: with both
+  principals present the two readings agree on every guard; `viewerAtom_eq_coalesce`: they agree
+  on a bare atom; `viewerAtom_not_differs`, `actorAtom_not_differs`: they differ under `not`
+  (the same facts as `Totality.lean`'s `viewerIn_eq_coalesce` and `viewerIn_not_differs`).
+* **App-only access is written out** (`UMD`): `appOnly_allow_exact`: `app = slack and not exists
+  global viewer` admits the app acting as itself and no request with a viewer
+  (`canOp_noViewer_allows`); `appAllow_without_noviewer_admits_viewer`: without the second atom
+  it admits an agent acting for a user.
+* `actorsDecl_enforced`: a schema that declares actors denies any other actor, including the app
+  as itself unless `shep::App` is declared.
+* `visible_preserves_viewer`: `allow select using (shep::visible(.channel))` admits exactly the
   requests, with the same app, actor, and viewer, that the channel admits.
   `visible_crosstype_denies`: a `visible` into a schema with another viewer type denies.
-* **`canOp_actfor_no_amplification`**: if no allow rule reachable through `visible` reads the
-  actor, then `canOp app g u n → canOp app u u n`: an agent acting for a user can never do more
-  than the user acting directly. Side conditions, each shown necessary by a counterexample:
-  - `u` acting as itself passes the reachable actor declarations and is caught by no reachable
-    actor-reading deny (`ActorOK`; `actorsDecl_excluding_viewer_amplifies` (first match),
-    `actorDeny_on_self_amplifies`);
-  - under union minus deny, no reachable deny guard uses `visible` (`NoVisibleDeny`;
-    `UMD.Ex.visibleDeny_amplifies`). In first match, `visible` is allow-only by construction.
-  `actorAllow_amplifies`: an actor-reading allow (`allow if actor is agents.Agent`) breaks it.
+* **`canOp_actfor_no_amplification`**: `canOp app g u n → canOp app u u n`, an agent acting for a
+  user can never do more than the user acting directly, when at every node reachable through
+  `visible` the user passes the actors declaration and every guard is `Ok` at its polarity
+  (`UMD.Model.ActForOK`): actor atoms move toward `u` (no allow on `global actor is
+  agents::Agent`; `deny (global actor is agents::Agent)` is fine), and `visible` occurs only
+  positively in allows and negatively in denies. `actForOK_of_actorless` is the syntactic
+  version. Each side condition is needed:
+  - `actorAllow_amplifies`: `allow (global actor is agents::Agent)`;
+  - `actorDeny_on_self_amplifies`: `deny (global actor is users::User)`;
+  - `actorsDecl_excluding_viewer_amplifies`: `global actor: agents::Agent` in a schema whose
+    viewer type is `users::User`;
+  - `visibleDeny_amplifies`: `deny (shep::visible(.t))` where `t` denies agents.
   `canOp_actfor_eq_undeclared`: when no reachable schema declares actors, the agent can do
-  exactly what the user can (in `UMD` this holds even with `visible` under a deny).
+  exactly what the user can, whatever the polarity of `visible`.
   `canOpN_actor_mono`: the general form, for any two actors acting for the same viewer.
-* **Two-party issuance** (`Issuance`): a user-approved act-for key `(app, g, u)` exists only if
-  the app registered `g`, the app requested the key with its own key, and `u` approved it while
-  signed in (`actfor_key_two_party`, `actfor_needs_consent`, `actfor_needs_registration`); an
-  act-for key can't register, request, approve, or revoke anything (`bound_key_inert`: no
-  chaining).
+* **Superseded: two-party issuance** (`Issuance`). Shep no longer issues credentials (§6.3: an
+  external auth service issues signed JWTs and decides act-for). The section models the earlier
+  key-issuance design and is kept for history only.
 -/
 import ShepZSet.ViewerMapping
 
@@ -546,66 +558,233 @@ end Ex
 
 Policies combine as allow-union-minus-deny with default deny, as in Gel and Cedar: a request is
 allowed iff some allow guard holds and no deny guard holds, `(∨ A) ∧ ¬ (∨ D)`. Guards are total
-and two-valued (no runtime errors); a guard atom that reads an absent viewer or actor is false.
-The pre-checks are unchanged. -/
+and two-valued (no runtime errors). **Absent principals, per atom:** where a request has no
+viewer (or no actor), every atom that reads `global viewer` (or `global actor`) is false, and
+`not`, `and`, and `or` then apply as usual. `exists global viewer` is an ordinary atom. No rule
+treats the app acting as itself specially: an app-only allow is written
+`global shep::app = 'slack' and not exists global viewer`. The pre-checks are unchanged. -/
 
 namespace UMD
 
-/-- A total, two-valued guard: atoms joined by `&&`. -/
+/-- A total, two-valued guard. -/
 inductive Guard (App Node : Type*)
-  /-- reads the app, the viewer, and the node; false without a viewer -/
-  | onViewer (p : App → Node → Node → Prop)
-  /-- reads only the app and the node -/
-  | onApp (p : App → Node → Prop)
-  /-- reads the actor node (and maybe the app and viewer); false without an actor node -/
-  | onActor (p : App → Node → Option Node → Node → Prop)
-  /-- `shep::visible(.edge)`: the target passes `can_op` for the same request; false if the edge
-  is absent -/
+  /-- an atom that reads `global viewer` (and maybe the app and graph); false without a viewer -/
+  | viewerAtom (p : App → Node → Node → Prop)
+  /-- an atom that reads `global actor`; false without an actor node -/
+  | actorAtom (p : App → Node → Node → Prop)
+  /-- an atom that reads neither, such as `global shep::app = 'slack'` -/
+  | plain (p : App → Node → Prop)
+  /-- `exists global viewer` -/
+  | existsViewer
+  /-- `exists global actor` (true unless the app acts as itself) -/
+  | existsActor
+  /-- `shep::visible(.edge)`: the target passes `can_op` for the same request; false if the
+  link is empty -/
   | visible (edge : Node → Option Node)
+  | not (g : Guard App Node)
   | and (g₁ g₂ : Guard App Node)
+  | or (g₁ g₂ : Guard App Node)
 
-/-- A guard's value, given `dl`, the decision at a `visible` target. -/
+/-- A guard's value, given `dl`, the decision at a `shep::visible` target. -/
 def Guard.eval (dl : Node → Prop) :
     Guard App Node → App → Option Node → Option Node → Node → Prop
-  | .onViewer p, app, _, viewer, n => ∃ v, viewer = some v ∧ p app v n
-  | .onApp p, app, _, _, n => p app n
-  | .onActor p, app, actor, viewer, n => ∃ a, actor = some a ∧ p app a viewer n
+  | .viewerAtom p, app, _, viewer, n => ∃ v, viewer = some v ∧ p app v n
+  | .actorAtom p, app, actor, _, n => ∃ a, actor = some a ∧ p app a n
+  | .plain p, app, _, _, n => p app n
+  | .existsViewer, _, _, viewer, _ => viewer ≠ none
+  | .existsActor, _, actor, _, _ => actor ≠ none
   | .visible f, _, _, _, n => ∃ t, f n = some t ∧ dl t
+  | .not g, app, actor, viewer, n => ¬ g.eval dl app actor viewer n
   | .and g₁ g₂, app, actor, viewer, n =>
     g₁.eval dl app actor viewer n ∧ g₂.eval dl app actor viewer n
+  | .or g₁ g₂, app, actor, viewer, n =>
+    g₁.eval dl app actor viewer n ∨ g₂.eval dl app actor viewer n
 
-/-- The guard reads only the app (`allow if app == slack`). -/
-def Guard.appOnly : Guard App Node → Prop
-  | .onApp _ => True
-  | .and g₁ g₂ => g₁.appOnly ∧ g₂.appOnly
+/-- Every atom on `global viewer` (and `exists global viewer`) replaced by `false`. -/
+def Guard.dropViewer : Guard App Node → Guard App Node
+  | .viewerAtom _ => .plain fun _ _ => False
+  | .existsViewer => .plain fun _ _ => False
+  | .not g => .not g.dropViewer
+  | .and g₁ g₂ => .and g₁.dropViewer g₂.dropViewer
+  | .or g₁ g₂ => .or g₁.dropViewer g₂.dropViewer
+  | g => g
+
+/-- Every atom on `global actor` (and `exists global actor`) replaced by `false`. -/
+def Guard.dropActor : Guard App Node → Guard App Node
+  | .actorAtom _ => .plain fun _ _ => False
+  | .existsActor => .plain fun _ _ => False
+  | .not g => .not g.dropActor
+  | .and g₁ g₂ => .and g₁.dropActor g₂.dropActor
+  | .or g₁ g₂ => .or g₁.dropActor g₂.dropActor
+  | g => g
+
+def Guard.readsViewer : Guard App Node → Prop
+  | .viewerAtom _ => True
+  | .existsViewer => True
+  | .not g => g.readsViewer
+  | .and g₁ g₂ => g₁.readsViewer ∨ g₂.readsViewer
+  | .or g₁ g₂ => g₁.readsViewer ∨ g₂.readsViewer
   | _ => False
 
 def Guard.readsActor : Guard App Node → Prop
-  | .onActor _ => True
+  | .actorAtom _ => True
+  | .existsActor => True
+  | .not g => g.readsActor
   | .and g₁ g₂ => g₁.readsActor ∨ g₂.readsActor
+  | .or g₁ g₂ => g₁.readsActor ∨ g₂.readsActor
   | _ => False
 
-def Guard.hasVisible : Guard App Node → Prop
-  | .visible _ => True
-  | .and g₁ g₂ => g₁.hasVisible ∨ g₂.hasVisible
-  | _ => False
-
-/-- The `visible` targets of a guard at `n`. -/
+/-- The `shep::visible` targets of a guard at `n`. -/
 def Guard.reaches : Guard App Node → Node → Node → Prop
   | .visible f, n, t => f n = some t
+  | .not g, n, t => g.reaches n t
   | .and g₁ g₂, n, t => g₁.reaches n t ∨ g₂.reaches n t
+  | .or g₁ g₂, n, t => g₁.reaches n t ∨ g₂.reaches n t
   | _, _, _ => False
 
-/-- Every actor atom of the guard is false for actor `a` and viewer `v`. -/
-def Guard.actorAtomsFalse (app : App) (a v : Option Node) (n : Node) : Guard App Node → Prop
-  | .onActor p => ¬ ∃ x, a = some x ∧ p app x v n
-  | .and g₁ g₂ => g₁.actorAtomsFalse app a v n ∧ g₂.actorAtomsFalse app a v n
-  | _ => True
+/-- **Absent viewer, per atom.** With no viewer, a guard's value is that of the guard with every
+atom on `global viewer` set to false, with `not`, `and`, and `or` applied as usual; the result
+reads no viewer at all. -/
+theorem eval_absent_viewer (dl : Node → Prop) (app : App) (actor : Option Node) (n : Node) :
+    ∀ (g : Guard App Node),
+      (g.eval dl app actor none n ↔ g.dropViewer.eval dl app actor none n) ∧
+        ¬ g.dropViewer.readsViewer
+  | .viewerAtom _ => by simp [Guard.eval, Guard.dropViewer, Guard.readsViewer]
+  | .existsViewer => by simp [Guard.eval, Guard.dropViewer, Guard.readsViewer]
+  | .actorAtom _ => by simp [Guard.dropViewer, Guard.readsViewer]
+  | .plain _ => by simp [Guard.dropViewer, Guard.readsViewer]
+  | .existsActor => by simp [Guard.dropViewer, Guard.readsViewer]
+  | .visible _ => by simp [Guard.dropViewer, Guard.readsViewer]
+  | .not g => by
+    have ih := eval_absent_viewer dl app actor n g
+    simp only [Guard.eval, Guard.dropViewer, Guard.readsViewer]
+    exact ⟨not_congr ih.1, ih.2⟩
+  | .and g₁ g₂ => by
+    have ih₁ := eval_absent_viewer dl app actor n g₁
+    have ih₂ := eval_absent_viewer dl app actor n g₂
+    simp only [Guard.eval, Guard.dropViewer, Guard.readsViewer, not_or]
+    exact ⟨and_congr ih₁.1 ih₂.1, ih₁.2, ih₂.2⟩
+  | .or g₁ g₂ => by
+    have ih₁ := eval_absent_viewer dl app actor n g₁
+    have ih₂ := eval_absent_viewer dl app actor n g₂
+    simp only [Guard.eval, Guard.dropViewer, Guard.readsViewer, not_or]
+    exact ⟨or_congr ih₁.1 ih₂.1, ih₁.2, ih₂.2⟩
 
-/-- An allow guard; one that grants by app alone matches only the app acting as itself. -/
-def allowHolds (dl : Node → Prop) (g : Guard App Node) (app : App) (actor viewer : Option Node)
-    (n : Node) : Prop :=
-  g.eval dl app actor viewer n ∧ (g.appOnly → actor = none ∧ viewer = none)
+/-- **Absent actor, per atom**: the same for `global actor` (the app acting as itself). -/
+theorem eval_absent_actor (dl : Node → Prop) (app : App) (viewer : Option Node) (n : Node) :
+    ∀ (g : Guard App Node),
+      (g.eval dl app none viewer n ↔ g.dropActor.eval dl app none viewer n) ∧
+        ¬ g.dropActor.readsActor
+  | .viewerAtom _ => by simp [Guard.dropActor, Guard.readsActor]
+  | .existsViewer => by simp [Guard.dropActor, Guard.readsActor]
+  | .actorAtom _ => by simp [Guard.eval, Guard.dropActor, Guard.readsActor]
+  | .plain _ => by simp [Guard.dropActor, Guard.readsActor]
+  | .existsActor => by simp [Guard.eval, Guard.dropActor, Guard.readsActor]
+  | .visible _ => by simp [Guard.dropActor, Guard.readsActor]
+  | .not g => by
+    have ih := eval_absent_actor dl app viewer n g
+    simp only [Guard.eval, Guard.dropActor, Guard.readsActor]
+    exact ⟨not_congr ih.1, ih.2⟩
+  | .and g₁ g₂ => by
+    have ih₁ := eval_absent_actor dl app viewer n g₁
+    have ih₂ := eval_absent_actor dl app viewer n g₂
+    simp only [Guard.eval, Guard.dropActor, Guard.readsActor, not_or]
+    exact ⟨and_congr ih₁.1 ih₂.1, ih₁.2, ih₂.2⟩
+  | .or g₁ g₂ => by
+    have ih₁ := eval_absent_actor dl app viewer n g₁
+    have ih₂ := eval_absent_actor dl app viewer n g₂
+    simp only [Guard.eval, Guard.dropActor, Guard.readsActor, not_or]
+    exact ⟨or_congr ih₁.1 ih₂.1, ih₁.2, ih₂.2⟩
+
+/-- The atom itself: an atom on `global viewer` is false without a viewer, and its negation is
+true. So `allow … using (global viewer in .members)` never admits a request with no viewer, and
+`deny … using (global viewer in .author.blocked)` never denies one. -/
+theorem viewerAtom_absent (dl : Node → Prop) (p : App → Node → Node → Prop) (app : App)
+    (actor : Option Node) (n : Node) :
+    ¬ (Guard.viewerAtom p).eval dl app actor none n ∧
+      (Guard.not (.viewerAtom p)).eval dl app actor none n := by
+  simp [Guard.eval]
+
+/-! #### The per-atom rule versus coalescing the whole guard
+
+The per-atom rule is a typing rule (§6.1, §4.0 item 1): a comparison, `in`, or `is` atom whose
+only possibly-empty operand is `global viewer` or `global actor` has cardinality One, and is
+false when that principal is absent. Read as plain EdgeQL instead, such an atom is empty (`{}`)
+without the principal, emptiness propagates through `not`, `and`, and `or`, and the guard needs
+`?? false` as a whole. `Guard.evalSet` is that reading (`none` is `{}`); `Totality.lean` proves
+the same two facts for its expression language (`viewerIn_eq_coalesce`,
+`viewerIn_not_differs`). -/
+
+/-- The plain EdgeQL reading: an atom on an absent principal is `{}` (`none`), and `{}`
+propagates. `exists` and `shep::visible` are never empty. -/
+def Guard.evalSet (dl : Node → Prop) :
+    Guard App Node → App → Option Node → Option Node → Node → Option Prop
+  | .viewerAtom p, app, _, viewer, n => viewer.map fun v => p app v n
+  | .actorAtom p, app, actor, _, n => actor.map fun a => p app a n
+  | .plain p, app, _, _, n => some (p app n)
+  | .existsViewer, _, _, viewer, _ => some (viewer ≠ none)
+  | .existsActor, _, actor, _, _ => some (actor ≠ none)
+  | .visible f, _, _, _, n => some (∃ t, f n = some t ∧ dl t)
+  | .not g, app, actor, viewer, n => (g.evalSet dl app actor viewer n).map Not
+  | .and g₁ g₂, app, actor, viewer, n =>
+    match g₁.evalSet dl app actor viewer n, g₂.evalSet dl app actor viewer n with
+    | some a, some b => some (a ∧ b)
+    | _, _ => none
+  | .or g₁ g₂, app, actor, viewer, n =>
+    match g₁.evalSet dl app actor viewer n, g₂.evalSet dl app actor viewer n with
+    | some a, some b => some (a ∨ b)
+    | _, _ => none
+
+/-- `(guard) ?? false` over the whole guard. -/
+def Guard.coalesce (dl : Node → Prop) (g : Guard App Node) (app : App)
+    (actor viewer : Option Node) (n : Node) : Prop :=
+  (g.evalSet dl app actor viewer n).getD False
+
+/-- **With both principals present the readings agree** on every guard: the rules differ only
+for an absent viewer or actor. -/
+theorem evalSet_present (dl : Node → Prop) (app : App) (a v n : Node) :
+    ∀ (g : Guard App Node), g.evalSet dl app (some a) (some v) n =
+      some (g.eval dl app (some a) (some v) n)
+  | .viewerAtom _ => by simp [Guard.evalSet, Guard.eval]
+  | .actorAtom _ => by simp [Guard.evalSet, Guard.eval]
+  | .plain _ => rfl
+  | .existsViewer => rfl
+  | .existsActor => rfl
+  | .visible _ => rfl
+  | .not g => by simp [Guard.evalSet, Guard.eval, evalSet_present dl app a v n g]
+  | .and g₁ g₂ => by
+    simp [Guard.evalSet, Guard.eval, evalSet_present dl app a v n g₁,
+      evalSet_present dl app a v n g₂]
+  | .or g₁ g₂ => by
+    simp [Guard.evalSet, Guard.eval, evalSet_present dl app a v n g₁,
+      evalSet_present dl app a v n g₂]
+
+/-- **On a bare atom the readings agree**: the per-atom atom is the EdgeQL atom with
+`?? false`, with or without a viewer. -/
+theorem viewerAtom_eq_coalesce (dl : Node → Prop) (p : App → Node → Node → Prop) (app : App)
+    (actor viewer : Option Node) (n : Node) :
+    (Guard.viewerAtom p).eval dl app actor viewer n ↔
+      (Guard.viewerAtom p).coalesce dl app actor viewer n := by
+  cases viewer <;> simp [Guard.eval, Guard.coalesce, Guard.evalSet]
+
+/-- **Under `not` they differ.** With no viewer, the per-atom `not (global viewer in s)` is
+true, and `(not (global viewer in s)) ?? false` is false. So `deny … using (not (global viewer
+in .members))` denies the app acting as itself under the per-atom rule and doesn't under
+coalescing, and `allow … using (not (global viewer in .blocked))` admits it under the per-atom
+rule (`Ex.negated_viewer_allow_admits_asApp`) and doesn't under coalescing. -/
+theorem viewerAtom_not_differs (dl : Node → Prop) (p : App → Node → Node → Prop) (app : App)
+    (actor : Option Node) (n : Node) :
+    (Guard.not (.viewerAtom p)).eval dl app actor none n ∧
+      ¬ (Guard.not (.viewerAtom p)).coalesce dl app actor none n := by
+  simp [Guard.eval, Guard.coalesce, Guard.evalSet]
+
+/-- The same for `global actor`: per atom, `not (global actor is agents::Agent)` holds for the
+app acting as itself; coalesced, it doesn't. -/
+theorem actorAtom_not_differs (dl : Node → Prop) (p : App → Node → Node → Prop) (app : App)
+    (viewer : Option Node) (n : Node) :
+    (Guard.not (.actorAtom p)).eval dl app none viewer n ∧
+      ¬ (Guard.not (.actorAtom p)).coalesce dl app none viewer n := by
+  simp [Guard.eval, Guard.coalesce, Guard.evalSet]
 
 structure Policy (App Node : Type*) where
   allow : List (Guard App Node)
@@ -614,14 +793,14 @@ structure Policy (App Node : Type*) where
 /-- **Union minus deny:** `(∨ A) ∧ ¬ (∨ D)`; no allow means deny. -/
 def evalPolicy (dl : Node → Prop) (P : Policy App Node) (app : App) (actor viewer : Option Node)
     (n : Node) : Prop :=
-  (∃ g ∈ P.allow, allowHolds dl g app actor viewer n) ∧
-    ¬ ∃ g ∈ P.deny, g.eval dl app actor viewer n
+  (∃ g ∈ P.allow, g.eval dl app actor viewer n) ∧ ¬ ∃ g ∈ P.deny, g.eval dl app actor viewer n
 
 structure Model (Node Ty Schema App : Type*) where
   ty : Node → Ty
   deleted : Node → Prop
   schemaOf : Node → Schema
   viewerType : Schema → Ty
+  /-- `none`: any actor; `some D`: `global actor: T₁ | T₂`, where `none ∈ D` is `shep::App` -/
   actors : Schema → Option (Set (Option Ty))
   pol : Schema → Policy App Node
   depth : ℕ
@@ -663,6 +842,8 @@ theorem canOp_deleted_viewer (app : App) (actor : Option Node) {v : Node} (hd : 
     (n : Node) : ¬ M.canOp app actor (some v) n :=
   fun h => (canOpN_pre h).2.1 v rfl hd
 
+/-- A viewer of another type is denied before any policy runs, so it never reaches a grant to
+the app. -/
 theorem canOp_wrongtype_viewer (app : App) (actor : Option Node) {v : Node} (n : Node)
     (ht : M.ty v ≠ M.viewerType (M.schemaOf n)) : ¬ M.canOp app actor (some v) n :=
   fun h => ht ((canOpN_pre h).2.2.2 v rfl)
@@ -675,25 +856,27 @@ theorem actorsDecl_enforced (app : App) (actor viewer : Option Node) (n : Node)
   rw [hD] at h3
   exact ha h3
 
-/-- **An app-only allow never admits a request with a viewer**, so a policy whose allows are all
-app-only denies every such request. -/
-theorem canOp_appOnly_with_viewer (app : App) (actor : Option Node) (v n : Node)
-    (hall : ∀ g ∈ (M.pol (M.schemaOf n)).allow, g.appOnly) : ¬ M.canOp app actor (some v) n := by
+/-- **App-only access, written out.** If every allow ends in `and not exists global viewer`, no
+request with a viewer is admitted. -/
+theorem canOp_noViewer_allows (app : App) (actor : Option Node) (v n : Node)
+    (hall : ∀ g ∈ (M.pol (M.schemaOf n)).allow, ∃ h, g = .and h (.not .existsViewer)) :
+    ¬ M.canOp app actor (some v) n := by
   unfold canOp
   cases M.depth with
   | zero => exact id
   | succ k =>
-    rintro ⟨-, ⟨g, hg, -, himp⟩, -⟩
-    cases (himp (hall g hg)).2
+    rintro ⟨-, ⟨g, hg, hgE⟩, -⟩
+    obtain ⟨h, rfl⟩ := hall g hg
+    simp [Guard.eval] at hgE
 
-/-- **`visible` keeps the request's viewer.** For `Message.read: allow if
-shep::visible(.channel)`, the message admits exactly the requests (same app, actor, and viewer)
-that the channel admits, once the message's own pre-checks pass. -/
+/-- **`shep::visible` keeps the request's viewer.** For `Message`'s
+`allow select using (shep::visible(.channel))`, the message admits exactly the requests (same
+app, actor, and viewer) that the channel admits, once the message's own pre-checks pass. -/
 theorem visible_preserves_viewer {k : ℕ} {app : App} {actor viewer : Option Node} {n t : Node}
     {f : Node → Option Node} (hpol : M.pol (M.schemaOf n) = ⟨[.visible f], []⟩)
     (hf : f n = some t) (hpre : M.Pre actor viewer n) :
     M.canOpN (k + 1) app actor viewer n ↔ M.canOpN k app actor viewer t := by
-  simp [canOpN, hpol, evalPolicy, allowHolds, Guard.eval, Guard.appOnly, hf, hpre]
+  simp [canOpN, hpol, evalPolicy, Guard.eval, hf, hpre]
 
 theorem visible_crosstype_denies {k : ℕ} {app : App} {actor : Option Node} {v n t : Node}
     {f : Node → Option Node} (hpol : M.pol (M.schemaOf n) = ⟨[.visible f], []⟩)
@@ -703,7 +886,7 @@ theorem visible_crosstype_denies {k : ℕ} {app : App} {actor : Option Node} {v 
   rw [visible_preserves_viewer hpol hf h.1] at h
   exact ht ((canOpN_pre h).2.2.2 v rfl)
 
-/-- The nodes a check at `n` can reach through `visible`, in allow or deny guards. -/
+/-- The nodes a check at `n` can reach through `shep::visible`, in allow or deny guards. -/
 inductive Reach (M : Model Node Ty Schema App) (n : Node) : Node → Prop
   | refl : Reach M n n
   | step {t t' : Node} {g : Guard App Node} : Reach M n t →
@@ -715,132 +898,197 @@ theorem Reach.trans {n t s : Node} (h₁ : M.Reach n t) (h₂ : M.Reach t s) : M
   | refl => exact h₁
   | step _ hg hgt ih => exact .step ih hg hgt
 
-/-- No allow guard reachable from `n` reads the actor. -/
-def NoActorAllow (M : Model Node Ty Schema App) (n : Node) : Prop :=
-  ∀ t, M.Reach n t → ∀ g ∈ (M.pol (M.schemaOf t)).allow, ¬ g.readsActor
+/-- Swapping actor `a₁` for `a₂` (same viewer) can only make the guard truer (`b = true`) or
+only falser (`b = false`): each actor atom moves the right way at its polarity, and
+`shep::visible` occurs only at polarity `b = true` (it grows when the actor is swapped). -/
+def _root_.Shep.Principals.UMD.Guard.Ok (app : App) (a₁ a₂ n : Node) :
+    Bool → Guard App Node → Prop
+  | true, .actorAtom p => p app a₁ n → p app a₂ n
+  | false, .actorAtom p => p app a₂ n → p app a₁ n
+  | b, .visible _ => b = true
+  | b, .not g => g.Ok app a₁ a₂ n (!b)
+  | b, .and g₁ g₂ => g₁.Ok app a₁ a₂ n b ∧ g₂.Ok app a₁ a₂ n b
+  | b, .or g₁ g₂ => g₁.Ok app a₁ a₂ n b ∧ g₂.Ok app a₁ a₂ n b
+  | _, _ => True
 
-/-- No deny guard reachable from `n` uses `visible`. -/
-def NoVisibleDeny (M : Model Node Ty Schema App) (n : Node) : Prop :=
-  ∀ t, M.Reach n t → ∀ g ∈ (M.pol (M.schemaOf t)).deny, ¬ g.hasVisible
+theorem Guard.ok_mono {dl₁ dl₂ : Node → Prop} {app : App} {a₁ a₂ u n : Node} :
+    ∀ (g : Guard App Node), (∀ t, g.reaches n t → dl₁ t → dl₂ t) →
+    (g.Ok app a₁ a₂ n true →
+      g.eval dl₁ app (some a₁) (some u) n → g.eval dl₂ app (some a₂) (some u) n) ∧
+    (g.Ok app a₁ a₂ n false →
+      g.eval dl₂ app (some a₂) (some u) n → g.eval dl₁ app (some a₁) (some u) n)
+  | .viewerAtom _, _ => ⟨fun _ h => h, fun _ h => h⟩
+  | .plain _, _ => ⟨fun _ h => h, fun _ h => h⟩
+  | .existsViewer, _ => ⟨fun _ h => h, fun _ h => h⟩
+  | .existsActor, _ => by simp [Guard.eval]
+  | .actorAtom _, _ => by simp only [Guard.Ok, Guard.eval]; simp
+  | .visible _, hdl => by
+    refine ⟨fun _ ⟨t, hf, ht⟩ => ⟨t, hf, hdl t hf ht⟩, fun h => ?_⟩
+    simp [Guard.Ok] at h
+  | .not g, hdl => by
+    have ih := Guard.ok_mono (app := app) (a₁ := a₁) (a₂ := a₂) (u := u) g hdl
+    simp only [Guard.Ok, Guard.eval, Bool.not_true, Bool.not_false]
+    exact ⟨fun h h₁ h₂ => h₁ (ih.2 h h₂), fun h h₂ h₁ => h₂ (ih.1 h h₁)⟩
+  | .and g₁ g₂, hdl => by
+    have ih₁ := Guard.ok_mono (app := app) (a₁ := a₁) (a₂ := a₂) (u := u) g₁
+      (fun t ht => hdl t (Or.inl ht))
+    have ih₂ := Guard.ok_mono (app := app) (a₁ := a₁) (a₂ := a₂) (u := u) g₂
+      (fun t ht => hdl t (Or.inr ht))
+    simp only [Guard.Ok, Guard.eval]
+    exact ⟨fun ⟨o₁, o₂⟩ ⟨h₁, h₂⟩ => ⟨ih₁.1 o₁ h₁, ih₂.1 o₂ h₂⟩,
+      fun ⟨o₁, o₂⟩ ⟨h₁, h₂⟩ => ⟨ih₁.2 o₁ h₁, ih₂.2 o₂ h₂⟩⟩
+  | .or g₁ g₂, hdl => by
+    have ih₁ := Guard.ok_mono (app := app) (a₁ := a₁) (a₂ := a₂) (u := u) g₁
+      (fun t ht => hdl t (Or.inl ht))
+    have ih₂ := Guard.ok_mono (app := app) (a₁ := a₁) (a₂ := a₂) (u := u) g₂
+      (fun t ht => hdl t (Or.inr ht))
+    simp only [Guard.Ok, Guard.eval]
+    exact ⟨fun ⟨o₁, o₂⟩ h => h.imp (ih₁.1 o₁) (ih₂.1 o₂),
+      fun ⟨o₁, o₂⟩ h => h.imp (ih₁.2 o₁) (ih₂.2 o₂)⟩
 
-/-- Actor `a`, for viewer `v`, passes every reachable actors declaration, and every actor atom of
-every reachable deny guard is false for it. -/
-def ActorOK (M : Model Node Ty Schema App) (app : App) (a v : Option Node) (n : Node) : Prop :=
-  ∀ t, M.Reach n t → admits (M.actors (M.schemaOf t)) (a.map M.ty) ∧
-    ∀ g ∈ (M.pol (M.schemaOf t)).deny, g.actorAtomsFalse app a v t
-
-theorem allow_mono {dl₁ dl₂ : Node → Prop} {app : App} {a₁ a₂ : Option Node} {v : Option Node}
-    {n : Node} : ∀ (g : Guard App Node), ¬ g.readsActor →
-    (∀ t, g.reaches n t → dl₁ t → dl₂ t) →
-    g.eval dl₁ app a₁ v n → g.eval dl₂ app a₂ v n
-  | .onViewer _, _, _, h => h
-  | .onApp _, _, _, h => h
-  | .onActor _, hr, _, _ => absurd trivial hr
-  | .visible _, _, hdl, ⟨t, hf, ht⟩ => ⟨t, hf, hdl t hf ht⟩
-  | .and g₁ g₂, hr, hdl, ⟨h₁, h₂⟩ =>
-    ⟨allow_mono g₁ (fun h => hr (Or.inl h)) (fun t ht => hdl t (Or.inl ht)) h₁,
-      allow_mono g₂ (fun h => hr (Or.inr h)) (fun t ht => hdl t (Or.inr ht)) h₂⟩
-
-theorem deny_antimono {dl₁ dl₂ : Node → Prop} {app : App} {a₁ a₂ : Option Node}
-    {v : Option Node} {n : Node} : ∀ (g : Guard App Node), ¬ g.hasVisible →
-    g.actorAtomsFalse app a₂ v n → g.eval dl₂ app a₂ v n → g.eval dl₁ app a₁ v n
-  | .onViewer _, _, _, h => h
-  | .onApp _, _, _, h => h
-  | .onActor _, _, hf, h => absurd h hf
-  | .visible _, hv, _, _ => absurd trivial hv
-  | .and g₁ g₂, hv, ⟨hf₁, hf₂⟩, ⟨h₁, h₂⟩ =>
-    ⟨deny_antimono g₁ (fun h => hv (Or.inl h)) hf₁ h₁,
-      deny_antimono g₂ (fun h => hv (Or.inr h)) hf₂ h₂⟩
+/-- The side condition of no-amplification, at every node reachable from `n`: actor `a₂` passes
+the actors declaration, every allow guard is `Ok` at polarity `true`, and every deny guard at
+polarity `false`. -/
+def ActForOK (M : Model Node Ty Schema App) (app : App) (a₁ a₂ : Node) (n : Node) : Prop :=
+  ∀ t, M.Reach n t → admits (M.actors (M.schemaOf t)) (some (M.ty a₂)) ∧
+    (∀ g ∈ (M.pol (M.schemaOf t)).allow, g.Ok app a₁ a₂ t true) ∧
+    (∀ g ∈ (M.pol (M.schemaOf t)).deny, g.Ok app a₁ a₂ t false)
 
 /-- **Swapping the actor, with the viewer fixed** (union minus deny). -/
-theorem canOpN_actor_mono (app : App) (a₁ a₂ : Option Node) (u : Node) :
-    ∀ (k : ℕ) (n : Node), M.NoActorAllow n → M.NoVisibleDeny n →
-      M.ActorOK app a₂ (some u) n → (∀ x, a₂ = some x → ¬ M.deleted x) →
-      M.canOpN k app a₁ (some u) n → M.canOpN k app a₂ (some u) n
-  | 0, _, _, _, _, _, h => h
-  | k + 1, n, hno, hnv, hok, hdel, h => by
-    obtain ⟨⟨-, h2, -, h4⟩, ⟨g, hg, hgA, himp⟩, hD⟩ := h
-    refine ⟨⟨hdel, h2, (hok n .refl).1, h4⟩, ⟨g, hg, ?_, ?_⟩, ?_⟩
-    · refine allow_mono g (hno n .refl g hg) ?_ hgA
-      intro t ht hdl
-      have hnt : M.Reach n t := .step .refl (List.mem_append_left _ hg) ht
-      exact canOpN_actor_mono app a₁ a₂ u k t (fun s hs => hno s (hnt.trans hs))
-        (fun s hs => hnv s (hnt.trans hs)) (fun s hs => hok s (hnt.trans hs)) hdel hdl
-    · intro hap; cases (himp hap).2
-    · rintro ⟨d, hd, hdE⟩
-      exact hD ⟨d, hd, deny_antimono d (hnv n .refl d hd) ((hok n .refl).2 d hd) hdE⟩
+theorem canOpN_actor_mono (app : App) (a₁ a₂ u : Node) (hd₂ : ¬ M.deleted a₂) :
+    ∀ (k : ℕ) (n : Node), M.ActForOK app a₁ a₂ n →
+      M.canOpN k app (some a₁) (some u) n → M.canOpN k app (some a₂) (some u) n
+  | 0, _, _, h => h
+  | k + 1, n, hok, h => by
+    obtain ⟨⟨-, h2, -, h4⟩, ⟨g, hg, hgA⟩, hD⟩ := h
+    obtain ⟨hdecl, hA, hDn⟩ := hok n .refl
+    have hdl : ∀ g ∈ (M.pol (M.schemaOf n)).allow ++ (M.pol (M.schemaOf n)).deny,
+        ∀ t, g.reaches n t →
+          M.canOpN k app (some a₁) (some u) t → M.canOpN k app (some a₂) (some u) t :=
+      fun g hg t ht => canOpN_actor_mono app a₁ a₂ u hd₂ k t
+        (fun s hs => hok s ((Reach.step .refl hg ht).trans hs))
+    refine ⟨⟨fun x hx => by cases hx; exact hd₂, h2, by simpa using hdecl, h4⟩,
+      ⟨g, hg, (Guard.ok_mono g (hdl g (List.mem_append_left _ hg))).1 (hA g hg) hgA⟩, ?_⟩
+    rintro ⟨d, hd, hdE⟩
+    exact hD ⟨d, hd,
+      (Guard.ok_mono d (hdl d (List.mem_append_right _ hd))).2 (hDn d hd) hdE⟩
 
-/-- **An agent acting for a user can never do more than the user** (union minus deny). If no
-reachable allow guard reads `actor` and no reachable deny guard uses `visible`, then whatever `g`
-can do for viewer `u`, `u` can do acting as itself, given that `u` acting as itself passes the
-reachable actor declarations and makes every reachable deny guard's actor atoms false. -/
-theorem canOp_actfor_no_amplification {app : App} {g u n : Node} (hno : M.NoActorAllow n)
-    (hnv : M.NoVisibleDeny n) (hok : M.ActorOK app (some u) (some u) n) :
+/-- **An agent acting for a user can never do more than the user** (union minus deny). If, at
+every node reachable through `shep::visible`, the user passes the actors declaration and every
+guard is `Ok` at its polarity (`ActForOK`), then whatever `g` can do for viewer `u`, `u` can do
+acting as itself. `ActForOK` holds when no reachable guard reads `global actor` and
+`shep::visible` occurs only positively in allows and negatively in denies
+(`actForOK_of_actorless`); an actor atom is fine where it can only move toward `u`, such as
+`deny … using (global actor is agents::Agent)`. -/
+theorem canOp_actfor_no_amplification {app : App} {g u n : Node}
+    (hok : M.ActForOK app g u n) :
     M.canOp app (some g) (some u) n → M.canOp app (some u) (some u) n := fun h =>
-  canOpN_actor_mono app (some g) (some u) u M.depth n hno hnv hok
-    (fun x hx => by cases hx; exact (canOpN_pre h).2.1 u rfl) h
+  canOpN_actor_mono app g u u ((canOpN_pre h).2.1 u rfl) M.depth n hok h
 
-/-- The checker's rule: a schema that declares no actors has no guard on `actor`. -/
+/-- `shep::visible` occurs only at polarity `b`. -/
+def _root_.Shep.Principals.UMD.Guard.VisAt : Bool → Guard App Node → Prop
+  | b, .visible _ => b = true
+  | b, .not g => g.VisAt (!b)
+  | b, .and g₁ g₂ => g₁.VisAt b ∧ g₂.VisAt b
+  | b, .or g₁ g₂ => g₁.VisAt b ∧ g₂.VisAt b
+  | _, _ => True
+
+theorem Guard.ok_of_actorless (app : App) (a₁ a₂ n : Node) :
+    ∀ (b : Bool) (g : Guard App Node), ¬ g.readsActor → g.VisAt b → g.Ok app a₁ a₂ n b
+  | _, .viewerAtom _, _, _ => by simp [Guard.Ok]
+  | _, .plain _, _, _ => by simp [Guard.Ok]
+  | _, .existsViewer, _, _ => by simp [Guard.Ok]
+  | _, .existsActor, _, _ => by simp [Guard.Ok]
+  | _, .actorAtom _, hr, _ => absurd trivial hr
+  | b, .visible _, _, hv => by cases b <;> simp_all [Guard.Ok, Guard.VisAt]
+  | b, .not g, hr, hv => by
+    simp only [Guard.readsActor] at hr
+    simp only [Guard.VisAt] at hv
+    cases b <;> simpa [Guard.Ok] using Guard.ok_of_actorless app a₁ a₂ n _ g hr hv
+  | b, .and g₁ g₂, hr, hv => by
+    simp only [Guard.readsActor, not_or] at hr
+    cases b <;> exact ⟨Guard.ok_of_actorless app a₁ a₂ n _ g₁ hr.1 hv.1,
+      Guard.ok_of_actorless app a₁ a₂ n _ g₂ hr.2 hv.2⟩
+  | b, .or g₁ g₂, hr, hv => by
+    simp only [Guard.readsActor, not_or] at hr
+    cases b <;> exact ⟨Guard.ok_of_actorless app a₁ a₂ n _ g₁ hr.1 hv.1,
+      Guard.ok_of_actorless app a₁ a₂ n _ g₂ hr.2 hv.2⟩
+
+/-- The syntactic sufficient condition. -/
+theorem actForOK_of_actorless {app : App} {a₁ a₂ n : Node}
+    (h : ∀ t, M.Reach n t → admits (M.actors (M.schemaOf t)) (some (M.ty a₂)) ∧
+      (∀ g ∈ (M.pol (M.schemaOf t)).allow, ¬ g.readsActor ∧ g.VisAt true) ∧
+      (∀ g ∈ (M.pol (M.schemaOf t)).deny, ¬ g.readsActor ∧ g.VisAt false)) :
+    M.ActForOK app a₁ a₂ n := fun t ht =>
+  ⟨(h t ht).1, fun g hg => Guard.ok_of_actorless app a₁ a₂ t true g ((h t ht).2.1 g hg).1
+      ((h t ht).2.1 g hg).2,
+    fun g hg => Guard.ok_of_actorless app a₁ a₂ t false g ((h t ht).2.2 g hg).1
+      ((h t ht).2.2 g hg).2⟩
+
+/-- The checker's rule: a schema that declares no actors has no guard on `global actor`. -/
 def WF (M : Model Node Ty Schema App) : Prop :=
   ∀ s, M.actors s = none → ∀ g ∈ (M.pol s).allow ++ (M.pol s).deny, ¬ g.readsActor
 
-theorem eval_actor_indep {dl₁ dl₂ : Node → Prop} {app : App} {a₁ a₂ v : Option Node}
-    {n : Node} : ∀ (g : Guard App Node), ¬ g.readsActor →
+theorem eval_actor_indep {dl₁ dl₂ : Node → Prop} {app : App} {a₁ a₂ u n : Node} :
+    ∀ (g : Guard App Node), ¬ g.readsActor →
     (∀ t, g.reaches n t → (dl₁ t ↔ dl₂ t)) →
-    (g.eval dl₁ app a₁ v n ↔ g.eval dl₂ app a₂ v n)
-  | .onViewer _, _, _ => Iff.rfl
-  | .onApp _, _, _ => Iff.rfl
-  | .onActor _, hr, _ => absurd trivial hr
+    (g.eval dl₁ app (some a₁) (some u) n ↔ g.eval dl₂ app (some a₂) (some u) n)
+  | .viewerAtom _, _, _ => Iff.rfl
+  | .plain _, _, _ => Iff.rfl
+  | .existsViewer, _, _ => Iff.rfl
+  | .existsActor, _, _ => by simp [Guard.eval]
+  | .actorAtom _, hr, _ => absurd trivial hr
   | .visible _, _, hdl => by
     simp only [Guard.eval]
     exact exists_congr fun t => ⟨fun ⟨hf, h⟩ => ⟨hf, (hdl t hf).1 h⟩,
       fun ⟨hf, h⟩ => ⟨hf, (hdl t hf).2 h⟩⟩
+  | .not g, hr, hdl => not_congr (eval_actor_indep g hr hdl)
   | .and g₁ g₂, hr, hdl => and_congr
     (eval_actor_indep g₁ (fun h => hr (Or.inl h)) (fun t ht => hdl t (Or.inl ht)))
     (eval_actor_indep g₂ (fun h => hr (Or.inr h)) (fun t ht => hdl t (Or.inr ht)))
+  | .or g₁ g₂, hr, hdl => or_congr
+    (eval_actor_indep g₁ (fun h => hr (Or.inl h)) (fun t ht => hdl t (Or.inl ht)))
+    (eval_actor_indep g₂ (fun h => hr (Or.inr h)) (fun t ht => hdl t (Or.inr ht)))
 
-/-- With no actors declared on any reachable schema, the decision doesn't depend on the actor
-(given live actor nodes), even with `visible` under a deny. -/
-theorem canOpN_actor_indep (hwf : M.WF) (app : App) (a₁ a₂ : Option Node) (u : Node)
-    (hd₁ : ∀ x, a₁ = some x → ¬ M.deleted x) (hd₂ : ∀ x, a₂ = some x → ¬ M.deleted x) :
+/-- With no actors declared on any reachable schema, the decision doesn't depend on which live
+actor node acts, whatever the guards' polarity. -/
+theorem canOpN_actor_indep (hwf : M.WF) (app : App) (a₁ a₂ u : Node)
+    (hd₁ : ¬ M.deleted a₁) (hd₂ : ¬ M.deleted a₂) :
     ∀ (k : ℕ) (n : Node), (∀ t, M.Reach n t → M.actors (M.schemaOf t) = none) →
-      (M.canOpN k app a₁ (some u) n ↔ M.canOpN k app a₂ (some u) n)
+      (M.canOpN k app (some a₁) (some u) n ↔ M.canOpN k app (some a₂) (some u) n)
   | 0, _, _ => Iff.rfl
   | k + 1, n, hun => by
     have hn := hun n .refl
-    have ih : ∀ g ∈ (M.pol (M.schemaOf n)).allow ++ (M.pol (M.schemaOf n)).deny,
-        ∀ t, g.reaches n t →
-          (M.canOpN k app a₁ (some u) t ↔ M.canOpN k app a₂ (some u) t) := fun g hg t ht =>
-      canOpN_actor_indep hwf app a₁ a₂ u hd₁ hd₂ k t
-        (fun s hs => hun s ((Reach.step .refl hg ht).trans hs))
     have hev : ∀ g ∈ (M.pol (M.schemaOf n)).allow ++ (M.pol (M.schemaOf n)).deny,
-        (g.eval (M.canOpN k app a₁ (some u)) app a₁ (some u) n ↔
-          g.eval (M.canOpN k app a₂ (some u)) app a₂ (some u) n) := fun g hg =>
-      eval_actor_indep g (hwf _ hn g hg) (ih g hg)
-    simp only [canOpN, Pre, evalPolicy, allowHolds, hn, admits]
+        (g.eval (M.canOpN k app (some a₁) (some u)) app (some a₁) (some u) n ↔
+          g.eval (M.canOpN k app (some a₂) (some u)) app (some a₂) (some u) n) := fun g hg =>
+      eval_actor_indep g (hwf _ hn g hg) fun t ht =>
+        canOpN_actor_indep hwf app a₁ a₂ u hd₁ hd₂ k t
+          (fun s hs => hun s ((Reach.step .refl hg ht).trans hs))
+    simp only [canOpN, Pre, evalPolicy, hn, admits]
     constructor
-    · rintro ⟨⟨-, h2, -, h4⟩, ⟨g, hg, hgA, himp⟩, hD⟩
-      refine ⟨⟨hd₂, h2, trivial, h4⟩, ⟨g, hg, (hev g (List.mem_append_left _ hg)).1 hgA,
-        fun hap => by cases (himp hap).2⟩, ?_⟩
+    · rintro ⟨⟨-, h2, -, h4⟩, ⟨g, hg, hgA⟩, hD⟩
+      refine ⟨⟨fun x hx => by cases hx; exact hd₂, h2, trivial, h4⟩,
+        ⟨g, hg, (hev g (List.mem_append_left _ hg)).1 hgA⟩, ?_⟩
       rintro ⟨d, hd, hdE⟩
       exact hD ⟨d, hd, (hev d (List.mem_append_right _ hd)).2 hdE⟩
-    · rintro ⟨⟨-, h2, -, h4⟩, ⟨g, hg, hgA, himp⟩, hD⟩
-      refine ⟨⟨hd₁, h2, trivial, h4⟩, ⟨g, hg, (hev g (List.mem_append_left _ hg)).2 hgA,
-        fun hap => by cases (himp hap).2⟩, ?_⟩
+    · rintro ⟨⟨-, h2, -, h4⟩, ⟨g, hg, hgA⟩, hD⟩
+      refine ⟨⟨fun x hx => by cases hx; exact hd₁, h2, trivial, h4⟩,
+        ⟨g, hg, (hev g (List.mem_append_left _ hg)).2 hgA⟩, ?_⟩
       rintro ⟨d, hd, hdE⟩
       exact hD ⟨d, hd, (hev d (List.mem_append_right _ hd)).1 hdE⟩
 
-/-- **Viewer-only policies: an agent can do exactly what its user can** (union minus deny). -/
+/-- **Viewer-only policies: an agent can do exactly what its user can** (union minus deny),
+whatever the guards' polarity, `shep::visible` under `not` included. -/
 theorem canOp_actfor_eq_undeclared (hwf : M.WF) {app : App} {g u n : Node}
     (hun : ∀ t, M.Reach n t → M.actors (M.schemaOf t) = none) (hg : ¬ M.deleted g)
     (hu : ¬ M.deleted u) :
     M.canOp app (some g) (some u) n ↔ M.canOp app (some u) (some u) n :=
-  canOpN_actor_indep hwf app (some g) (some u) u (fun x hx => by cases hx; exact hg)
-    (fun x hx => by cases hx; exact hu) M.depth n hun
+  canOpN_actor_indep hwf app g u u hg hu M.depth n hun
 
 end Model
 
-/-! ### Counterexamples under union minus deny -/
+/-! ### Examples and counterexamples under union minus deny -/
 
 namespace Ex
 
@@ -860,53 +1108,96 @@ def tyOf : N → T
   | .d => .doc
   | .t => .doc
 
-/-- Schemas: `false` holds `d`, `true` holds `t`; both have viewer type `users.User` and declare
-`actors users.User | agents.Agent`. -/
-def mk (pd pt : Policy Unit N) : Model N T Bool Unit :=
-  ⟨tyOf, fun _ => False, fun x => decide (x = .t), fun _ => .user,
-    fun _ => some {some .agent, some .user}, fun s => if s then pt else pd, 2⟩
+/-- Schemas: `false` holds `d`, `true` holds `t`; both have viewer type `users::User` and the
+given actors declaration. The app is `Bool` (`true` is `slack`). -/
+def mk (decl : Option (Set (Option T))) (pd pt : Policy Bool N) : Model N T Bool Bool :=
+  ⟨tyOf, fun _ => False, fun x => decide (x = .t), fun _ => .user, fun _ => decl,
+    fun s => if s then pt else pd, 2⟩
 
-def none' : Policy Unit N := ⟨[], []⟩
+/-- `global actor: users::User | agents::Agent` -/
+def both : Option (Set (Option T)) := some {some .agent, some .user}
 
-/-- **An actor-reading allow amplifies:** `allow if actor is agents.Agent`. -/
+def none' : Policy Bool N := ⟨[], []⟩
+
+/-- **An allow on the actor amplifies:** `allow … using (global actor is agents::Agent)`. -/
 theorem actorAllow_amplifies :
-    (mk ⟨[.onActor (fun _ a _ _ => a = .g)], []⟩ none').canOp () (some .g) (some .u) .d ∧
-      ¬ (mk ⟨[.onActor (fun _ a _ _ => a = .g)], []⟩ none').canOp () (some .u) (some .u) .d := by
-  simp [mk, Model.canOp, Model.canOpN, Model.Pre, evalPolicy, allowHolds, Guard.eval,
-    Guard.appOnly, admits, tyOf]
+    (mk both ⟨[.actorAtom (fun _ a _ => a = .g)], []⟩ none').canOp true (some .g) (some .u) .d ∧
+      ¬ (mk both ⟨[.actorAtom (fun _ a _ => a = .g)], []⟩ none').canOp true (some .u)
+        (some .u) .d := by
+  simp [mk, both, Model.canOp, Model.canOpN, Model.Pre, evalPolicy, Guard.eval, admits, tyOf]
 
-/-- **A deny on the viewer's own type amplifies:** `deny if actor is users.User`. -/
+/-- **A deny on the viewer's own type amplifies:** `deny … using (global actor is
+users::User)`. -/
 theorem actorDeny_on_self_amplifies :
-    (mk ⟨[.onViewer (fun _ _ _ => True)], [.onActor (fun _ a _ _ => a = .u)]⟩ none').canOp ()
+    (mk both ⟨[.plain (fun _ _ => True)], [.actorAtom (fun _ a _ => a = .u)]⟩ none').canOp true
         (some .g) (some .u) .d ∧
-      ¬ (mk ⟨[.onViewer (fun _ _ _ => True)], [.onActor (fun _ a _ _ => a = .u)]⟩ none').canOp
-        () (some .u) (some .u) .d := by
-  simp [mk, Model.canOp, Model.canOpN, Model.Pre, evalPolicy, allowHolds, Guard.eval,
-    Guard.appOnly, admits, tyOf]
+      ¬ (mk both ⟨[.plain (fun _ _ => True)], [.actorAtom (fun _ a _ => a = .u)]⟩ none').canOp
+        true (some .u) (some .u) .d := by
+  simp [mk, both, Model.canOp, Model.canOpN, Model.Pre, evalPolicy, Guard.eval, admits, tyOf]
 
-/-- `t`'s policy: `allow if viewer …; deny if actor is agents.Agent`. -/
-def ptAgentDeny : Policy Unit N :=
-  ⟨[.onViewer (fun _ _ _ => True)], [.onActor (fun _ a _ _ => a = .g)]⟩
+/-- **A declaration that leaves out the viewer type amplifies:** `global actor: agents::Agent`
+in a schema whose viewer type is `users::User`. -/
+theorem actorsDecl_excluding_viewer_amplifies :
+    (mk (some {some .agent}) ⟨[.plain (fun _ _ => True)], []⟩ none').canOp true (some .g)
+        (some .u) .d ∧
+      ¬ (mk (some {some .agent}) ⟨[.plain (fun _ _ => True)], []⟩ none').canOp true (some .u)
+        (some .u) .d := by
+  simp [mk, Model.canOp, Model.canOpN, Model.Pre, evalPolicy, Guard.eval, admits, tyOf]
 
-/-- `d`'s policy: `allow if viewer …; deny if shep::visible(.t)`. -/
-def pdVisibleDeny : Policy Unit N :=
-  ⟨[.onViewer (fun _ _ _ => True)], [.visible (fun _ => some .t)]⟩
+/-- `t`: `allow (true)`, `deny (global actor is agents::Agent)` -/
+def ptAgentDeny : Policy Bool N :=
+  ⟨[.plain (fun _ _ => True)], [.actorAtom (fun _ a _ => a = .g)]⟩
 
-/-- **`visible` under a deny amplifies** when its target reads the actor: `t` hides itself from
-agents, so `deny if shep::visible(.t)` on `d` denies `u` but not the agent acting for `u`. No
-allow reads the actor, and `u` makes every actor atom false; that is why the theorem needs
-`NoVisibleDeny`. -/
+/-- `d`: `allow (true)`, `deny (shep::visible(.t))` -/
+def pdVisibleDeny : Policy Bool N :=
+  ⟨[.plain (fun _ _ => True)], [.visible (fun _ => some .t)]⟩
+
+/-- **`shep::visible` at deny polarity amplifies** when its target reads the actor: `t` hides
+itself from agents, so `deny … using (shep::visible(.t))` on `d` denies `u` but not the agent
+acting for `u`, although no allow reads the actor. -/
 theorem visibleDeny_amplifies :
-    (mk pdVisibleDeny ptAgentDeny).canOp () (some .g) (some .u) .d ∧
-      ¬ (mk pdVisibleDeny ptAgentDeny).canOp () (some .u) (some .u) .d := by
-  simp [mk, pdVisibleDeny, ptAgentDeny, Model.canOp, Model.canOpN, Model.Pre, evalPolicy,
-    allowHolds, Guard.eval, Guard.appOnly, admits, tyOf]
+    (mk both pdVisibleDeny ptAgentDeny).canOp true (some .g) (some .u) .d ∧
+      ¬ (mk both pdVisibleDeny ptAgentDeny).canOp true (some .u) (some .u) .d := by
+  simp [mk, both, pdVisibleDeny, ptAgentDeny, Model.canOp, Model.canOpN, Model.Pre, evalPolicy,
+    Guard.eval, admits, tyOf]
+
+/-- `global shep::app = 'slack'` -/
+def isSlack : Guard Bool N := .plain fun app _ => app = true
+
+/-- **An app grant without `not exists global viewer` reaches every request from that app**,
+including an agent acting for `u`. -/
+theorem appAllow_without_noviewer_admits_viewer :
+    (mk none ⟨[isSlack], []⟩ none').canOp true (some .g) (some .u) .d := by
+  simp [mk, isSlack, Model.canOp, Model.canOpN, Model.Pre, evalPolicy, Guard.eval, admits,
+    tyOf]
+
+/-- **Written out, it admits exactly the app acting as itself.** -/
+theorem appOnly_allow_exact :
+    (mk none ⟨[.and isSlack (.not .existsViewer)], []⟩ none').canOp true none none .d ∧
+      ∀ (actor : Option N) (v : N),
+        ¬ (mk none ⟨[.and isSlack (.not .existsViewer)], []⟩ none').canOp true actor (some v)
+          .d := by
+  refine ⟨by simp [mk, isSlack, Model.canOp, Model.canOpN, Model.Pre, evalPolicy, Guard.eval,
+    admits], fun actor v => Model.canOp_noViewer_allows true actor v .d ?_⟩
+  simp [mk]
+
+/-- **A negated viewer atom in an allow admits requests with no viewer**: per atom,
+`global viewer in .blocked` is false without a viewer, so `allow … using (not (global viewer in
+.blocked))` admits the app acting as itself. -/
+theorem negated_viewer_allow_admits_asApp :
+    (mk none ⟨[.not (.viewerAtom fun _ v _ => v = .u)], []⟩ none').canOp false none none .d := by
+  simp [mk, Model.canOp, Model.canOpN, Model.Pre, evalPolicy, Guard.eval, admits]
 
 end Ex
 
 end UMD
 
-/-! ## Two-party issuance (§6.3, "Issuing takes two parties") -/
+/-! ## Superseded: two-party issuance
+
+The earlier §6.3 had Shep issue act-for keys in a system partition. Shep now has no system
+partition, no API keys, and no key revocation: an external auth service issues signed JWTs and
+decides act-for, and Shep only verifies them (§6.3). This section models the earlier design and
+is kept for history; nothing in the current design depends on it. -/
 
 namespace Issuance
 

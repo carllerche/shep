@@ -1,0 +1,5 @@
+error: a tag is a u8 (0..=255)
+ --> tests/ui/tag_out_of_range.rs:3:19
+  |
+3 |     #[codec(tag = 256)]
+  |                   ^^^

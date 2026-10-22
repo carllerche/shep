@@ -1,0 +1,21 @@
+[package]
+name = "shep-wal-controller"
+description = "The WAL controller's state: members, log sets and partitions, rebuilt from its log"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+bytes.workspace = true
+shep-codec.workspace = true
+shep-raft.workspace = true
+shep-rpc.workspace = true
+shep-wal-api.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+bytes.workspace = true
+shep-codec.workspace = true

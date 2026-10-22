@@ -1,2 +1,5 @@
 target/
 formal/tla/.tlc.lock
+
+# Test logs, if anything writes them into the source tree.
+**/_log/

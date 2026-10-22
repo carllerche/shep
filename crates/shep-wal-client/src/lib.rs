@@ -1,143 +1,79 @@
-//! A client for the WAL's gRPC protocol.
+//! A client for the WAL's protocol, on shep-rpc.
 //!
 //! [`NodeClient`] talks to one node. [`WalClient`] knows a set of nodes and
 //! routes each proposal to its partition's leader, re-sending the same
 //! proposal when the outcome is unknown (always safe: every proposal has an
-//! idempotency key), and tails the log from whichever replica answers.
+//! idempotency key), and tails the log by long-polling whichever replica
+//! answers.
 
-use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use futures::{Stream, StreamExt};
-use shep_wal_api::proto::wal_admin_client::WalAdminClient;
-use shep_wal_api::proto::wal_client::WalClient as WalRpc;
+use futures::Stream;
+use shep_rpc::{ConnectionCache, ReconnectConfig, RpcError};
 use shep_wal_api::{
-    Decided, LogEntry, Member, PartitionId, PartitionStatus, Proposal, Rejection, proto,
+    AdminReply, CreatePartitionRequest, Decided, FetchReply, FetchRequest,
+    InitializePartitionRequest, LogEntry, Member, PartitionId, PartitionStatus, Proposal,
+    ProposeReply, ProposeRequest, Rejection, StatusReply, StatusRequest, method,
+};
+use shep_wal_controller::{
+    ControllerState, CreateLogSetReply, CreateLogSetRequest, LogSet, LogSetId, StateReply,
+    StateRequest, method as cm,
 };
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 use tokio_stream::wrappers::ReceiverStream;
-use tonic::transport::{Channel, Endpoint};
 
 pub use shep_wal_api as api;
+pub use shep_wal_controller as controller;
 
-/// The default for the largest message either side sends.
-const MAX_MESSAGE: usize = 256 << 20;
+/// Shep's reading of a log set: a universe, whose first partition is its
+/// meta partition and the rest its data partitions.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Universe {
+    pub id: LogSetId,
+    pub name: String,
+    pub meta: PartitionId,
+    pub data: Vec<PartitionId>,
+}
+
+impl Universe {
+    pub fn of(id: LogSetId, set: &LogSet) -> Option<Universe> {
+        let (&meta, data) = set.partitions.split_first()?;
+        Some(Universe {
+            id,
+            name: set.name.clone(),
+            meta,
+            data: data.to_vec(),
+        })
+    }
+
+    /// Log set `id` in `state`, as a universe.
+    pub fn find(state: &ControllerState, id: LogSetId) -> Option<Universe> {
+        Universe::of(id, state.log_sets.get(&id)?)
+    }
+
+    /// Its meta partition, then its data partitions.
+    pub fn partitions(&self) -> impl Iterator<Item = PartitionId> + '_ {
+        std::iter::once(self.meta).chain(self.data.iter().copied())
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum ClientError {
     #[error("invalid address {0:?}")]
     InvalidAddress(String),
     #[error(transparent)]
-    Rpc(#[from] tonic::Status),
+    Rpc(#[from] RpcError),
     #[error(transparent)]
-    Decode(#[from] shep_wal_api::DecodeError),
-}
-
-/// A connection to one WAL node.
-#[derive(Clone)]
-pub struct NodeClient {
-    addr: String,
-    wal: WalRpc<Channel>,
-    admin: WalAdminClient<Channel>,
-}
-
-impl NodeClient {
-    /// A client for `addr` (`host:port`). It connects on first use.
-    pub fn new(addr: impl Into<String>) -> Result<NodeClient, ClientError> {
-        NodeClient::with_max_message(addr, MAX_MESSAGE)
-    }
-
-    /// Like `new`, sending and accepting messages up to `max_message` bytes.
-    pub fn with_max_message(
-        addr: impl Into<String>,
-        max_message: usize,
-    ) -> Result<NodeClient, ClientError> {
-        let addr = addr.into();
-        let channel = Endpoint::from_shared(format!("http://{addr}"))
-            .map_err(|_| ClientError::InvalidAddress(addr.clone()))?
-            .connect_timeout(Duration::from_secs(1))
-            .tcp_nodelay(true)
-            .connect_lazy();
-        Ok(NodeClient {
-            addr,
-            wal: WalRpc::new(channel.clone())
-                .max_decoding_message_size(max_message)
-                .max_encoding_message_size(max_message),
-            admin: WalAdminClient::new(channel),
-        })
-    }
-
-    pub fn addr(&self) -> &str {
-        &self.addr
-    }
-
-    /// Sends one proposal to this node, whatever its role.
-    pub async fn propose(
-        &self,
-        partition: PartitionId,
-        proposal: &Proposal,
-    ) -> Result<Result<Decided, Rejection>, ClientError> {
-        let req = proto::ProposeRequest {
-            partition: partition.0,
-            proposal: Some(proposal.into()),
-        };
-        let resp = self.wal.clone().propose(req).await?.into_inner();
-        Ok(resp.try_into()?)
-    }
-
-    /// Committed entries from `from_index` on, as this node serves them. The
-    /// stream ends with an error if the node stops serving it.
-    pub async fn tail(
-        &self,
-        partition: PartitionId,
-        from_index: u64,
-    ) -> Result<impl Stream<Item = Result<Vec<LogEntry>, ClientError>> + use<>, ClientError> {
-        let req = proto::TailRequest {
-            partition: partition.0,
-            from_index,
-        };
-        let stream = self.wal.clone().tail(req).await?.into_inner();
-        Ok(stream.map(move |resp| {
-            let resp = resp?;
-            Ok(resp
-                .entries
-                .into_iter()
-                .map(|e| LogEntry::from_proto(partition, e))
-                .collect::<Result<Vec<_>, _>>()?)
-        }))
-    }
-
-    pub async fn status(&self, partition: PartitionId) -> Result<PartitionStatus, ClientError> {
-        let req = proto::StatusRequest {
-            partition: partition.0,
-        };
-        Ok(self.wal.clone().status(req).await?.into_inner().into())
-    }
-
-    pub async fn create_partition(&self, partition: PartitionId) -> Result<(), ClientError> {
-        self.admin
-            .clone()
-            .create_partition(proto::CreatePartitionRequest {
-                partition: partition.0,
-            })
-            .await?;
-        Ok(())
-    }
-
-    pub async fn initialize_partition(
-        &self,
-        partition: PartitionId,
-        members: &[Member],
-    ) -> Result<(), ClientError> {
-        let req = proto::InitializePartitionRequest {
-            partition: partition.0,
-            members: members.iter().map(Into::into).collect(),
-        };
-        self.admin.clone().initialize_partition(req).await?;
-        Ok(())
-    }
+    Decode(#[from] shep_codec::DecodeError),
+    #[error("unknown partition")]
+    UnknownPartition,
+    #[error("partition already initialized")]
+    AlreadyInitialized,
+    #[error("{0}")]
+    Failed(String),
 }
 
 #[derive(Clone, Debug)]
@@ -148,12 +84,12 @@ pub struct ClientConfig {
     pub rpc_timeout: Duration,
     /// The pause before trying again after a failure.
     pub retry_backoff: Duration,
-    /// How long a tail may go without entries before checking whether
-    /// another replica is ahead of the one it's reading.
+    /// How long one fetch waits for entries; also how long a tail goes
+    /// without entries before checking whether another replica is ahead.
     pub tail_idle: Duration,
-    /// The largest message sent or accepted. It must be at least the
-    /// servers' limit, or large batches are refused.
-    pub max_message_size: usize,
+    /// About how many bytes of entries one fetch returns.
+    pub fetch_max_bytes: u32,
+    pub reconnect: ReconnectConfig,
 }
 
 impl Default for ClientConfig {
@@ -163,8 +99,170 @@ impl Default for ClientConfig {
             rpc_timeout: Duration::from_secs(6),
             retry_backoff: Duration::from_millis(25),
             tail_idle: Duration::from_secs(1),
-            max_message_size: MAX_MESSAGE,
+            fetch_max_bytes: 4 << 20,
+            reconnect: ReconnectConfig {
+                initial_backoff: Duration::from_millis(50),
+                max_backoff: Duration::from_secs(1),
+                connect_timeout: Duration::from_secs(1),
+            },
         }
+    }
+}
+
+/// One WAL node.
+#[derive(Clone)]
+pub struct NodeClient {
+    addr: String,
+    sock: SocketAddr,
+    cache: Arc<ConnectionCache>,
+    rpc_timeout: Duration,
+}
+
+impl NodeClient {
+    /// A client for `addr` (`host:port`). It connects on first use.
+    pub fn new(addr: impl Into<String>) -> Result<NodeClient, ClientError> {
+        let config = ClientConfig::default();
+        NodeClient::with(
+            addr.into(),
+            Arc::new(ConnectionCache::new(config.reconnect)),
+            config.rpc_timeout,
+        )
+    }
+
+    fn with(
+        addr: String,
+        cache: Arc<ConnectionCache>,
+        rpc_timeout: Duration,
+    ) -> Result<NodeClient, ClientError> {
+        let sock = addr
+            .parse()
+            .map_err(|_| ClientError::InvalidAddress(addr.clone()))?;
+        Ok(NodeClient {
+            addr,
+            sock,
+            cache,
+            rpc_timeout,
+        })
+    }
+
+    pub fn addr(&self) -> &str {
+        &self.addr
+    }
+
+    async fn call<Req: shep_codec::Encode, Resp: shep_codec::Decode>(
+        &self,
+        method: u32,
+        req: &Req,
+        timeout: Duration,
+    ) -> Result<Resp, ClientError> {
+        let body = self
+            .cache
+            .call(self.sock, method, shep_codec::to_bytes(req), timeout)
+            .await?;
+        Ok(shep_codec::from_bytes(body)?)
+    }
+
+    /// Sends one proposal to this node, whatever its role.
+    pub async fn propose(
+        &self,
+        partition: PartitionId,
+        proposal: &Proposal,
+    ) -> Result<Result<Decided, Rejection>, ClientError> {
+        self.propose_within(partition, proposal, self.rpc_timeout)
+            .await
+    }
+
+    async fn propose_within(
+        &self,
+        partition: PartitionId,
+        proposal: &Proposal,
+        timeout: Duration,
+    ) -> Result<Result<Decided, Rejection>, ClientError> {
+        let req = ProposeRequest {
+            partition,
+            proposal: proposal.clone(),
+        };
+        let reply: ProposeReply = self.call(method::PROPOSE, &req, timeout).await?;
+        Ok(reply.into())
+    }
+
+    /// One long poll: committed entries from `from_index` on, waiting up to
+    /// `wait` for any.
+    pub async fn fetch(
+        &self,
+        partition: PartitionId,
+        from_index: u64,
+        max_bytes: u32,
+        wait: Duration,
+    ) -> Result<(Vec<LogEntry>, Option<u64>), ClientError> {
+        let req = FetchRequest {
+            partition,
+            from_index,
+            max_bytes,
+            max_wait_ms: wait.as_millis().min(u32::MAX as u128) as u32,
+        };
+        match self
+            .call(method::FETCH, &req, wait + self.rpc_timeout)
+            .await?
+        {
+            FetchReply::Entries {
+                entries,
+                applied_index,
+            } => Ok((entries, applied_index)),
+            FetchReply::OutOfRange { start } => Err(ClientError::Failed(format!(
+                "index {from_index} is no longer held; the log starts at {start}"
+            ))),
+            FetchReply::UnknownPartition => Err(ClientError::UnknownPartition),
+        }
+    }
+
+    pub async fn status(&self, partition: PartitionId) -> Result<PartitionStatus, ClientError> {
+        match self
+            .call(
+                method::STATUS,
+                &StatusRequest { partition },
+                self.rpc_timeout,
+            )
+            .await?
+        {
+            StatusReply::Status(s) => Ok(s),
+            StatusReply::UnknownPartition => Err(ClientError::UnknownPartition),
+        }
+    }
+
+    pub async fn create_partition(&self, partition: PartitionId) -> Result<(), ClientError> {
+        admin(
+            self.call(
+                method::CREATE_PARTITION,
+                &CreatePartitionRequest { partition },
+                self.rpc_timeout,
+            )
+            .await?,
+        )
+    }
+
+    pub async fn initialize_partition(
+        &self,
+        partition: PartitionId,
+        members: &[Member],
+    ) -> Result<(), ClientError> {
+        let req = InitializePartitionRequest {
+            partition,
+            members: members.to_vec(),
+        };
+        admin(
+            self.call(method::INITIALIZE_PARTITION, &req, self.rpc_timeout)
+                .await?,
+        )
+    }
+}
+
+fn admin(reply: AdminReply) -> Result<(), ClientError> {
+    match reply {
+        AdminReply::Ok => Ok(()),
+        AdminReply::AlreadyInitialized => Err(ClientError::AlreadyInitialized),
+        AdminReply::UnknownPartition => Err(ClientError::UnknownPartition),
+        AdminReply::Failed(m) => Err(ClientError::Failed(m)),
     }
 }
 
@@ -193,8 +291,9 @@ pub struct WalClient {
 
 struct Shared {
     config: ClientConfig,
+    cache: Arc<ConnectionCache>,
     nodes: Mutex<Vec<NodeClient>>,
-    leaders: Mutex<HashMap<PartitionId, String>>,
+    leaders: Mutex<std::collections::HashMap<PartitionId, String>>,
 }
 
 impl WalClient {
@@ -211,15 +310,17 @@ impl WalClient {
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
+        let cache = Arc::new(ConnectionCache::new(config.reconnect.clone()));
         let nodes = addrs
             .into_iter()
-            .map(|addr| NodeClient::with_max_message(addr, config.max_message_size))
+            .map(|a| NodeClient::with(a.into(), cache.clone(), config.rpc_timeout))
             .collect::<Result<Vec<_>, _>>()?;
         Ok(WalClient {
             shared: Arc::new(Shared {
                 config,
+                cache,
                 nodes: Mutex::new(nodes),
-                leaders: Mutex::new(HashMap::new()),
+                leaders: Mutex::new(Default::default()),
             }),
         })
     }
@@ -230,7 +331,11 @@ impl WalClient {
         if let Some(n) = nodes.iter().find(|n| n.addr == addr) {
             return Ok(n.clone());
         }
-        let n = NodeClient::with_max_message(addr, self.shared.config.max_message_size)?;
+        let n = NodeClient::with(
+            addr.to_string(),
+            self.shared.cache.clone(),
+            self.shared.config.rpc_timeout,
+        )?;
         nodes.push(n.clone());
         Ok(n)
     }
@@ -277,7 +382,8 @@ impl WalClient {
                 }
             };
             let wait = config.rpc_timeout.min(remaining);
-            let rpc = tokio::time::timeout(wait, node.propose(partition, proposal)).await;
+            let rpc =
+                tokio::time::timeout(wait, node.propose_within(partition, proposal, wait)).await;
             let mut pause = true;
             match rpc {
                 Ok(Ok(Ok(decided))) => {
@@ -330,9 +436,9 @@ impl WalClient {
 
     /// Every committed entry of `partition` from `from_index` on, in order,
     /// from whichever replica serves them. It moves to another replica when
-    /// one fails, or when one goes quiet while another has applied entries
-    /// it hasn't sent (say, it was cut off from its leader). The stream never
-    /// ends while it's polled.
+    /// one fails, or when one has nothing new while another has applied
+    /// further (say, it was cut off from its leader). The stream never ends
+    /// while it's polled.
     pub fn tail(
         &self,
         partition: PartitionId,
@@ -341,10 +447,11 @@ impl WalClient {
         let (tx, rx) = mpsc::channel(256);
         let client = self.clone();
         tokio::spawn(async move {
+            let config = client.shared.config.clone();
             let mut next = from_index;
             let mut n = 0usize;
             let mut preferred: Option<String> = None;
-            loop {
+            'nodes: loop {
                 let node = match preferred.take().map(|addr| client.node(&addr)) {
                     Some(Ok(node)) => node,
                     _ => {
@@ -353,63 +460,142 @@ impl WalClient {
                         nodes[(n - 1) % nodes.len()].clone()
                     }
                 };
-                match client.follow(&node, partition, &mut next, &tx).await {
-                    Follow::Closed => return,
-                    Follow::SwitchTo(addr) => preferred = Some(addr),
-                    Follow::Failed => tokio::time::sleep(client.shared.config.retry_backoff).await,
+                loop {
+                    let fetched = node
+                        .fetch(partition, next, config.fetch_max_bytes, config.tail_idle)
+                        .await;
+                    let entries = match fetched {
+                        Ok((entries, _)) => entries,
+                        Err(e) => {
+                            tracing::debug!(addr = node.addr, "tail: {e}");
+                            break;
+                        }
+                    };
+                    if entries.is_empty() {
+                        // Nothing new here: either nothing committed, or this
+                        // replica fell behind. Ask the others.
+                        if let Some(addr) = client.replica_ahead(partition, next, &node.addr).await
+                        {
+                            preferred = Some(addr);
+                            continue 'nodes;
+                        }
+                        if tx.is_closed() {
+                            return;
+                        }
+                        continue;
+                    }
+                    for entry in entries {
+                        if entry.dot.index < next {
+                            continue;
+                        }
+                        if entry.dot.index > next {
+                            tracing::warn!(
+                                addr = node.addr,
+                                next,
+                                got = entry.dot.index,
+                                "tail: gap"
+                            );
+                            break;
+                        }
+                        next += 1;
+                        if tx.send(entry).await.is_err() {
+                            return;
+                        }
+                    }
                 }
+                if tx.is_closed() {
+                    return;
+                }
+                tokio::time::sleep(config.retry_backoff).await;
             }
         });
         ReceiverStream::new(rx)
     }
 
-    /// Forwards `node`'s tail to `tx` until the node fails, falls behind
-    /// another replica, or the receiver goes away.
-    async fn follow(
+    /// The WAL controller's state, from the first node that answers.
+    pub async fn controller_state(&self) -> Result<ControllerState, ClientError> {
+        let mut last = ClientError::Failed("no nodes".into());
+        for node in self.nodes() {
+            match node
+                .call(cm::STATE, &StateRequest {}, self.shared.config.rpc_timeout)
+                .await
+            {
+                Ok(StateReply::State(s)) => return Ok(s),
+                Ok(StateReply::NoController) => {
+                    last = ClientError::Failed(format!("{} hosts no controller", node.addr))
+                }
+                Err(e) => last = e,
+            }
+        }
+        Err(last)
+    }
+
+    /// Creates a universe, `data_partitions` data partitions and a meta
+    /// partition with `replication` replicas each: see
+    /// [`WalClient::create_log_set`].
+    pub async fn create_universe(
         &self,
-        node: &NodeClient,
-        partition: PartitionId,
-        next: &mut u64,
-        tx: &mpsc::Sender<LogEntry>,
-    ) -> Follow {
+        name: &str,
+        data_partitions: u32,
+        replication: u32,
+    ) -> Result<(Universe, ControllerState), ClientError> {
+        let partitions = data_partitions.saturating_add(1);
+        let (id, state) = self.create_log_set(name, partitions, replication).await?;
+        let universe = Universe::find(&state, id)
+            .ok_or_else(|| ClientError::Failed(format!("log set {} isn't a universe", id.0)))?;
+        Ok((universe, state))
+    }
+
+    /// Creates a log set through the controller's leader, following
+    /// redirects until `propose_deadline`. No RPC or pause runs past it.
+    pub async fn create_log_set(
+        &self,
+        name: &str,
+        partitions: u32,
+        replication: u32,
+    ) -> Result<(LogSetId, ControllerState), ClientError> {
         let config = &self.shared.config;
-        let open = tokio::time::timeout(config.rpc_timeout, node.tail(partition, *next)).await;
-        let stream = match open {
-            Ok(Ok(stream)) => stream,
-            Ok(Err(e)) => {
-                tracing::debug!(addr = node.addr, "tail: {e}");
-                return Follow::Failed;
-            }
-            Err(_) => return Follow::Failed,
+        let deadline = Instant::now() + config.propose_deadline;
+        let req = CreateLogSetRequest {
+            name: name.to_string(),
+            partitions,
+            replication,
         };
-        futures::pin_mut!(stream);
+        let nodes = self.nodes();
+        let mut target: Option<String> = None;
+        let mut n = 0usize;
+        let mut last = String::from("no attempt");
         loop {
-            tokio::select! {
-                batch = stream.next() => {
-                    let Some(Ok(batch)) = batch else { return Follow::Failed };
-                    for entry in batch {
-                        if entry.dot.index < *next {
-                            continue;
-                        }
-                        if entry.dot.index > *next {
-                            tracing::warn!(addr = node.addr, next, got = entry.dot.index, "tail: gap");
-                            return Follow::Failed;
-                        }
-                        *next += 1;
-                        if tx.send(entry).await.is_err() {
-                            return Follow::Closed;
-                        }
-                    }
-                }
-                _ = tokio::time::sleep(config.tail_idle) => {
-                    // Quiet: either nothing committed, or this replica fell
-                    // behind. Ask the others.
-                    if let Some(addr) = self.replica_ahead(partition, *next, &node.addr).await {
-                        return Follow::SwitchTo(addr);
-                    }
-                }
-                _ = tx.closed() => return Follow::Closed,
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(ClientError::Failed(format!(
+                    "no controller leader created it in time: {last}"
+                )));
             }
+            let node = match target.take() {
+                Some(addr) => self.node(&addr)?,
+                None if nodes.is_empty() => return Err(ClientError::Failed("no nodes".into())),
+                None => {
+                    n += 1;
+                    nodes[n % nodes.len()].clone()
+                }
+            };
+            let wait = config.rpc_timeout.min(remaining);
+            let rpc = tokio::time::timeout(wait, node.call(cm::CREATE_LOG_SET, &req, wait)).await;
+            match rpc {
+                Ok(Ok(CreateLogSetReply::Created { id, state })) => return Ok((id, state)),
+                Ok(Ok(CreateLogSetReply::Rejected(m))) => return Err(ClientError::Failed(m)),
+                Ok(Ok(CreateLogSetReply::NotLeader { leader: Some(l) })) if l.addr != node.addr => {
+                    target = Some(l.addr);
+                    continue;
+                }
+                Ok(Ok(CreateLogSetReply::NotLeader { .. })) => {
+                    last = format!("{} isn't the leader", node.addr)
+                }
+                Ok(Err(e)) => last = format!("{}: {e}", node.addr),
+                Err(_) => last = format!("{}: timed out", node.addr),
+            }
+            tokio::time::sleep_until((Instant::now() + config.retry_backoff).min(deadline)).await;
         }
     }
 
@@ -440,11 +626,4 @@ impl WalClient {
             .max_by_key(|(_, applied)| *applied)
             .map(|(addr, _)| addr)
     }
-}
-
-enum Follow {
-    /// The receiver went away.
-    Closed,
-    Failed,
-    SwitchTo(String),
 }

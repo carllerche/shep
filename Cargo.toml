@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/*"]
+members = ["crates/*", "tests/*"]
 
 [workspace.package]
 version = "0.1.0"
@@ -9,24 +9,35 @@ license = "MIT"
 publish = false
 
 [workspace.dependencies]
+shep-codec = { path = "crates/shep-codec" }
+shep-codec-derive = { path = "crates/shep-codec-derive" }
+shep-node = { path = "crates/shep-node" }
+shep-raft = { path = "crates/shep-raft" }
+shep-raft-engine = { path = "crates/shep-raft-engine", default-features = false }
+shep-rpc = { path = "crates/shep-rpc" }
+shep-smp = { path = "crates/shep-smp" }
+shep-storage = { path = "crates/shep-storage" }
 shep-version = { path = "crates/shep-version" }
 shep-wal = { path = "crates/shep-wal" }
 shep-wal-api = { path = "crates/shep-wal-api" }
 shep-wal-client = { path = "crates/shep-wal-client" }
+shep-wal-controller = { path = "crates/shep-wal-controller" }
 
 bytes = "1"
-crc32fast = "1"
+core_affinity = "0.8"
+crc32c = "0.6"
 futures = "0.3"
-openraft = { version = "0.9.25", default-features = false, features = ["storage-v2", "generic-snapshot-data"] }
-prost = "0.14"
-protox = "0.10"
+proc-macro2 = "1"
+quote = "1"
 rand = "0.9"
+serde = "1"
+syn = "2"
 tempfile = "3"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
 tokio-stream = { version = "0.1", features = ["net", "sync"] }
-tonic = "0.14"
-tonic-prost = "0.14"
-tonic-prost-build = "0.14"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+trybuild = "1"
+xxhash-rust = { version = "0.8", features = ["xxh64"] }

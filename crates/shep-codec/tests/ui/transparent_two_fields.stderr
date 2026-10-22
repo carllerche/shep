@@ -1,0 +1,5 @@
+error: `transparent` requires exactly one field
+ --> tests/ui/transparent_two_fields.rs:2:9
+  |
+2 | #[codec(transparent)]
+  |         ^^^^^^^^^^^

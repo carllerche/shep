@@ -70,7 +70,8 @@ RQ2 == ("w1" :> [n |-> "n1", v |-> "b"]) @@ ("w2" :> [n |-> "n2", v |-> "a"])
 VARIABLES
   mlog,     \* the meta partition's registry changes, in order
   dlog,     \* D's log
-  cut,      \* change -> the position in D's log from which it is in force
+  cut,      \* change -> it is in force for D's entries after this position:
+            \*   its barrier's, or (no barriers) D's length when it committed
             \*   (0: not yet)
   fe,       \* request -> front end
   mat       \* the materializer: applied, index store, backfill position
@@ -157,7 +158,8 @@ Init ==
 MChange(c) ==
   /\ c \in Changes /\ ~ Committed(c)
   /\ mlog' = Append(mlog, c)
-  /\ cut' = IF Barriers THEN cut ELSE [cut EXCEPT ![c] = Len(dlog) + 1]
+  \* without barriers it is in force for every entry after D's log now
+  /\ cut' = IF Barriers THEN cut ELSE [cut EXCEPT ![c] = Len(dlog)]
   /\ UNCHANGED <<dlog, fe, mat>>
 
 \* the meta leader appends a barrier naming the change to D (any order)

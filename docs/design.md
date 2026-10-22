@@ -1,7 +1,8 @@
 # Shep: design sketch
 
 Ent-style graph data as a shared service, in Rust, on its own replicated
-log (openraft) and LSM storage (SlateDB).
+log (`shep-raft`, a multi-raft forked from openraft) and LSM storage
+(SlateDB).
 
 Status: fifth revision. The second revision replaced the single ordered
 log with dotted version vectors, change queries, and materialized queries.
@@ -13,8 +14,8 @@ derived from operations, placement separate from keys, one way to follow
 changes, and freshness checks. This one replaces Postgres with Shep's own
 storage, and changes nothing apps see:
 
-- **The log is the database.** Each partition's write-ahead log is an
-  openraft group, and a dot is a position in it. Dotted version vectors
+- **The log is the database.** Each partition's write-ahead log is a Raft
+  group with its own log, and a dot is a position in it. Dotted version vectors
   stay the core of consistency: every fact is stamped with a dot, and a
   fact is visible at a version exactly when its stamp is in it. Holes,
   voids, and the frontier machinery are gone.
@@ -30,8 +31,10 @@ storage, and changes nothing apps see:
 - **Placement is static.** A node's partition comes from its key, groups
   split only at their boundaries, and whether an operation needs
   two-phase commit is decided at deploy.
-- **Every component runs in one process or many:** the WAL cluster,
-  materializers, search indexers, view maintainers, and front ends.
+- **Every component runs in one binary or many:** the WAL cluster,
+  materializers, search indexers, view maintainers, and front ends. One
+  binary on one server, with replication factor 1, is a supported
+  deployment that loses only fault tolerance (§9.6).
 
 A review of this revision simplified it further: one rule for consistent
 versions (causal closure over stamps), derived per-node metadata, no
@@ -78,12 +81,12 @@ dialect of EdgeQL (§4.0).
          │ live queries (HTTP/2)      │ live queries (WebSocket)       │ as themselves
          ▼                            ▼                                ▼
  ┌──────────── Front ends: N instances, soft state only (sessions, live-query topics) ────────────┐
- │ admission control: measured resources, per-app quotas, priorities, budgets, shedding           │
+ │ token verification │ admission control: measured resources, priorities, budgets, shedding     │
  │ registry + checker │ privacy │ planner │ mutation executor │ delta engine │ live queries       │
  └───────┬───────────────────────────────┬─────────────────────────────────────▲──────────────────┘
          │ propose: delta + read set     │ reads at a version                  │ tail the logs;
          ▼ (2PC across partitions)       ▼ (at_least V)                        │ view, search reads
- ┌─── WAL cluster (openraft) ───┐  ┌─── Materializers (SlateDB) ───┐  ┌────────┴──────────────────┐
+ ┌─── WAL cluster (shep-raft) ──┐  ┌─── Materializers (SlateDB) ───┐  ┌────────┴──────────────────┐
  │ one Raft group per partition │  │ facts, edges, local indexes,  │  │ view maintainers (DBSP)   │
  │ 3 replicas; the leader       │  │ ghosts, per-field dots;       │  │ search indexers (Tantivy) │
  │ validates and appends        │  │ reads at any version          │  │ each with its version     │
@@ -93,9 +96,10 @@ dialect of EdgeQL (§4.0).
                  └── committed entries, in log order ─────────────────────────────┘
 
  Object store (S3): archived log segments, SlateDB SSTs and checkpoints, search segments, blobs (§16)
- System partition (Raft): apps, API keys, quotas, universes, schema names, login mapping
- Meta partition per universe (Raft): registry, partition map, published frontiers
- Every component also runs in one process, for tests and local use (§9.6)
+ WAL controller (Raft, every WAL node): nodes, universes, partitions, replica sets (§9.6)
+ Meta partition per universe (Raft): registry (versions, policies, operation sets), barriers, frontiers
+ Auth service (outside Shep): identities, act-for consent, credentials; issues the tokens Shep verifies
+ Every component also runs in one binary on one node, replication factor 1: in production or in tests (§9.6)
 ```
 
 **Major capabilities**
@@ -115,7 +119,7 @@ dialect of EdgeQL (§4.0).
 | Materialized queries | Maintained incrementally with DBSP. Slightly behind the log, always tagged with their exact version | §12 |
 | Live queries | Clients subscribe to declared live queries, or poll the same stream as a feed. Shep computes each change once per topic, then applies each subscriber's privacy rules | §13 |
 | Universes | Isolated graphs: production, plus short-lived dev and test universes | §14 |
-| Admission control | Measured resources, per-app quotas, priority classes, and budgets keep the shared service from overloading | §15 |
+| Admission control | Measured resources, priority classes, and budgets keep the shared service from overloading; per-app quotas are open | §15 |
 | Files | Large content in an object store, behind a built-in `File` type with upload states, download links checked on use, and extracted text. The same bytes are never stored twice | §16.1–§16.5 |
 | Text search | Word and substring search over text fields and files' text, on Rust search indexers (Tantivy) that follow the log. Same privacy rules as any read | §16.6 |
 
@@ -283,13 +287,14 @@ materialized queries.
 | **Node key** | A node's identity within its type: generated, app-declared, composite, or a content hash. A key says nothing about where the node is stored (§3). |
 | **ShepQL** | Shep's one language, a dialect of EdgeQL: SDL for schemas and policies (`.esdl`), queries and mutations for operations (`.edgeql`). Every difference from EdgeQL is specified and comes with a checker error (§4.0). |
 | **Placement** | Which placement group a node is in. `constraint shep::placement on (.channel)` keeps a node with another one, so they're written in one partition without two-phase commit. A node's partition is computed from its key, with no lookup (§9.6). |
-| **Actor** | Who is doing the work, as authenticated: a node, such as a `users::User` signed in through SSO or an `agents::Agent` registered to an app, or the calling app itself (`actor = app`, with no viewer). Read-your-writes, quotas, and audit are per actor. Policies see it only in schemas that declare their permitted actors (§6.3). |
-| **Actor handle** | A client-side value, such as `db.as_user(id)`, `db.as_token(&jwt).by(agent)`, or `db.as_app()`, that every request runs through. It starts from the viewer, `.by()` adds a different actor, and it tracks the actor's causal position (§7.3). |
+| **Actor** | Who is doing the work, as the token says: a node, such as a `users::User` signed in through SSO or an `agents::Agent` an app runs, or the calling app itself (`actor = app`, with no viewer). Read-your-writes and audit are per actor. Policies see it only in schemas that declare their permitted actors (§6.3). |
+| **Actor handle** | A client-side value, such as `db.with_token(&token)` or `db.as_user(id).by(agent)`, that every request runs through. It presents a token whose claims name the actor and viewer, and tracks the actor's causal position (§7.3). |
+| **Token** | A bearer JWT the external auth service signs and Shep verifies, naming the universe, app, actor, viewer, and scopes (§6.3). |
 | **Viewer** | Whom a request is for. It defaults to the actor; a credential can name another, such as the user an agent acts for. Everything access-related is per viewer. A viewer not of a schema's viewer type is denied by that schema (§6.3). |
 | **Policy** | An `access policy … allow\|deny <ops> using (<guard>)` on a node or edge type, or on a field. An operation is allowed when some allow's guard holds and no deny's does; guards are always true or false (§6.1). |
 | **Function** | A named, typed, Pure ShepQL function in a policy file, exported to dependent policies and inlined when policies compile (§6.1). |
 | **Check** | A constraint in the schema: a built-in such as `max_len_value(200)`, or `constraint expression on (…)` over the node's own fields. Empty means satisfied (§4.5). |
-| **App** | A registered application. Apps live in one global namespace shared by all universes. An app owns schemas, policies, and operation sets, and its API keys carry permissions (§6.3). |
+| **App** | A registered application. Apps live in one global namespace shared by all universes. An app owns schemas, policies, and operation sets; its name is registered in production's registry, and tokens name it (§6.3, §14.1). |
 | **Universe** | A fully isolated instance of the graph (data, registry, policies, mutation log), such as production, staging, a dev environment, or a test run. Production is `prod` at `shep.internal`; every other universe is at `<universe>.shep.internal` (§14). |
 | **Operation** | A query, live query, or mutation an app declares in a ShepQL `.edgeql` file or `shep::query!`, against pinned schema versions. Apps can run only declared operations, and Shep builds the indexes they need (§7.1). |
 | **Primitive** | An operation every app gets for each node type it uses: get, create, update, delete, restore, link, unlink, paged edge loads, and uploads for file fields (§7.1). |
@@ -319,7 +324,7 @@ uses them.
 | **Valid set `S(v)`** | The set of states that version `v` considers valid. |
 | **Representable** | A stored value is representable for version `v` if reading it through `v`'s adapters and writing it back unchanged leaves it unchanged. Old-version writes to non-representable fields are rejected by default (§4.3). |
 | **Partition** | A range of placement groups, with its own replicated log. Partitions split at group boundaries by size and load (§9.6). |
-| **WAL** | The write-ahead log: one openraft group per partition, three replicas. The source of truth. Its leader validates and appends mutations (§3, §10.3). |
+| **WAL** | The write-ahead log: one Raft group per partition, each with its own log, three replicas (one on a single-node deployment), run by `shep-raft`. The source of truth. Its leader validates and appends mutations (§3, §10.3). |
 | **Materializer** | A process that applies partitions' logs into SlateDB and serves reads at any version (§3). |
 | **Front end** | A process that holds sessions and live-query topics, plans and executes operations, and proposes mutations to the WAL. Soft state only (§9.6). |
 | **Dot** | `(partition, index)`: a position in a partition's log. A mutation's dot is its entry's; a two-phase commit's is its decision's. One dot per mutation (§9.1). |
@@ -343,7 +348,8 @@ uses them.
 ## 3. Storage model
 
 Shep owns its storage. The source of truth is the **write-ahead log
-(WAL)**: one replicated log per **partition**, run by openraft. Everything
+(WAL)**: one replicated log per **partition**, run by `shep-raft`, Shep's
+multi-raft (§17). Everything
 else is derived from it. **Materializers** apply each partition's log into
 SlateDB, an LSM tree on object storage, and serve reads from it; search
 indexers (§16.6) and view maintainers (§12) follow the same logs.
@@ -362,7 +368,9 @@ indexers (§16.6) and view maintainers (§12) follow the same logs.
 **The components** (§9.6 covers how they're deployed):
 
 - **WAL.** One Raft group per partition, three replicas across failure
-  domains. A log entry is a committed mutation: its Z-set delta with old
+  domains, or one on a single-node deployment (§9.6). Each group has its
+  own log, as in Redpanda; no write-ahead log is shared between a core's
+  groups. A log entry is a committed mutation: its Z-set delta with old
   values, its context, and its intent metadata (§10.1), or another kind of
   entry, such as a two-phase commit record (§8) or a registry barrier
   (§10.3). The leader validates every proposed mutation before appending
@@ -433,8 +441,8 @@ m / cf / ¬pos                                → the causal frontier cf(p, pos)
   partition (§8).
 - **The registry lives in the universe's meta partition**: schemas,
   versions, field IDs, dependencies, operation sets, policies and their
-  pins (§6.6), node and edge types, index definitions, and the partition
-  map (§9.6). It's an ordinary partition, with its own log, so every
+  pins (§6.6), node and edge types, and index definitions. The
+  partition map is the WAL controller's (§9.6). It's an ordinary partition, with its own log, so every
   registry change is a log entry with a dot (§10.1).
 - **Blob bytes aren't in SlateDB.** Blobs live only in the object store,
   keyed by their SHA-256, and a file's fields record its blob's hash
@@ -506,15 +514,14 @@ Proposed decisions:
     partition, so the unique index is an `x` range there, validated like
     any other read.
   - **Global, when it can't be local.** A constraint that can't include
-    the group, such as a user's email or the login field (§6.3), lives in
+    the group, such as a user's email, lives in
     the **hashed keyspace**: partitions keyed by a hash of (index, value),
     holding one entry per value. A mutation that writes such a value makes
     that partition a two-phase commit participant (§8), and `shep ops
     check` warns about it, with its cost.
   - **The same answers either way.** A create whose unique value has a
     live entry fails with `conflict`. An entry of a deleted node doesn't
-    count, except for the login field, whose entries are never freed
-    (§6.3). Deleting or restoring a node with a global unique updates its
+    count. Deleting or restoring a node with a global unique updates its
     entry in the same two-phase commit.
 - **A node's identity is its type plus a key.** The key is scoped to the
   node type, and every key in storage starts with both.
@@ -609,9 +616,10 @@ Proposed decisions:
       casts, and every path read treat a placeholder as `{}`; ShepQL has
       no other way to reach the lifecycle facts. With that rule, every query returns the
       same result for a placeholder as for an absent key, and filling one
-      produces the same change as creating it (`query_placeholder_eq_absent`, whose
-      premise is pending re-establishment for ShepQL, §18,
-      and `fill_changes_eq_create` in `formal/lean`).
+      produces the same change as creating it (`query_placeholder_eq_absent`
+      and `fill_changes_eq_create` in `formal/lean`; for ShepQL, in both
+      read contexts, `evalQ_placeholder_eq_absent` in
+      `PlaceholdersQL.lean`).
     - **Filling.** An ordinary create with the placeholder's key fills it.
       Validation, checks, and the target's create policy run then, with
       the full data. Required edges and checks aren't enforced on the
@@ -685,12 +693,40 @@ Proposed decisions:
 - **The hashed keyspace.** Data that has no placement group of its own
   lives in partitions keyed by a hash: global unique entries (above) and
   upload records (§16.3). It's split like any other range (§9.6).
-- **Every component runs in one process or many.** Each component (WAL,
-  materializer, search indexer, view maintainer, front end) is a Tower
-  service behind a trait. A single binary composes them all, with
-  in-memory transport and a local or in-memory object store, for tests and
-  local runs. The distributed deployment runs the same code with one role
-  per process (§9.6, §17).
+- **Every component runs in one process or many.** A single binary
+  composes the components (WAL, materializer, search indexer, view
+  maintainer, front end), with in-process transport and a local or
+  in-memory object store, for tests and local runs. The distributed
+  deployment runs the same code with one role per process (§9.6, §17).
+  Where a component has real and test implementations, such as the
+  transport or the object store, it's an enum with a real and a test
+  variant, not a trait.
+- **The WAL is thread-per-core.** The WAL service is a specialized Rust
+  implementation of Redpanda's model, after Seastar: one tokio
+  `current_thread` runtime per core, and minimal sharing. Each core owns
+  its Raft groups, their logs, a per-core metadata store, and its peer
+  connections; cores talk only through bounded channels. Core 0 hosts
+  the WAL controller (§9.6).
+  - **Raft is `shep-raft`,** Shep's own multi-raft, forked from openraft
+    0.10.0-alpha.37. It keeps openraft's engine (elections, vote rules,
+    log matching, commit, and joint consensus) and its runtime, which
+    already pipelines appends to each follower, runs heartbeats as a
+    separate command with a worker per follower, and tracks submitted
+    I/O apart from flushed I/O. The fork changes only what Redpanda does
+    differently: heartbeats batched per node pair in Shep's network
+    layer, then lightweight heartbeats; recovery admitted by the follower;
+    and the flush rules (commit over flushed offsets, a follower's commit
+    clamped to its own flushed index, group flush). Each Raft group runs
+    on its owning core's runtime (§9.9).
+  - **Validation and append are one step.** A partition's leader
+    validates a proposal and appends it in one step of its core's loop
+    (§10.3), so no other append can come between them.
+  - **A request on the wrong core hops once.** Each node assigns its
+    replicas to cores (§9.6); a request that reaches a node on a core
+    that doesn't own the target replica is forwarded once, over the
+    node's bounded channels, to the owning core. This applies to the WAL service; the other
+  components use an ordinary multi-threaded tokio runtime unless a
+  section says otherwise.
 
 ## 4. Schemas, versions, and compatibility
 
@@ -791,12 +827,25 @@ see:
      then apply as usual, so `not (global viewer in .blocked)` is true
      with no viewer. `exists global viewer` is an ordinary, total atom.
      This is the only way an absent principal enters a decision (§6.1).
+   - **It's a typing rule.** A comparison, `in`, or `is` atom whose only
+     possibly-empty operand is `global viewer` or `global actor` has
+     cardinality One, so `global viewer in .members` is a valid guard
+     with no `??` (`viewerIn_one`). Plain EdgeQL would type it
+     AtMostOne; the two readings agree on the atom but differ under
+     `not` (`viewerIn_not_differs`), which is why the rule is Shep's.
+     The linter flags `?? false` on such an atom as redundant. An atom
+     with another optional operand, such as `i.assignee = global
+     viewer`, is still AtMostOne and needs the polarity's default.
 2. **Policies combine as union minus deny**, with default deny (§6.1).
 3. **`required` describes storage.** A link read is optional even when
    `required`, because visibility can hide its target (§6.2). Gel raises
    an error here; Shep returns `None`. The exception: when the checker
    proves a required single link is always visible to anyone who can read
-   its source, the link is typed One (§4.1.1).
+   its source, the link is typed One (§4.1.1), in operations. In
+   policies, which read raw data, a required single link is One, except
+   a hop to a type that extends `shep::Placeholders`, which is AtMostOne
+   even when `required`, since its target may be a placeholder
+   (`placeholder_hop_not_total`).
 4. **Key casts are optional.** `<Issue>$issue` is AtMostOne: it's `{}`
    for a key that's missing, hidden, deleted, or a placeholder, and those
    look alike. Only `assert_exists` raises `not_found`. A placeholder is
@@ -989,7 +1038,9 @@ module issues {
   the source's `select` implies `shep::visible(.link)`, or the link is
   `shep::contained_in`, anyone who can read the node can read its
   target, so the checker types the link One: `i.project` in `close_issue`
-  (§8) needs no `assert_exists`. `shep schema check` reports which links
+  (§8) needs no `assert_exists`. This applies in the operations read
+  context only; in policies, a required hop to a `shep::Placeholders`
+  type stays AtMostOne (§4.0 item 3). `shep schema check` reports which links
   qualify, and a policy deploy that would break the inference is checked
   like a field becoming hideable (§6.6 item 7).
 
@@ -1095,8 +1146,8 @@ them to decide which reads need no coordination (§7.6).
   (`frozen_eq_creation`). On a single link, such as a message's `author`,
   the target never changes. On a `multi` link, the whole set is fixed at
   creation, like a content-addressed tree's children or a commit's
-  parents. Key fields, hashed fields, the login field, and placement
-  links are already frozen.
+  parents. Key fields, hashed fields, and placement links are already
+  frozen.
 - `extending shep::Permanent` on a type: no `@deleted_at` fact at all,
   so neither delete nor restore applies, and its lifecycle never retracts
   (`present_mono`).
@@ -1211,8 +1262,9 @@ pub mod users  { include!(concat!(env!("OUT_DIR"), "/shep/users.rs")); }    // u
     file `shep.toml` names), and GraphQL
     documents if it has a browser front end (§7.1)
   - its policies (`shep/policies/`)
-  - where to find the API key. The key names its universe, and with it
-    the host, so nothing else picks the universe (§6.3, §14.3).
+  - how to get a token from the auth service. A token names its
+    universe, and with it the host, so nothing else picks the universe
+    (§6.3, §14.3).
 - **No build step to read the schema.** The CLI parses and checks `.esdl`
   and `.edgeql` itself (`shep-ql`, §17). For inline `shep::query!`
   operations it parses the one `#[shep::ops]` module that `shep.toml`
@@ -1252,30 +1304,30 @@ pub mod users  { include!(concat!(env!("OUT_DIR"), "/shep/users.rs")); }    // u
     its IR into `shep/deps/` and records its hash in the lockfile (§4.1.4).
   - `shep dev`: creates a dev universe on the non-production fleet,
     keeps it alive, and redeploys the schema, policies, and operations on
-    save (§7.3, §14.2). Nothing runs locally. It runs as the person logged
-    in with `shep login`: creating a dev universe needs no special
-    permission on the dev fleet, and the person's local processes get a
-    key valid only in that universe. A brand-new app or schema name must
+    save (§7.3, §14.2). Nothing runs locally. It runs as the person, with
+    a token from the auth service carrying `manage_universes` for the dev
+    fleet, and the person's local processes get tokens valid only in that
+    universe. A brand-new app or schema name must
     be registered in production first: until it has propagated, `shep dev`
     fails with an error that says how to register it (§14.1). Dev
     universes accept `localhost`
     origins automatically, so a browser app served locally can connect.
   - `shep policy show | matrix | explain | test`: what policies do, and
     their fixtures and property tests (§6.7).
-  - `shep login`, `shep query`, `shep shell`, and `shep get`: ad-hoc access
-    as yourself, in the universe you logged in to (§7.2).
+  - `shep query`, `shep shell`, and `shep get`: ad-hoc access as
+    yourself, with a token from the auth service (§7.2).
   - `shep app create <name>` and `shep schema reserve <name> --app <app>`:
     register an app or reserve a schema name. They run only against
-    production's control plane, with production credentials, and are
+    production's registry, with a production `deploy` token, and are
     typically run by CI. Every other universe gets the name from
     production's copy within 30 seconds (§14.1).
-  - `shep top` and `shep app quota set`: live load and quotas (§15).
+  - `shep top`: live load (§15).
   - `shep file get | reprocess`: download a file as yourself, and
     re-extract a field's files with a newer extractor (§16.4, §16.5).
-  - `shep key create`, `shep universe create | list | drop`, and
-    `shep log tail | export | replay`: administration (§6.3, §14, §10).
+  - `shep universe create | list | drop`, and
+    `shep log tail | export | replay`: administration (§14, §10).
 - **Deployment never happens from a browser.** It happens from developer
-  machines (dev) and CI (production), using an API key with `deploy`
+  machines (dev) and CI (production), with a token carrying `deploy`
   (§6.3). A browser bundle carries only the hash of the operation set its
   generated client was built from.
 
@@ -1548,7 +1600,9 @@ Abandoned, and is diffed against it.
   abandons a cutover past its point of no return. A timeout leaves the
   cutover running and the old operation set active.
 - **Dev and test universes** with few nodes run a cutover synchronously in
-  one step, so a `shep dev` save doesn't wait on barriers.
+  one step, so a `shep dev` save doesn't wait on barriers. A production
+  single-node deployment (§9.6) runs cutovers through the four states
+  like any other: the shortcut is for dev and test only.
 - **Crash recovery.** Each state is a log entry, so a crash resumes at the
   last recorded state. Backfill rewrites are conditional on the value they
   read, so restarting them is safe.
@@ -1835,7 +1889,10 @@ language.
     `or`, `not`, `if … else`, `??`, `?=`, `?!=`, `exists` on single
     pointers, and `in` a set of literals.
   - **Encoding.** Each optional term becomes a pair `(defined, value)`.
-    An element-wise operator is defined when all its inputs are. `??`,
+    An element-wise operator is defined when all its inputs are, and
+    `if c then a else b` is defined when `c` is and the branch it chooses
+    is; requiring both branches would disagree with the evaluator
+    (`ite_naive_disagrees`, `enc_agrees` in `Checks.lean`). `??`,
     `?=`, and `exists` are total. A policy guard or filter holds when it's
     `defined ∧ value` (totality makes `defined` true for guards); a check
     holds when it's `¬defined ∨ value`. Empty propagates uniformly, so
@@ -1963,7 +2020,8 @@ Policies are ShepQL access policies (§4.0), combined as in Gel and Cedar:
   (global viewer in .author.blocked)` doesn't deny it. `exists global
   viewer` is an ordinary atom, and is how a guard says "only with a
   viewer" or "only without one". This is the rule `Principals.lean`'s
-  `UMD` model states.
+  `UMD` model states. It's also a typing rule: such an atom is One, so
+  these guards need no `??` (§4.0 item 1, `viewerIn_one`).
 - **Deterministic in their inputs.** Policies and functions are Pure
   (§4.0): they read only the graph, `global shep::app`, `global viewer`,
   and (where declared) `global actor`. They can't read the clock
@@ -2081,9 +2139,13 @@ module slack {
   - **How they combine.** A field operation is allowed when the type
     allows the operation on the node, and either the field has no allows
     or one of them holds, and none of its denies does:
-    `type_allowed ∧ (no field allows ∨ ∨A_f) ∧ ¬∨D_f`. A field with only
-    denies narrows the type's policy; a field with allows replaces the
-    type's allows for that field.
+    `type_allowed ∧ (no field allows ∨ ∨A_f) ∧ ¬∨D_f`. It's default deny
+    and never exceeds the type (`field_default_deny`, `field_le_type` in
+    `PolicyCombine.lean`). A field with only denies narrows the type's
+    policy; a field with allows further requires one of them, on top of
+    the type's allows, rather than replacing them (`field_not_replace`).
+    So adding a field's first allow narrows access, and later allows
+    widen it again (`first_field_allow_narrows`).
   - A field policy can't read fields that can be hidden (§6.6 item 7).
 - **Path constraints** declare what isn't a guard, in the `extend type`
   block: `shep::contained_in` and `shep::independent_of` (§6.7), and
@@ -2096,10 +2158,14 @@ module slack {
 
 **Porting Ent-style policies.** Ordered first-match rules have an exact
 union-minus-deny translation, which authors porting from Ent can apply by
-hand. Write the rules in order; each is an allow `A_i` or a deny `D_j`.
-Keep every allow, and rewrite each deny as `D'_j = D_j ∧ ¬(∨_{i<j} A_i)`:
-a deny carries the negation of every allow that came before it. A policy
-whose denies all come first, as above, needs no change. A rewritten deny
+hand (`port_exact` in `PolicyCombine.lean`). Write the rules in order;
+each is an allow `A_i` or a deny `D_j`. Keep every allow, and rewrite
+each deny as `D'_j = D_j ∧ ¬(∨_{i<j} A_i)`: a deny carries the negation
+of every allow that came before it. A policy whose denies all come
+first, as above, needs no change. Ent treats "every rule skips" as
+allow, so a port adds a final `allow … using (true)` unless the Ent
+policy ends in `AlwaysDenyRule` (`port_entDefault`). The port keeps the
+policy's stability (`port_safe`, §7.6). A rewritten deny
 that negates a recursive `shep::visible` isn't allowed (§6.8); restate
 the exception instead.
 
@@ -2132,21 +2198,22 @@ against all of those versions, just as a new schema version is (§6.6).
 
 A request carries three principals: the **calling app**, the **actor**,
 and the **viewer**. This is OAuth 2.0 token exchange's model (RFC 8693),
-where `act` names who is acting and `sub` whom the request is for.
+where `act` names who is acting and `sub` whom the request is for. All
+three come from a bearer token issued by an external auth service (below).
 
 - **The actor** is who is doing the work, as authenticated: any node,
   such as a `users::User` who signed in through SSO or an `agents::Agent`
-  registered to an app, or the app acting as itself. The app acting as
+  an app runs, or the app acting as itself. The app acting as
   itself is `actor = app` with no viewer.
-- **Per actor and per viewer.** Read-your-writes, quotas, and audit are
-  per actor. Everything access-related (policies, audiences, live views,
+- **Per actor and per viewer.** Read-your-writes and audit are per
+  actor. Everything access-related (policies, audiences, live views,
   links, per-viewer aggregates) is per viewer.
 - **The viewer** is whom the request is for. **It defaults to the
   actor:** a person signed in through SSO is both. An agent working for a
   user has `actor = agent g1` and `viewer = user u1`.
-- **Credentials establish act-for, never schemas.** Which viewer an actor
-  may act for is fixed by how the request authenticates (below), so no
-  node type declares it and no schema maps it.
+- **Tokens establish act-for, never schemas.** Which viewer an actor
+  may act for is the auth service's decision, carried in the token
+  (below), so no node type declares it and no schema maps it.
 
 **Policies see the viewer.** Each schema declares its viewer type
 (`global viewer: users::User`, §4.1.1), and policies read it:
@@ -2218,44 +2285,145 @@ extend type Issue {
 - **Seeing who arrives.** "Any actor is permitted" is the default, so
   tooling shows who actually reaches each schema: `shep policy matrix`
   lists, per schema, the actor types that reach it through in-service
-  operation sets and bound keys, and a schema owner's deploy report lists
+  operation sets and the tokens seen, and a schema owner's deploy report lists
   newly arriving actor types.
 
 **Deleted actors and viewers.**
 
-- **A deleted actor is rejected** (`denied`) before any policy runs, and
-  a key bound to it is revoked. This check is load-bearing: soft delete
-  keeps edges, so policies alone would still admit a deleted actor.
-  `can_op` is false for a deleted actor on every node, under every policy
-  and app, only because of it (`canOp_deleted_actor`, and
-  `precheck_needed` for the counterexample without it, in
-  `formal/lean`). The theorem holds at the snapshot a check evaluates;
-  the horizon below says how old that snapshot can be.
-- **A deleted viewer is rejected too.** A request whose credential names
-  a deleted viewer is `denied` before any policy runs, the same as a
+- **A deleted actor is rejected** (`denied`) before any policy runs,
+  whatever its token says. This check is load-bearing: soft delete keeps
+  edges, so policies alone would still admit a deleted actor. `can_op` is
+  false for a deleted actor on every node, under every policy and app,
+  only because of it (`canOp_deleted_actor`, and `precheck_needed` for
+  the counterexample without it, in `formal/lean`). The theorem holds at
+  the snapshot a check evaluates; the horizon below says how old that
+  snapshot can be.
+- **A deleted viewer is rejected too.** A request whose token names a
+  deleted viewer is `denied` before any policy runs, the same as a
   deleted actor. An agent acting for an offboarded user keeps nothing the
   user had, even though the user's membership edges are still in place,
-  and deleting a viewer revokes the act-for keys issued for them
-  (`canOp_deleted_viewer`, proven in `Principals.lean`, §18).
+  and even while its token hasn't expired (`canOp_deleted_viewer`, proven
+  in `Principals.lean`, §18).
+
+**Credentials belong to an external auth service.** Shep manages no
+credentials and signs nothing to authenticate anyone. A separate auth
+service, outside Shep, is responsible for:
+- **identity:** signing people in (company SSO), and mapping identities
+  to actor nodes such as `users::User`;
+- **consent for act-for:** deciding when an agent may act for a user,
+  and which agents an app runs;
+- **credential lifecycle:** the keys and secrets apps and CI hold,
+  rotation, and expiry;
+- **allowlists:** which apps may obtain tokens for arbitrary users, for
+  work no user is present for, such as a queue worker;
+- **revocation:** refusing to issue new tokens to a revoked app, key, or
+  person.
+
+It hands out short-lived **bearer tokens** that say what the bearer may
+do in Shep.
+
+**Shep verifies bearer tokens.**
+- **Format.** A token is an OAuth 2.0 access token in the JWT profile of
+  RFC 9068: a JWT (RFC 7519) in JWS compact form, with header `typ`
+  `at+jwt`, signed with an asymmetric key: EdDSA over Ed25519, with ES256
+  also accepted. Shep holds only the auth service's public keys, so it
+  can verify tokens and can never mint one; a shared HMAC secret would
+  let any Shep node do that, so none is accepted.
+- **Keys.** Shep fetches the public keys from the auth service's JWKS
+  endpoint, configured per fleet, or takes them from fleet
+  configuration, and picks one by the token's `kid`. Several keys can be
+  active at once, so the auth service rotates by publishing a new key
+  before signing with it.
+  - **Freshness.** Shep refreshes the JWKS every `R` (60 s by default),
+    and also when a token names an unknown `kid`, rate-limited. A key
+    missing from the latest successful fetch is dropped at once. If
+    fetches keep failing, cached keys expire `M` (1 hour) after the last
+    successful one, and Shep then fails closed. A fleet-configuration
+    denylist of `kid`s is the break-glass for a leaked key.
+  - **The bound.** A key the auth service withdraws stops being accepted
+    within `R`; a token signed with it before then works for at most `R`
+    plus its own lifetime.
+- **Claims:**
+
+  | Claim | Meaning |
+  |---|---|
+  | `iss` | The auth service. It must equal the fleet's configured issuer |
+  | `aud` | The universe's URL, such as `https://staging.shep.internal`. It must match the host the request reached (§14.3). Tokens for fleet-level operations name the fleet, `https://<fleet>.shep.internal`, and tokens for ephemeral universes name the universe's immutable ID (§14.3) |
+  | `client_id` | The calling app, a name in the universe's registry (§14.1), as RFC 9068 names the client |
+  | `act` | The actor, as RFC 8693's actor claim: `{"sub": "agents::Agent:<key>"}`, or `{"sub": "app"}` for the app acting as itself. A nested `act` (a chain of actors) is refused |
+  | `sub` | The viewer: a node, or absent for the app acting as itself. Defaults to the actor. This is RFC 8693's `act`/`sub` split |
+  | `scope` | A space-delimited string of what else the bearer may do: `as_app`, `deploy`, `manage_universes`, `seed` |
+  | `exp`, `nbf`, `iat` | Expiry, not-before, and issue time |
+  | `jti` | The token's ID, recorded with every write (§10.1) |
+
+- **What Shep checks:** `typ` is `at+jwt`; the header's `alg` equals the
+  JWK's `alg`, and is never `none` or an HMAC; the signature, against an
+  active key; `iss`; `exp` and `nbf`, with a small allowance for clock
+  skew; that `aud` names the universe of the host, so a test token sent
+  to `shep.internal` fails and never falls back to production; that the
+  app is registered in the universe and admitted by the schemas it uses;
+  and that the actor and the viewer exist and aren't deleted (above).
+- **Reused universe names.** A universe dropped and recreated under the
+  same name has the same URL, so a token for the old one would reach the
+  new one within its lifetime. Tokens for long-lived universes
+  (production, staging) name the URL; tokens for ephemeral test and dev
+  universes name the immutable ID instead, which is never reused.
+- **Everything else comes from the claims.** The `(app, actor, viewer)`
+  triple and the scopes are the token's; Shep trusts the auth service
+  for act-for and checks nothing about who may act for whom. The Rust
+  client's handles are ways to present tokens (§7.3), and
+  `db.as_user(u).by(g)` means "a token whose claims say actor `g`,
+  viewer `u`". Running as the app itself needs a token with the `as_app`
+  scope and no `sub`.
+- **Revocation is bounded by token lifetime.** Shep keeps no revocation
+  list in v1: a token is honored until it expires, even after the auth
+  service revokes the key or person it was issued to. Deleting the actor
+  or viewer node in Shep is the exception, and takes effect within the
+  horizon below. Tokens should live minutes, not hours; whether Shep
+  should also accept an optional revocation list is open question 26.
+- **Expiry on long-lived connections.** Shep sends a subscription a
+  `reauth` update 60 seconds before its token's `exp`. At `exp` the
+  stream pauses: no pushes, with its state kept, until a new token
+  arrives or a grace period ends, when it closes (§13.4).
+  - **Same claims.** A new token is accepted for the stream if its
+    `aud`, `client_id`, `act`, and `sub` equal the old one's and its
+    scopes are no wider; anything else is a new subscription.
+  - **Messages.** On the native protocol, `reauth` is a stream frame and
+    the client answers with a `reauthenticate` request carrying the
+    token on the same connection. Over `graphql-transport-ws`, `reauth`
+    is a `next` message with an `extensions.shep.reauth` field, and the
+    client answers with a `ping` whose payload carries the token.
+  - **Links follow.** On `reauth`, the subscription's download handles
+    are extended to the new token's `exp` (§16.4). Download links never
+    outlive the token that minted them.
 
 **The authorization horizon: one rule.** The revocation bound `B` is 5
 seconds by default, and absorbs clock drift between leaders and front
-ends.
+ends. It bounds what Shep itself decides: registry changes (policy
+deploys and promotions, app grants) and deleting an actor or a viewer.
+Token revocation isn't Shep's, and is bounded by token lifetime (above).
 
-- **Tails.** Each front end tails the committed entries of the system
-  partition, the meta partition, and the partitions of the actors and
-  viewers it serves, over the WAL's gRPC stream from any replica (§10.4).
-  The evidence for a partition is the front end's position in that
-  stream, plus the leader's commit index, obtained with a leader-lease
-  read or a read-index call and refreshed in the background. So the front
+- **Tails.** Each front end tails the committed entries of the
+  universe's meta partition and the partitions of the actors and viewers
+  it serves, with long-poll fetches from those partitions' leaders
+  (§10.4). The evidence for a partition is the front end's position in
+  that log, plus the leader's `(commit index, leader-lease stamp)`,
+  which every fetch response carries, and followers relay unchanged.
+  - **Long-polls are short enough.** A fetch's `max_wait` is at most
+    `(B − 2ε)/4`, so an idle partition still refreshes its evidence well
+    within the bound.
+  - **Across a split.** Evidence from a partition whose committed log
+    contains a split entry doesn't count for ranges past that entry. The
+    front end switches its tail to the child holding the range, and fails
+    closed for it until it has evidence from the child. So the front
   end knows each partition's commit index as of a recent moment, without
   a read per request.
 - **The rule.** Every principal-sensitive request, mutation proposal,
   two-phase commit decision, live-topic step, and download-link check
   runs at a version `S` that contains the **horizon**: for each of those
   partitions, an index the front end saw committed no more than `B` ago.
-  So key and app revocations, policy deploys, and deleting an actor or a
-  viewer take effect within `B` everywhere.
+  So policy deploys, app grants, and deleting an actor or a viewer take
+  effect within `B` everywhere.
   - **When evidence counts.** A heartbeat counts while the front end's
     clock minus the heartbeat's leader-lease time is at most `B − 2ε`,
     where `ε` bounds any node's clock error. That keeps the real age of
@@ -2265,8 +2433,8 @@ ends.
     passes the previous lease's end. No other margin is needed at a
     handoff: the `B − 2ε` test already absorbs the skew between the two
     leaders (`AuthHorizon_deposed`).
-- **Two parts.** The principal part of the horizon (keys, the registry,
-  and the actor's and viewer's lifecycles) always applies, and comes from
+- **Two parts.** The principal part of the horizon (the registry, and
+  the actor's and viewer's lifecycles) always applies, and comes from
   those tails at no read cost per request. The data-partition part applies
   only to reads under a revocation-sensitive decision (§7.6). That is
   judged over the whole decision: `visible()` of the type, field
@@ -2315,8 +2483,8 @@ ends.
   checked against the horizon, not as validated reads (§10.3): validating
   them in every mutation would make nearly every mutation a two-phase
   commit with their partitions.
-- **In single-process mode** every partition is local, so the evidence is
-  trivially current.
+- **On a single node** every partition is local, so the evidence is
+  trivially current (§9.6).
 
 - **App identity matters on its own.** If an app can act as a user, that
   alone shouldn't let it read every schema that user can see.
@@ -2327,143 +2495,63 @@ ends.
   <shep::App>'slack'`), **and the actor** in schemas that declare their
   actors (`global actor is agents::Agent`, above).
 
-**Ways in:**
+**Ways in.** Every request presents a token from the auth service; the
+paths differ only in how the bearer gets one.
 
-- **End users, from browsers.**
-  - The browser sends the user's token from company SSO (OIDC/JWT). Shep
-    verifies it against the identity provider's keys and maps the token's
-    subject to an actor node. **The login mapping is deployment
-    configuration,** not part of any schema: for example, SSO subjects map
-    to the `users::User` whose unique `sso_subject` field matches.
-  - **The login field is frozen.** The field the login mapping names must
-    be frozen, like a key, and writable only by an identity-admin app.
-    The checker enforces both when the deployment names the field, so no
-    write can re-point an identity.
-  - **Its unique index is global and never frees a value.** The login
-    field's index lives in the hashed keyspace (§3), since users aren't
-    placed together. Unlike other `exclusive` indexes, it counts deleted
-    nodes' entries, so a deleted user's subject can't be claimed by a new
-    node, and restoring the user never hits a conflict.
-  - The app is the token's audience, meaning the app's OIDC client,
-    cross-checked against the origins the app registered for that
-    universe. Production origins are never accepted by another universe.
-  - The actor and the viewer are whoever the token says, and the app
-    can't change them.
-  - **Tokens expire.** A request with an expired token is rejected. A
-    subscription opened with a token gets a `reauth` update when the token
-    expires; the client runtime refreshes the token and resumes, and
-    otherwise the stream closes (§13.4).
-  - Shep's endpoints must therefore be reachable from wherever users'
-    browsers are, which for an internal system means the corporate network
-    or VPN.
-- **Apps, with API keys.** Backends, CI, and tools authenticate with an API
-  key issued to one app.
+- **End users, from browsers.** The app's page gets the user's token from
+  the auth service, after the user signs in there, and passes it to
+  `connect({ token })` (§7.4). The token's `client_id` must be the app whose
+  origin the request comes from, among the origins it registered for
+  that universe; production origins are never accepted by another
+  universe. Shep's endpoints must be reachable from wherever users'
+  browsers are, which for an internal system means the corporate network
+  or VPN.
 - **Backends, for a signed-in user.** A backend that serves a browser
-  request forwards the user's SSO token: `db.as_token(&jwt)`. Shep
-  verifies it as on the browser path, with the backend's app as the
-  required audience. No sensitive permission is needed.
-  - **The viewer is the token's user,** always.
-  - **The actor is the token's user too,** unless the app names an agent
-    it runs for that user: `db.as_token(&jwt).by(agent_id)`. The token is
-    the user's consent for this request; the agent must be registered to
-    the app (below). Read-your-writes and quotas then follow the agent. A
-    key bound to an actor can't call `as_token` or `as_app`.
-- **Actor-bound keys carry act-for.** A key can be bound to one actor
-  node, such as an agent, and to the viewer it acts for: a key for
-  `(actor g1, on behalf of u1)`. Every request with it runs as that pair
-  (`db.as_bound()`), and the key can't name another.
-  - **Agents belong to apps.** The app that runs an agent registers it
-    as its own: `shep agent register --app X agents::Agent:<g1>`. This is
-    a recorded action by an admin or the app's owner, in the system
-    partition. An app's own actors come only from this registration.
-  - **Issuing takes two parties.** An act-for key `(actor g1, viewer
-    u1)` is requested by the app that owns `g1`, for one of its own keys,
-    and approved by `u1` while signed in, as consent. Alternatively an
-    admin issues it, as a privileged, recorded action like the
-    `act_as_any` allowlist. The actor must be registered to the key's
-    app, and its type must not be a viewer type of any schema the app
-    uses, so a key can't make one person act as another.
-  - **What it can do.** A user-approved key carries no permission beyond
-    `as_bound`. It needs an expiry. There is no chaining: an act-for key
-    can't issue or approve another (no sub-delegation in v1).
-  - **The CLI.** `shep key create --actor agents::Agent:<g1>` requires
-    `--for <viewer>` or `--for self`, and warns when the pair is useless
-    (for example, a viewer type no schema the app uses accepts). The
-    viewer can list and revoke their act-for keys (`shep key list --for
-    me`, `shep key revoke`), and the app's owner can revoke every key for
-    an agent.
-  - **Revoking access is revoking the key.** Front ends tail the system
-    partition, so it takes effect within the revocation bound, and live
-    subscriptions opened with a revoked key close with `denied` (§13.2).
-  - **`--for self` means the actor is the viewer:** a key bound only to
-    `g1` runs with `viewer = g1`. Agents with no user to act for need such
-    a key or `global actor` policies in the schemas they use (open
-    question 23).
-- **People, from the CLI.** `shep login` runs the SSO device flow. The
-  actor is the person, and the app is the built-in `shep-cli` (§7.2).
+  request forwards the user's token, or exchanges it at the auth service
+  for one naming the backend's app: `db.with_token(&token)`.
+- **Agents.** An app that runs an agent for a user gets a token from the
+  auth service whose `act` is the agent and whose `sub` is the user, as
+  the auth service's consent rules allow. Read-your-writes then follows
+  the agent. An agent with no user gets a token whose `sub` is itself,
+  or relies on `global actor` policies in the schemas it uses (open
+  question 23).
+- **Work no user is present for,** such as a queue worker, uses tokens
+  the auth service issues to that app for arbitrary users; which apps may
+  get them is the auth service's allowlist.
+- **People, from the CLI.** The CLI gets a token from the auth service,
+  through whatever flow it offers, and presents it. The app is the
+  built-in `shep-cli` (§7.2). Shep has no login flow.
+- **CI.** Deploys present a token with the `deploy` scope, and test runs
+  one with `manage_universes`. A leaked deploy token can't read data,
+  and expires within minutes.
+- **Tests, dev, and CI.** No Shep tool signs anything.
+  - **In-process tests.** `shep::test::db` uses the token verifier's test
+    variant (the verifier is an enum, §17), which takes claims directly
+    instead of a token, so tests can act as made-up users and agents
+    with no keys at all.
+  - **Shared-fleet test and dev universes** get tokens from the auth
+    service like everything else, for example from a test issuer whose
+    key only universes of kind test or dev trust.
+  - **Fleet-level operations,** such as creating a universe, use tokens
+    whose `aud` is the fleet, `https://<fleet>.shep.internal`.
+  - **Seeding.** A token with the `seed` scope may create principal
+    nodes (made-up users and agents) directly, and is accepted only in
+    test and dev universes.
 
-**API keys carry explicit permissions.** A key is issued to one app (apps
-are global, §14.1), for a set of universes, with a set of permissions:
+**Scopes.** Reading and writing data needs no scope: the claims name the
+principals, and policies decide. The scopes cover the rest:
 
-| Permission | Allows |
+| Scope | Allows |
 |---|---|
-| `act_as_app` | Running operations as the app (`db.as_app()`). App-level policies apply. |
-| `act_as_any` | Running operations for any viewer, by any actor registered to the app, of the shapes its operation set declares, without proof from either: `db.as_user(u)` (actor and viewer `u`), `db.as_user(u).by(g)` (actor `g`, viewer `u`), `db.as_agent(g)` (actor and viewer `g`). Needed only for work no user is present for, such as a queue worker. |
-| `deploy` | Deploying the app's schemas, policies, and operation sets (CI keys). |
-| `manage_universes` | Creating and dropping dev and test universes. |
+| `as_app` | Running operations as the app itself (`db.as_app()`), with no `sub` |
+| `deploy` | Deploying the app's schemas, policies, and operation sets, and registering names in production (§14.1) |
+| `manage_universes` | Creating and dropping dev and test universes (with a fleet `aud`) |
+| `seed` | Creating principal nodes, such as made-up users and agents, directly; accepted only in test and dev universes |
 
-- **`act_as_any` is the sensitive one.** It sidesteps the trust in
-  the user's own token, so it can be issued only to keys of apps on an
-  explicit allowlist (for example, the Slack backend). Adding an app to the
-  allowlist, and issuing such a key, are privileged admin actions, and
-  both are recorded.
-- **Without that permission, a key can't assert an actor or a viewer.**
-  A request from such a key that names either is rejected before any
-  policy runs. Apps off the allowlist can act only as themselves, as the
-  pair a key is bound to, or for users whose own token they hold, from a
-  browser or forwarded with `db.as_token`.
-- **One key, one job.** A typical app has:
-  - a runtime key for its backend (`act_as_app`, plus `act_as_any` if
-    allowlisted)
-  - a CI key with only `deploy`
-  - a CI key with `manage_universes` for test runs
-
-  A leaked CI key then can't read data, and a leaked runtime key can't
-  change schemas.
-- **Production keys are separate.** A key lists its universes, and
-  production is never included in a key that also covers non-production
-  universes.
-- **The key picks the universe, and so the host.** Each universe has its
-  own domain (§14.3).
-  - **A key valid in exactly one universe** names that universe in its
-    public prefix: `shep_prod_…` connects to `shep.internal`, and
-    `shep_staging_…` to `staging.shep.internal`, with no configuration.
-  - **One value overrides it:** `SHEP_URL`, such as
-    `https://staging.shep.internal`. Only keys valid in several universes,
-    such as an administrator's, need it.
-  - **Key and host must agree.** A request whose key isn't valid in the
-    universe of the host it reached is rejected before anything runs. A
-    test key sent to `shep.internal` fails; it never falls back to
-    production.
-- **Test universes get a key automatically.** The test harness receives a
-  key with `act_as_any` that is valid only in that test universe, so
-  tests can act as made-up users and agents without any allowlist entry
-  for production.
-- **Key hygiene.**
-  - Keys are hashed at rest in the system partition and shown once, at
-    creation.
-  - An app can have several active keys, which allows rotation.
-  - Keys can expire, and revocation takes effect within the revocation
-    bound (5 seconds by default), as front ends tail the system partition.
-  - Admins issue keys with `shep key create --app slack --universe prod
-    --permission act_as_app,act_as_any`. An actor-bound key adds
-    `--actor agents::Agent:<key>`, and `--for users::User:<key>` (or
-    `--for self`) for the viewer it acts for.
 - **Every write is attributable.** The mutation log records the app, the
-  actor, the viewer, and the credential: its kind and id (a token's
-  subject and `jti`, a bound key's id, or `act_as_any` with the app key's
-  id) for each transaction (§10.1), so any impersonation can be audited
-  afterward.
+  actor, the viewer, the token's `jti`, and its other claims for each
+  transaction (§10.1), so any impersonation can be traced to the token,
+  and through the auth service's records to whoever obtained it.
 
 ### 6.4 Evaluation strategy
 
@@ -2628,6 +2716,11 @@ comparison is two satisfiability checks, as in Cedar's analysis tooling.
   viewer present and absent, and the actor present and absent, since an
   atom on an absent principal is false and `not` flips it. A change that
   only matters for the app acting as itself is reported as such.
+
+- **A field's first allow is labeled.** Adding the first allow to a
+  field narrows access to it, unlike any other added allow
+  (`first_field_allow_narrows`, §6.1), so the diff report labels it
+  "first field allow: narrows".
 
 More-permissive changes can require a second reviewer.
 
@@ -3310,8 +3403,8 @@ let issue = Issue::get_by_id(&issue_id).exec(&alice).await?;               // a 
   be called as soon as the code compiles, or the `.edgeql` file is saved.
 - **No schema change in production.** A new operation is a `shep deploy`
   of the app. No schema version changes.
-- **Ad-hoc queries are for people (§7.2), not for app code.** No API key
-  can run one.
+- **Ad-hoc queries are for people (§7.2), not for app code.** Only
+  tokens for the built-in `shep-cli` app can run one.
 
 **The operation set is bound once, at connect.**
 
@@ -3349,9 +3442,10 @@ let issue = Issue::get_by_id(&issue_id).exec(&alice).await?;               // a 
 
 People can query Shep directly, as themselves, with every policy applied.
 
-- **Login.** `shep login` runs the SSO device flow (OIDC device
-  authorization). The token names the person, and Shep maps it to their
-  `users::User` node, as for browsers (§6.3).
+- **Tokens, not logins.** The CLI gets a token from the auth service,
+  through whatever flow the auth service offers, and presents it. The
+  token names the person's node, as for browsers (§6.3). Shep has no
+  login flow.
 - **The principals.** The person is both actor and viewer, and each schema
   checks them against its viewer type as usual. The app is `shep-cli`, a
   built-in app.
@@ -3376,18 +3470,20 @@ People can query Shep directly, as themselves, with every policy applied.
   rules: a literal `limit`, no `offset`.
 
   ```
-  $ shep login                       # production; --universe staging for another
-  $ shep query 'select Issue { title, assignee: { name } } filter .state = State.Open limit 10'
+  $ shep query --universe staging \
+      'select Issue { title, assignee: { name } } filter .state = State.Open limit 10'
   ```
 
-  Each universe's host also serves GraphiQL to logged-in browsers, over a
+  Each universe's host also serves GraphiQL, which gets the person's
+  token from the auth service as any browser app does, over a
   generated GraphQL schema for ad-hoc sessions with a root field per node
   type (`issues(where:, orderBy:, first:)`) and a version picker
   (`https://staging.shep.internal/graphiql`). Only `shep-cli` sessions
   can use it.
 
-  Commands run in the universe you logged in to, and `--universe` overrides
-  it for one command.
+  Commands run in the universe named by the token's `aud`; `--universe`
+  asks the auth service for a token for another universe, for one
+  command.
 - **Read-only by default.** Ad-hoc mutations are off unless a schema
   enables them for `shep-cli`. They then run as the person, under write
   policies, and the log records the person and `shep-cli` (§10.1).
@@ -3412,7 +3508,8 @@ People can query Shep directly, as themselves, with every policy applied.
 ```rust
 let db = shep::Db::builder()
     .ops(tracker::ops::set())            // the app's operation set, bound at connect
-    .connect()                           // SHEP_KEY names the universe, and so the host (§6.3)
+    .token_provider(auth::provider())    // gets tokens from the auth service; they name the universe (§6.3)
+    .connect()
     .await?;
 
 // Every operation runs through an actor handle (§6.3).
@@ -3440,26 +3537,24 @@ run a request. That's the only place Shep follows Toasty: schemas are SDL
 generated functions take the same `.exec(&handle)`. The differences come
 from running against a shared service:
 
-- **Connecting.** `connect()` reads the API key from `SHEP_KEY`. The key
-  names its universe, and so the host. `SHEP_URL` overrides it, and only
-  keys valid in several universes need that (§6.3).
+- **Connecting.** `Db::builder().token_provider(p)` takes a token
+  provider: a callback the app implements against the auth service, which
+  returns a token for given claims and refreshes it before it expires.
+  The universe, and so the host, comes from the tokens; `SHEP_URL`
+  overrides it (§6.3).
 - **Actor handles.** Every request takes one, so no call runs without an
-  actor. They're cheap.
-  - **Handles start from the viewer, and `.by(actor)` adds the actor.**
-    The constructors are typed by the operation set's principal shapes
-    (§7.1). `.by()` with an actor of a viewer type is rejected.
-  - `db.as_user(id)`, `db.as_agent(id)`: one constructor per viewer
-    type, with that node as both actor and viewer.
-    `db.as_user(u1).by(g1)` is agent `g1` working for user `u1`. These
-    need an API key with `act_as_any` (§6.3), so they're for work no user
-    is present for.
-  - `db.as_token(&jwt)`: the signed-in user whose SSO token a backend is
-    forwarding, as actor and viewer. This is the usual way a backend acts
-    for a user. `db.as_token(&jwt).by(agent_id)` runs one of the app's
-    registered agents for that user.
-  - `db.as_bound()`: the actor and viewer a key is bound to, such as an
-    agent's own key issued on behalf of its user.
-  - `db.as_app()`: the app itself.
+  actor. They're cheap. A handle is a way to present a token: Shep reads
+  the actor and viewer from its claims, and trusts nothing else.
+  - **`db.with_token(&token)`:** a token the app already holds, such as
+    the signed-in user's, forwarded from a browser request. This is the
+    usual way a backend acts for a user.
+  - **`db.as_user(id)`, `db.as_agent(id)`, and `.by(actor)`:** ask the
+    token provider for a token whose `sub` is that node and whose `act`
+    is the `.by()` actor, or the same node. `db.as_user(u1).by(g1)` is
+    agent `g1` working for user `u1`. Whether the auth service issues
+    such a token is its business (§6.3). The constructors are typed by
+    the operation set's principal shapes (§7.1).
+  - **`db.as_app()`:** a token with the `as_app` scope and no viewer.
   - One `Db` is one connection, and serves every actor of a backend.
 - **Read-your-writes per actor.** Each handle tracks the causal position
   of everything it has read or written, and sends it as `at_least`
@@ -3715,8 +3810,8 @@ from running against a shared service:
 - **Live queries are GraphQL subscriptions.** They travel over a WebSocket
   using the `graphql-transport-ws` protocol (§13). The generated client
   also offers `feed()` to poll the same stream.
-- **Authentication.** Browsers send the user's SSO token (OIDC/JWT)
-  directly, and Shep verifies it (§6.3).
+- **Authentication.** Browsers send the user's token from the auth
+  service directly, and Shep verifies it (§6.3).
 
 ### 7.5 Query execution
 
@@ -3797,8 +3892,7 @@ disciplines, never the log.
    type, a type's lifecycle, an edge type, an edge set of a source, an
    index, or a registry head.
 2. **Unchanging facts.** A fact is *unchanging* if it can't change once its
-   node exists and is filled: keys, hashed fields, the login field,
-   placement links, and `readonly` fields and links (§4.1.2). The
+   node exists and is filled: keys, hashed fields, placement links, and `readonly` fields and links (§4.1.2). The
    lifecycle of a `shep::Permanent` type only grows: absent, then present,
    never deleted.
    Everything else is mutable.
@@ -3814,12 +3908,25 @@ disciplines, never the log.
    - **Negative:** `not`, `not exists`, `not in`, `count(…) <= k`, every
      deny guard, `shep::contained_in`, a `hide` predicate, and `not exists
      .deleted_at` inside `visible()`.
-   - **`shep::visible` inside a deny** is classified RevocationSensitive
-     outright rather than by flipping the target policy's polarity: the
-     flip makes the target's lifecycle a negative input, and lifecycles
-     grow through create and fill (`denyDelegate_overgrants`).
-   - **Both:** `=`, `?=`, `??` defaults, `count(…) = k`, `if` conditions,
-     exact values returned or written, ordering with a limit.
+   - **`shep::visible` is classified by its effective polarity,**
+     tracked through `not`. Inside a deny it's negative, so its target's
+     lifecycle is a negative input, and lifecycles grow through create
+     and fill: the decision is RevocationSensitive
+     (`denyDelegate_overgrants`). `not shep::visible(…)` inside a deny is
+     positive, and Stable⁻ when the `visible` is Stable⁺
+     (`port_visible_safe` in `Polarity.lean`), so an Ent-ported policy,
+     whose rewritten denies negate earlier allows, keeps its stability
+     (`port_safe`).
+   - **`??` defaults read a lifecycle.** `(x.f = 1) ?? d` reads the
+     lifecycle of the node on the left, `x`, with the default's
+     polarity: `?? true` makes "`x` doesn't exist" admit. So in a
+     Stable⁺ position the default must be `false`, and in a Stable⁻
+     position `true`; otherwise the lifecycle read counts as negative
+     and the guard isn't Stable. A policy hop to a placeholder that is
+     later filled reads its target's lifecycle the same way
+     (`trueDefault_unsound` in `Planner.lean`).
+   - **Both:** `=`, `?=`, `count(…) = k`, `if` conditions, exact values
+     returned or written, ordering with a limit.
 5. **The consumers of every read,** followed through data flow. A read's
    class is the strictest any consumer it reaches needs. That is the taint
    rule (MixT, ConSysT): a read that skipped validation can't flow into
@@ -3852,8 +3959,7 @@ From these it derives three predicates:
   there's no error case to classify. Proven in `Polarity.lean`
   (`vis_mono`, `history_admit_mono`), with counterexamples for a deny
   over mutable facts, a non-permanent type, and `shep::visible` inside a
-  deny. These citations are pending the restatement of `Polarity.lean`
-  for union minus deny (§18).
+  deny, restated for union minus deny (§18).
 
 The classifier is syntactic, sound, and incomplete: when it can't prove a
 read safe, it validates.
@@ -4058,12 +4164,17 @@ match ops::close_issue().issue(&issue_id).comment("fixed").exec(&alice).await {
   one node merge in statement order into one patch. `update write`
   policies, field policies, and checks then run once, on the merged
   post-state, and `update read` on the pre-state.
+  - **The merged patch is the definition.** It equals applying the
+    updates in sequence whenever every intermediate view is valid
+    (`merge_eq_seq` in `PatchMerge.lean`, §4.4 law 5); when an
+    intermediate view wouldn't be, the merge is still what runs, and
+    only the merged result is checked (`merge_accepts_invalid_prefix`).
   - **Assigning a field twice is an error.** At compile time when the
     targets are statically the same node (Gel silently keeps one); at run
     time, `invalid`, when two updates may alias, such as two key
     parameters naming one node, and do.
-  - **In a `for`,** field operations on one field sum (§8, below), and a
-    repeated plain assignment is the same error.
+  - **In a `for`,** field operations on one field apply in statement
+    order (§8, below), and a repeated plain assignment is the same error.
   - Fields no statement names are left alone.
 - **Single-target writes fail loudly.** An `update` or `delete` of one
   node, through a binding or a key cast, raises `denied` when its policy
@@ -4156,11 +4267,17 @@ Properties:
     `?? []` to qualify. Anything else, `.x + e` on an optional field
     included, compiles to a validated read and write.
   - **When it qualifies.** The target is read only by its own update, `e`
-    reads no graph state, and the field reaches storage through the
+    reads no graph state and has cardinality One (an optional `e` would
+    unset the field when empty: `optionalArg_unsets`,
+    `max_optionalArg_unset` in `LeaderOps.lean`), and the field reaches storage through the
     identity lens: a write from an older version whose adapter isn't the
     identity on this field is never leader-resolved (§4.3).
-  - **In a `for`,** operations on one field sum: `add` and `sub` add up,
-    `insert`s and `remove`s apply in order, pushes concatenate.
+  - **In a `for`,** operations on one field apply in statement order, as
+    the leader resolves them: `add` and `sub` add up, `insert`s and
+    `remove`s apply in order, pushes concatenate. Ops of different kinds
+    on one field, such as an `add` and a `max`, don't commute
+    (`add_max_not_comm`), so their order is the statement order, not a
+    sum.
   - `shep ops check` prints "leader-resolved", or the reason it isn't.
     They're the same operations as Toasty's `increment()`, `add(v)`,
     `push(x)`, and the rest in `update!` (§7.3). The operation exists
@@ -4217,8 +4334,7 @@ Properties:
     `prev`'s context in the entry's context, so writes to one key stay
     causally ordered (§9.5). `prev` is the map's newest write to the key
     whose stamp is not in `S`, or else the base's stamp. If `prev`'s
-    index isn't known yet, because openraft assigns indexes inside its
-    core and interleaves blank entries, the context carries a
+    index isn't known when the context is fixed, the context carries a
     **self-prefix flag** instead, which readers expand to the entry's own
     partition up to the entry before it (§9.5).
   - **Crate boundary.** Values are encoded by a small shared codec,
@@ -4248,7 +4364,14 @@ Properties:
     keys; and one independent claiming update per node, made by Shep. No
     `shep::observe`, and no part of a two-phase commit. The checker
     rejects anything else. A retried `claim` after an unknown outcome returns the
-    keys it claimed the first time, through its idempotency key.
+    keys it claimed the first time, through its idempotency key, checked
+    at the leader against appended entries. That check is the only thing
+    that stops a duplicate: claims skip contended candidates, so
+    validation never sees one (`WalValidate_claim_idem`, §10.3).
+  - **An empty claim is a client-visible outcome.** Like any failure the
+    client sees, a claim that finds nothing on a re-execution is reported
+    through the anchor, so it never hides an earlier attempt's leases
+    (§10.3, `WalValidate_fail`).
   - **A lease, not exactly-once execution.** Lease state is system-owned
     (`@lease`: holder, expiry, and an **attempt generation** that goes up
     with every claim), and never appears in a schema. The generation is a
@@ -4426,12 +4549,13 @@ Properties:
     home, and the full participant list, so any participant can find the
     decision without the coordinator.
   - **Finding a retired home.** If the home has split, the transaction ID's
-    home is routed through the split lineage in the controller's
-    partition table to the child that holds the decision. A split hands
-    its unforgotten decision records, with the full idempotency window,
-    to the child holding the home's lowest placement group, in the
-    child's first entry, before `finish_split` routes anything to it
-    (§9.6, `TwoPhase_splitlost`, `TwoPhase_split`).
+    home is routed through the split lineage, from the split entry in
+    the parent's log or the controller's partition table, to the child
+    that holds the decision. A split hands its unforgotten decision
+    records, with a snapshot of its idempotency table, to the child
+    holding the home's lowest placement group, in the child's first
+    entry, which the child commits before accepting any proposal (§9.6,
+    `TwoPhase_splitlost`, `TwoPhase_split`).
   - **Safe forgetting.** The home keeps a decision until every
     participant that prepared has released **and** the transaction's
     deadline has passed. Forgetting earlier lets a delayed prepare reach
@@ -4498,7 +4622,7 @@ specified:
 | Mutation isolation | Your mutations behave as if run one at a time | Committed mutations are serializable, in a serial order consistent with each partition's log order: each one's writes and `assert` outcomes are what they would be at its position. Every read behind a decision (guards, write policies, freshness guards, `observe`, values flowing into writes) is validated at commit, including reads in other placement groups, through read-only participants, except reads the planner proves can't change the outcome: stable guards, unchanging facts, and leader-resolved field operations. A value a mutation only returns is a snapshot read at its `S` | §10.3, §8, §7.6 |
 | Read freshness | Reads are consistent snapshots that include your own writes | Every read has an exact, causally closed version. Plain reads are causally consistent snapshots, not serializable. `at_least` gives read-your-writes per actor. Views and search wait to a bound, then fail with `lagging`, or return their own version if `stale_ok` | §9.4, §7.3 |
 | Atomic visibility | You see all of a mutation or none of it | A transaction is one dot, so every causally closed version holds all of it or none of it | §9.5, §8 |
-| Authorization staleness | Revocations take up to 5 seconds | Every principal-sensitive request, mutation, link check, and topic step runs at a version that contains the authorization horizon: the system and meta partitions and the actor's and viewer's partitions, each as committed no more than the revocation bound ago. A front end or materializer that can't show that fails closed. Bounded this way: key and app revocations (including the act-for an actor-bound key carries), policy deploys and promotions, and deleting an actor or a viewer. Other permission changes, such as removing a member from a channel, are bounded too, because a materializer refuses revocation-sensitive reads at versions more than the bound behind its leader's commit index, and proposals and decisions carry a deadline the appending leader enforces. Write policies are validated at commit, not bounded (§6.3, §7.6) | §6.3, §7.6, §13.2, §16.4 |
+| Authorization staleness | Shep's revocations take up to 5 seconds; credential revocation takes up to a token's lifetime | Every principal-sensitive request, mutation, link check, and topic step runs at a version that contains the authorization horizon: the meta partition and the actor's and viewer's partitions, each as committed no more than the revocation bound ago. A front end or materializer that can't show that fails closed. Bounded this way: policy deploys and promotions, app grants, and deleting an actor or a viewer. A revoked credential is the auth service's: Shep keeps no revocation list, and honors a token until it expires (open question 26). Other permission changes, such as removing a member from a channel, are bounded too, because a materializer refuses revocation-sensitive reads at versions more than the bound behind its leader's commit index, and proposals and decisions carry a deadline the appending leader enforces. Write policies are validated at commit, not bounded (§6.3, §7.6) | §6.3, §7.6, §13.2, §16.4 |
 | Leftover access after revocation | A download link works as you for an hour; its redirect works for anyone for a minute | A link is a bearer capability for up to an hour, rechecked on every use. Its redirect's presigned GET is a residual capability for up to one minute after the check, unless the field's policy sets `strict_revocation` | §16.4 |
 | Derived-data lag | Views, search, and live updates trail writes slightly | Views, search indexes, and live topics step between causally closed versions, and lag the log by their consumers' delay | §9.7, §12, §13 |
 | Search | Search results can be a moment behind, and are ranked, not exact | Ranked over one index version. Not exact at a version, and not freshness-checkable | §16.6, §11.7 |
@@ -4534,14 +4658,19 @@ specified:
   - **It keeps its index.** A void entry is a dot with no facts, like a
     barrier. Committed indexes stay contiguous, versions are unaffected,
     and a version that contains a void dot contains nothing more for it.
+  - **It stays for now.** With `shep-raft`, the leader validates and
+    appends in one step on its own core, which may make the rule
+    unnecessary; a re-run of `WalValidate.tla` is checking that (§18),
+    and until it does the rule applies.
 - **Committed indexes are final and contiguous.** Raft commits a
   partition's entries in index order, and a committed entry never changes.
   Uncommitted entries that a failed leader appended can be overwritten by
   a new leader, but nothing reads them: materializers, readers, and
   responses only ever see committed entries.
 - **Partition IDs increase.** The WAL controller assigns each universe's
-  partition IDs in increasing order, and never reuses one. A split retires a
-  partition and creates new ones with larger IDs (§9.6).
+  partition IDs in increasing order, from its `next_partition`, and never
+  reuses one. A split retires a partition and creates new ones with
+  larger IDs (§9.6).
 - **A partition's ID is its generation.** IDs only increase, and a
   split's children get larger IDs than their parent, so the ID orders
   lineage. Keys order their physical versions by partition ID, then
@@ -4693,9 +4822,13 @@ with a delta and a context (§9.5).
     `LeaderOps.lean` (`leader_wf`, `ctx_closed`, `selfPrefix_closed`,
     `ctx_pathDisjoint`; counterexample `ctxOmitPrev_not_set`).
   - **On the wire, a context is a DVV plus an optional self-prefix
-    flag.** openraft assigns indexes inside its core and interleaves
-    blank entries, so when the leader fixes `e`'s context, `prevₖ` may
-    not have an index yet. Then the context carries the flag instead of
+    flag.** The flag was needed because openraft assigned indexes inside
+    its core and interleaved blank entries, so when the leader fixed
+    `e`'s context, `prevₖ` might not have an index yet. `shep-raft`
+    assigns an index in the same step that validates and appends, so the
+    leader can usually name `prevₖ`'s dot; the flag stays in the format,
+    and stays sound, until the void-entry re-check (§18) settles what the
+    atomic step removes. Then the context carries the flag instead of
     the dot, and readers expand it to `{p: i−1}`, where `p` is `e`'s
     partition and `i` its index. That over-approximates (every earlier
     entry of `p`), which costs nothing because `p` is applied in order:
@@ -4786,6 +4919,23 @@ with a delta and a context (§9.5).
     map and retries. Client libraries never see `moved`.
   - **One partition until it's needed.** A small universe has one data
     partition, and every mutation is local.
+  - **At most 1024 data partitions per universe,** a constant for now.
+    The controller's leader checks the cap before planning a split or a
+    create, and the apply step checks it again, deterministically, on
+    every node, so a command that would exceed it is refused with a clear
+    error (`partition_limit`) rather than half-applied. A split that
+    would exceed the cap is refused the same way. The apply step also
+    rejects empty or duplicate replica sets.
+  - **Partition IDs come only from the controller.** On a
+    controller-managed node (one configured with seeds), every partition
+    ID comes from the controller's `next_partition`, and creating or
+    initializing a partition by hand is refused with
+    `ControllerManaged`. Otherwise a hand-made partition could take an ID
+    the controller later allocates, and a new universe would inherit its
+    data. Only a **standalone WAL node**, configured with no seeds and no
+    controller, creates partitions by hand; it exists for WAL-only tests
+    and tools that exercise one partition's log without the rest of
+    Shep.
 - **Splitting, by size and load.** A partition splits when it grows large
   or hot, as CockroachDB's load-based splitting does.
   - **Only at group boundaries.** A split point is a group hash, so a group
@@ -4814,78 +4964,104 @@ with a delta and a context (§9.5).
 
   **Protocol: a split.** Redpanda never splits partitions, so this
   protocol is Shep's own, written as controller commands around the
-  parent's log (§9.6, the WAL controller below). The **partition
-  balancer** runs on the controller's leader and decides splits from the
-  load and size that materializers report. Like Redpanda's
-  `partition_balancer_backend`, it keeps its planning state per
-  controller term and discards it when the term changes, so two leaders
-  never plan from each other's state. The order is drain, then split
-  entry, then finish, so writes keep flowing to the parent until the
-  split entry.
+  parent's log (the WAL controller is below). The **partition balancer**
+  runs on the controller's leader and decides splits from the load and
+  size that materializers report. Like Redpanda's
+  `partition_balancer_backend` (its `per_term_state`), it keeps its
+  planning state per controller term and discards it when the term
+  changes, and it submits commands fenced by that term, so two leaders
+  never plan from each other's state.
+  - **`p`'s log decides.** The controller plans and cleans up, but
+    whether the split happens is decided by `p`'s own log: whichever of
+    a `split_aborted` entry and the split entry comes first there wins.
+    Every request between the controller and `p` names the split's
+    revision, so a stale request can't act on a different split.
+  - **Routing comes from the split entry,** not from the controller, so
+    writes route to the children as soon as the split entry commits.
+
   1. **Start.** The balancer appends a `start_split` command to the
      controller log: the parent `p`, the split point, two new partition
      IDs, and their replica sets. Every node applies it to its partition
      table, and the reconcilers on the children's replica nodes create
      their Raft groups, with no entries yet. The command's controller
      offset is the split's revision.
-  2. **Drain.** The controller's leader asks `p`'s leader to split. The
-     leader stops accepting new prepares and waits until every prepared
-     two-phase commit it holds is released. Ordinary proposals keep
-     committing. The drain has no time bound, because a transaction's
-     completion depends on its home's availability (§8); the balancer
-     can cancel it at any time before step 3 with a `cancel_split`
-     command.
-  3. **Split entry.** `p`'s leader appends the **split entry** at index
-     `i`, in `p`'s own log, naming the children, their ranges, and the
-     split's revision. Its causal past contains everything `p` applied,
-     including the decision dots of released two-phase commit parts,
-     because each release's context carries its decision dot (§8), so a
-     child's version `{p: i}` includes them. From then on it rejects
-     every proposal with `moved`. Proposals in flight that didn't make it
-     in before `i` are rejected and re-executed against a child.
-  4. **Children start.** `p`'s materializer writes a SlateDB checkpoint at
-     `i`. Each child's materializer opens a clone of it, which shares the
+  2. **Drain.** The controller's leader asks `p`'s leader to split, naming
+     the revision. The leader rejects new prepares with a retryable
+     `splitting`, and waits until every prepared two-phase commit it holds
+     is released. Two-phase commits that touch `p` wait and retry;
+     single-partition proposals keep committing. The drain has no time
+     bound, because a transaction's completion depends on its home's
+     availability (§8).
+  3. **Split entry, or abort.** Either:
+     - `p`'s leader appends the **split entry** at index `i`, in `p`'s own
+       log, naming the children, their ranges, and the split's revision.
+       Its causal past contains everything `p` applied, including the
+       decision dots of released two-phase commit parts, because each
+       release's context carries its decision dot (§8), so a child's
+       version `{p: i}` includes them. From then on `p` answers every
+       proposal with `moved`, and the `moved` reply carries the split
+       entry itself (the children, their ranges, and the revision), so a
+       front end routes to the right child at once, without asking the
+       controller. Proposals in flight that didn't make it in before `i`
+       are rejected and re-executed against a child.
+     - or, if the balancer wants to cancel, `p`'s leader appends a
+       **`split_aborted`** entry naming the revision, and reports it. Only
+       then does the balancer append `cancel_split` to the controller log.
+       If `p` reports that its split entry came first, the balancer must
+       finish the split instead.
+  4. **Handoff.** `p`'s materializer writes a SlateDB checkpoint at `i`.
+     Each child's materializer opens a clone of it, which shares the
      SSTs, ignores keys outside its range, and drops them at compaction.
      The clone's keys keep the parent's generation, and the child writes
      at its own, larger generation, so its writes sort as newer (§3).
-     Each child's first entry has context `{p: i}` and carries the
-     **split handoff**:
-     - the parent's whole idempotency window (§10.3)
-     - the parent's unforgotten two-phase commit decisions, each handed to
-       the child holding its home's lowest placement group (§8)
-     - the released transaction IDs, until their deadlines (§8)
-     - the latest registry dot, and the retention floor (§10.4)
-     - an empty validation table: a child rejects proposals whose read
-       version predates its first entry with `too_old` until its window
-       fills, and so does any proposal whose read version doesn't contain
-       `(p, i)`
+     - **Who sends it.** `p`'s leader sends each child its **split
+       handoff**, and so does any later leader of `p` that finds a
+       committed split entry in its log, so a crash right after the
+       split entry doesn't strand the children.
+     - **Idempotent.** The handoff becomes the child's first entry, with
+       context `{p: i}`. It's keyed by the split's revision, and a child
+       that already has it ignores a second copy.
+     - **What it holds:**
+       - a reference to an object-store snapshot of `p`'s idempotency
+         table at `i` (§10.3), which the child installs before accepting
+         proposals; it may be filtered to the keys whose anchor groups
+         the child holds
+       - the parent's unforgotten two-phase commit decisions, each handed
+         to the child holding its home's lowest placement group (§8)
+       - the released transaction IDs, until their deadlines (§8)
+       - the latest registry dot, and the retention floor (§10.4)
+       - an empty validation table: a child answers `too_old` to every
+         proposal whose read version doesn't contain `(p, i)`, and to any
+         older than its own window
 
      A child's leader accepts proposals once that entry commits.
   5. **Finish.** Once both children's first entries commit, the balancer
-     appends `finish_split`. It's the map change and the retirement in
-     one command: every node's partition table now routes the range to
-     the children, records the lineage `p → (children, i)` for readers
-     (§9.7), and marks `p` retired. Only then do the reconcilers remove
-     `p`'s replicas, once its log is archived (§10.4). Front ends that
-     hit `moved` at `p` refresh their maps and retry against a child. A
-     registry barrier sent to `p` after its split entry is delivered
+     appends `finish_split`. It only retires and cleans up: every node's
+     partition table records the lineage `p → (children, i)` for readers
+     (§9.7) and marks `p` retired, and the reconcilers then remove `p`'s
+     replicas, once its log is archived (§10.4). Front ends that refresh
+     their maps learn the children from it, but routing never waited for
+     it. A registry barrier sent to `p` after its split entry is delivered
      again to each child.
 
-  A crash at any step leaves the split's commands in the controller log;
-  a new controller leader finds the split in progress in its partition
-  table and resumes it, starting a fresh balancer state for its term.
-  Before step 3 the split can still be cancelled; after it, it can only
-  finish.
+  A crash at any step leaves the split's state in the controller log and
+  `p`'s log; a new controller leader finds the split in progress in its
+  partition table and resumes it, starting a fresh balancer state for its
+  term, and asks `p` which entry came first.
 - **Moves.** Moving a partition's WAL replicas is two controller commands
   around a Raft membership change, as in Redpanda: `move_partition_replicas`
   names the new replica set, the reconcilers on the new nodes create
   replicas, the partition's leader runs joint consensus in the
   partition's own Raft group, and `finish_moving_partition_replicas`
   records the result. Only the finish command lets the reconcilers remove
-  the old replicas. A replica's identity includes the revision of the
-  command that created it, so a node removed and re-added is a new
-  member, never a stale one (Redpanda's `log_revision`). Moving a leader
-  is a leadership transfer. Neither changes dots or versions. Moving or
+  the old replicas. Until the finish, a move can be cancelled
+  (`cancel_moving_partition_replicas` in Redpanda), which reverts the
+  replica set through the same joint consensus. A replica's identity
+  includes the revision of the command that created it, so a node
+  removed and re-added is a new member, never a stale one (Redpanda's
+  `log_revision`). A partition's replication factor changes the same
+  way, by a move to a larger or smaller replica set. Moving a leader is a
+  leadership transfer. Neither changes dots or versions. Moving or
   adding a materializer means opening the partition's SlateDB from its
   manifest in the object store and tailing the log, with no copying
   between nodes.
@@ -4894,24 +5070,94 @@ with a delta and a context (§9.5).
   `shep ops check` warns about any operation that needs it, with its cost
   (§7.1). Whether an operation needs it is decided by placement groups at
   deploy, never by which partitions hold them at the moment (§10.3).
-- **Deployment.** Every component is a Tower service behind a trait, so
-  one codebase runs two ways:
-  - **One process,** for tests and local runs: every component in one
-    binary, with in-memory transport and an in-memory or local-directory
-    object store. The test harness gives each placement group its own
-    partition, assigns groups to partitions at random, and injects a
-    little apply lag, so two-phase commit, cross-partition reads, and lagging
-    views all run in ordinary tests (§14.3).
+- **Deployment.** Two things vary independently: the **topology** (one
+  process on one node, or roles spread over many processes and nodes)
+  and the **implementation variants** of the enums that have more than
+  one (the transport: in-process or shep-rpc; the object store: memory,
+  local directory, or S3; the token verifier: real or test, §6.3) (§17).
+  - **One node, one binary.** `shep-node` can be built with every
+    service in it (WAL and controller, materializers, search indexers,
+    view maintainers, front ends, files, and extraction), and run on a
+    single server with replication factor 1. This is a supported,
+    production-shaped deployment, not a test mode: "it should be possible
+    to run a real Shep service using a single server and binary, just
+    losing replication and fault tolerance." It has two uses:
+    - **Production on one server,** for small installations: the
+      in-process transport between components, the real token verifier,
+      and a real object store, a local directory or S3.
+    - **Tests and local runs,** with the in-memory object store and the
+      test token verifier. The test harness gives each placement group
+      its own partition, assigns groups to partitions at random, and
+      injects a little apply lag, so two-phase commit, cross-partition
+      reads, and lagging views all run in ordinary tests (§14.3).
+  - **What stays the same on one node:** the protocols (every partition
+    is still a Raft group with its own log, validation, two-phase commit
+    across partitions, the controller and its commands, splits,
+    barriers), the APIs, and every consistency guarantee. Code paths
+    don't branch on node count.
+  - **What it loses:** fault tolerance and availability. A restart or a
+    crash is downtime.
+  - **Its recovery point.** Losing the server's disk loses every
+    committed entry since the last archived segment (§10.4), and
+    everything, if the object store is on the same disk. So on one node
+    the WAL seals and archives segments by age as well as size, every
+    second by default (configurable), which bounds the loss to about
+    that much with an object store elsewhere (§19).
+  - **Files on one node.** With a local-directory object store there are
+    no presigned URLs, so uploads and downloads use proxy mode through
+    Shep (§16.3, §16.4).
+  - **Dev and test universes.** A single-node install can host its own
+    dev and test universes on the same node, next to production. Their
+    bases come from the production universe's registry, so they read
+    app and schema names from it, as on the shared non-production fleet
+    (§14.1).
+  - **Growing.** A single node grows by joining nodes to the controller.
+    Going from one voter to three directly keeps the controller
+    available; a second node alone should join as a learner until the
+    third arrives. A partition's replication factor then rises through
+    `move_partition_replicas` to a larger replica set (above).
+  - **What assumes more than one node, and how it degrades at RF 1.**
+    Each degrades correctly: the quorum checks become trivially true,
+    and splits on one node keep every guarantee.
+    - **Quorums of one.** Every Raft group, the controller's included,
+      has one voter, so an append commits on the leader's own fsync, and
+      a leadership check (`not_leader`, the anchor's fresh quorum check
+      in §10.3) is trivially true.
+    - **The controller is a group of one,** founded from a one-entry seed
+      list. Joins still work.
+    - **Moves need a second node.** With one node, the balancer has
+      nowhere to move replicas, and only moves replicas between cores
+      (§9.9).
+    - **Splits still happen,** with both children on the same node.
+    - **Election timing** is moot with one voter: there are no elections
+      after startup, and the timing defaults below matter only with more
+      nodes.
+    - **The authorization horizon** is trivially current, since every
+      partition is local (§6.3). With no front ends outside the node, the
+      leader-lease wait for evidence is skipped. Front ends on other
+      machines keep the full rule, and drop their evidence when the WAL
+      node restarts, which they detect from the incarnation ID in every
+      fetch response (§10.4).
+    - **Materializer replicas** for a hot partition still help with read
+      load, but share the server's disk and CPU.
   - **Distributed:**
-    - a **WAL cluster**: openraft nodes, each hosting a replica of the
-      WAL controller (below) and many partitions' Raft groups, three
-      replicas per partition, reached over gRPC (tonic). Readers tail committed entries over a gRPC stream from any
-      replica.
-      - **Timing.** openraft uses the heartbeat interval as the deadline
-        of each AppendEntries call, and followers reply only after fsync,
-        so heartbeats must be well above fsync latency (macOS's
-        `F_FULLFSYNC` is slow). Defaults, as in etcd: a 100 ms heartbeat
-        and 1–2 s election timeouts. The other timers sit above these:
+    - a **WAL cluster**: `shep-raft` nodes, thread-per-core (§3), each
+      hosting a replica of the WAL controller (below) on core 0 and many
+      partitions' Raft groups, three replicas per partition, reached over
+      Shep's RPC (§17). Readers tail committed entries with long-poll
+      fetches from any replica.
+      - **Two levels of placement,** as in Redpanda: the controller
+        assigns each replica to a node, and only to a node; each node
+        assigns its replicas to cores, as Redpanda's node-local core assignment does
+        with its `shard_balancer` and `shard_placement_table`, whose
+        entries move through `receiving`, `hosted`, and `obsolete`.
+        Moving a replica between cores is local to the node and never
+        goes through the controller log. A request that lands on the
+        wrong core hops once (§3).
+      - **Timing.** `shep-raft` batches heartbeats per node pair, apart
+        from appends, so a slow fsync (macOS's `F_FULLFSYNC`) delays
+        appends' acknowledgements but not heartbeats. Defaults, as in
+        etcd: a 100 ms heartbeat and 1–2 s election timeouts. The other timers sit above these:
         the proposal timeout (one second) and the revocation bound `B`
         (5 s) exceed a heartbeat by far, and `B` covers an election plus
         clock drift, so one leader change doesn't break the bound.
@@ -4939,7 +5185,8 @@ with a delta and a context (§9.5).
   - **Its log holds typed commands:** node join and decommission,
     universe create and drop, partition create, `start_split`,
     `cancel_split`, `finish_split`, `move_partition_replicas`,
-    `finish_moving_partition_replicas`, and replica-set changes. Redpanda's
+    `cancel_moving_partition_replicas`,
+    `finish_moving_partition_replicas`, and feature activations. Redpanda's
     equivalents are `add_node_cmd`, `decommission_node_cmd`,
     `create_topic_cmd`, `create_partition_cmd`,
     `move_partition_replicas_cmd`, and
@@ -4960,13 +5207,35 @@ with a delta and a context (§9.5).
     hosts, as Redpanda's `controller_backend` reconciles each partition.
     Commands come in start and finish pairs, and only a finish command
     removes old replicas, so a crash between them leaves the old replicas
-    serving.
+    serving. §9.9 describes reconciliation in more detail.
+  - **A feature table,** as in Redpanda: the controller records which
+    versions every member supports, and a new command or log-entry
+    variant is emitted only once every member supports it, so a rolling
+    upgrade never sends a node something it can't read.
+  - **Cluster identity.** Founding writes a cluster UUID, persisted on
+    every node and checked in a hello exchange at the service layer
+    whenever a shep-rpc connection opens (the framing itself has no
+    handshake), so a production
+    node and a non-production node can never join each other's
+    clusters.
   - **Front ends cache it.** They follow the controller's state from any
     WAL node and keep a read-only copy, as Redpanda's `metadata_cache`
     does on every shard: the universe directory, each universe's
     partition map, and replica locations. A WAL leader that gets a
-    proposal for a range it no longer holds answers `moved` with the
-    current revision, and the front end catches up to it and retries.
+    proposal for a range it no longer holds answers `moved`: after a
+    split, with the split entry, which routes the retry directly (above);
+    otherwise with the current revision, and the front end catches up to
+    it and retries.
+  - **When the controller is unavailable,** for example without a
+    quorum of its members, the data path doesn't stop: data partitions,
+    reads, live queries, and two-phase commits continue, and front ends
+    route with their cached maps. What waits for the controller:
+    splits, moves, universe create and drop, joins, re-delivering
+    barriers to new children, and resolving `moved` from a partition
+    whose split has finished and been cleaned up. On restart, a node's
+    reconciler opens the replicas its locally applied controller state
+    assigns it, and removes a replica only on a finish command committed
+    in its local log.
 
 - **Universes are a fixed kind of the controller,** like a Redpanda topic
   whose layout isn't configurable. Each universe is a cell: a meta
@@ -4975,21 +5244,26 @@ with a delta and a context (§9.5).
   with other universes in the core. The controller holds which universes
   exist, with their immutable IDs and names, and where their partitions
   are; the meta partition holds only the universe's registry and what
-  goes with it. Implementation starts with a single universe.
+  goes with it. Implementation starts with a single universe, and
+  production runs one; the non-production fleet hosts many (§14.3).
 
   **Protocol: bootstrap.** Every WAL node hosts a controller replica, so
-  there's no separate system partition on seed nodes.
+  there's no separate system partition on seed nodes, as earlier
+  revisions had.
   - **Founding.** A static seed list in each node's configuration names
-    the founding nodes. When no controller exists yet, the seeds agree
-    on the list and form the controller group with it as the initial
-    Raft configuration, as Redpanda's `cluster_discovery` does with its
-    founding brokers (`founding_brokers`, `is_cluster_founder`). The
-    seed list is used for nothing else.
+    the founding nodes. A cluster is founded only when every seed is
+    reachable and empty: then the seeds agree on the list and form the
+    controller group with it as the initial Raft configuration, as
+    Redpanda's `cluster_discovery` does with its founding brokers
+    (`founding_brokers`, `is_cluster_founder`). An empty node that any
+    seed reports as already part of a cluster joins it instead of
+    founding. The seed list is used for nothing else.
   - **Joining.** A new node contacts any node it can reach, seeds first,
     and asks the controller's leader to admit it. The leader appends a
     node-join command and adds the node to the controller group through
     Raft joint consensus, in the controller's own log, as Redpanda's
-    `members_manager` handles join requests. Decommission works the same
+    `members_manager::handle_join_request` and `members_backend` do with
+    `add_node_cmd`. Decommission works the same
     way in reverse. Replacing every seed needs no configuration rollout:
     later membership lives in the controller log, and seeds matter only
     to founding and as a first contact.
@@ -5084,6 +5358,113 @@ dotted version vectors. This revision replaces Postgres itself with the
 WAL and materializers, and keeps the dotted version vectors. Milestone 2
 makes the move (§18).
 
+### 9.9 WAL internals
+
+The WAL's internal protocols are copied from Redpanda's, adapted where
+Shep differs. This is their design; the specs that check them are listed
+in §18.
+
+**The `shep-raft` runtime.** `shep-raft` is openraft 0.10's engine and
+runtime, forked with targeted changes (§3). Each Raft group runs on its
+owning core's `current_thread` runtime. What follows marks which parts
+are openraft's as they are, and which the fork changes to Redpanda's
+behavior.
+- **Pipelined appends (openraft's).** A leader keeps a queue of
+  AppendEntries requests in flight to each follower (openraft's
+  `InflightAppendQueue`), each identified so that replies match
+  requests. A follower rejects a request that arrives out of sequence,
+  and the leader rejects a reply that does, so reordering on the wire
+  never moves a follower's log backwards.
+- **Replies carry two indexes:** the follower's dirty index (appended,
+  not yet fsynced) and its flushed index (fsynced). openraft already
+  tracks submitted and flushed I/O; the fork carries both in replies.
+- **Commit (changed).** The leader commits the highest index a quorum has durably,
+  taking each follower's `min(flushed, match)` and its own flushed index,
+  and clamping to entries of its current term, as Raft requires. A
+  follower's commit index is `min(leader_commit, own flushed)`, so it
+  never applies what it hasn't made durable.
+- **Group flush (changed).** A follower appends a burst of entries, then fsyncs
+  once for all of them; the leader does the same for its own appends.
+- **Heartbeats (changed).** openraft runs heartbeats as their own
+  command, with a worker per follower. The fork batches them per node
+  pair in Shep's network layer: one message carries the lightweight
+  heartbeats of every group the two nodes share. A group whose follower
+  needs more than a heartbeat (a commit index to advance, a term to
+  check, a gap) falls back to a full heartbeat.
+- **Elections (openraft's).** Prevote, so a node that was partitioned away doesn't
+  disrupt a working leader when it returns, and leader stickiness: a
+  follower that has heard from a live leader recently refuses to vote,
+  except for a leadership transfer the leader asked for.
+- **Follower-admitted recovery (changed).** A follower far behind is caught up in
+  bulk, but only when it admits it: each node has a few recovery slots
+  (`may_recover`), so a restarted node isn't flooded by every group
+  recovering at once.
+
+**Moving a replica between cores.** Each node assigns its replicas to
+cores, and moves them between cores without the controller (§9.6), as
+Redpanda's `shard_placement_table` does:
+1. **Receiving.** The destination core records the replica as
+   `receiving`, a persisted marker in its kvstore.
+2. **Copy.** The source core stops the group, and its kvstore state (the
+   vote, the Raft configuration, and the start offset) is copied to the
+   destination core's kvstore. The log segments are files, so they stay
+   where they are.
+3. **Hosted.** The destination marks the replica `hosted` and starts the
+   group; the source marks its copy `obsolete`.
+4. **Obsolete** state is deleted from the source core's kvstore.
+
+Each step's marker is persisted, so a crash between steps resumes from
+the marker. If the core count changes across a restart, each replica's
+markers are merged on its newly assigned core before any group starts.
+
+**Controller reconciliation.** The desired state is a fold of the
+controller log: every node applies the same commands in the same order,
+and each command's offset is its revision (§9.6).
+- **Moves are two-phase:** `move_partition_replicas`, then the
+  partition's own joint consensus, then
+  `finish_moving_partition_replicas`. A move can be cancelled until the
+  finish. Only the finish deletes old replicas.
+- **Vnode revisions.** A replica is identified to Raft by `(node,
+  revision)`, the revision of the command that created it, so a group
+  deleted and recreated on the same node is a new member, and a stale
+  replica from before can't vote in the new group.
+- **Each node reconciles** its local replicas against the fold:
+  creating, starting, and deleting, and, where it hosts the leader,
+  driving the membership change.
+
+**Storage.** Each Raft group has its own log on its core's disk:
+- **Segments.** A group's log is a sequence of segment files, each named
+  `<base offset>-<term>`, rolled on size, on age (§10.4), and on a term
+  change, so a segment never spans terms.
+- **Batches** carry two CRCs, one over the header and one over the
+  payload, so a torn write is detected at either end.
+- **Three offsets:** appended ≥ written ≥ flushed. Appended is in memory,
+  written has reached the file, and flushed has been fsynced. Only
+  flushed counts toward commit.
+- **A per-core kvstore** holds each group's vote, its start offset, and a
+  clean-shutdown marker. The marker is cleared before any truncation and
+  on startup; recovery rescans the last segment, checking CRCs and
+  dropping a torn tail, unless the marker is set.
+- **Suffix truncation** (a new leader overwriting uncommitted entries):
+  delete later segments, truncate the segment that holds the point, then
+  fsync.
+  - **Readers.** The truncation sets a `truncating` flag in the same step
+    that bumps the log's epoch, and clears it once the segment metadata
+    matches the files again, on success, error, or cancellation alike. A
+    reader that sees the flag waits on the log lock, then restarts; a
+    read that began at an older epoch restarts when it sees the epoch
+    change.
+- **Prefix truncation** (after archiving or a snapshot, §10.4): persist
+  the new start offset in the kvstore first, then delete segments below
+  it, so a crash never leaves a start offset pointing at deleted data.
+  It's atomic for readers: the metadata changes in one step, before any
+  whole segment is deleted.
+- **The reader invariant.** A read never combines file contents and
+  metadata from different sides of a truncation.
+- **Snapshots** are written to a temporary file, fsynced, renamed into
+  place, and the directory is fsynced, so a crash leaves either the old
+  snapshot or the new one.
+
 ## 10. The mutation log
 
 Every committed mutation, to data, the registry, or policies, is one entry
@@ -5114,8 +5495,8 @@ materialized queries (§12), and search (§16.6).
 
   Readers of the log (materializers, replay, tailers, search indexers,
   and view maintainers) skip Void, Internal, and Failure entries.
-- **Intent metadata, for audit.** App, API key, actor, viewer, schema
-  version,
+- **Intent metadata, for audit.** App, actor, viewer, the token's `jti`
+  and its other claims, schema version,
   the operation set and operation (§7.1), and the idempotency key. Replay
   ignores it.
 - **The delta: a Z-set of facts.** Shep's base data is a set of **facts**,
@@ -5378,13 +5759,23 @@ can't change the outcome (below):
      internal `stale_registry`. The front end refreshes its registry to at
      least that dot and re-executes, without the client seeing it.
    - **Idempotency.** If the idempotency key is in the table, the leader
-     returns that entry's outcome instead (below).
+     returns that entry's outcome instead (below). The table holds keys
+     from appended entries, committed or not, so a retry racing its
+     original is caught before either commits; checking only committed
+     entries lets one key commit twice (`WalValidate_idemcommit`). A hit
+     on an entry that's appended but not committed waits for it to
+     commit, then returns its outcome; if the entry is overwritten or
+     made void instead, the waiter gets `not_leader` and the front end
+     re-sends. The failure-record path below waits the same way.
    - **Too old.** If `S`'s prefix for this partition is older than the
      table's window, the leader can't check, and rejects with a retryable
-     `too_old`.
+     `too_old`. Without that rejection, a proposal from before the window
+     commits over a conflict the table no longer holds
+     (`WalValidate_notooold`).
    - **Conflict.** If any entry in the window whose stamp is not in `S`
      wrote a key inside one of the read set's key ranges, the leader
-     rejects with a retryable `contended`. The same
+     rejects with a retryable `contended`. Ranges matter: checking only
+     the keys read lets a phantom commit (`WalValidate_norange`). The same
      goes for an intent of a prepared two-phase commit on any of those
      keys or ranges. With `S` a prefix, "stamp not in `S`" means "after
      `S`"; with extras it's the exact test.
@@ -5395,9 +5786,15 @@ can't change the outcome (below):
      in; if Raft appends it under any other term, it is void (§9.1), and
      the proposer, finding no outcome, re-sends. Its write set enters the
      validation table **at append time**, tagged with that term, so the
-     next proposal is checked against it even before it commits. Proposals are validated one at a time per partition, in log
-     order; appends may be pipelined and batched, and validation is a
-     lookup per key and range, so it's cheap.
+     next proposal is checked against it even before it commits; entering
+     it at commit lets a phantom commit (`WalValidate_c1`,
+     `WalValidate_claim_c1`). The term tag isn't needed for safety,
+     because the table is rebuilt on every leader change (below); it only
+     makes a void entry's write set easy to drop. The leader validates
+     and appends in one step of its core's loop (§3), one proposal at a
+     time per partition, in log order; replication to followers is
+     pipelined and batched, and validation is a lookup per key and range,
+     so it's cheap.
 4. **Commit.** The entry commits once a quorum of the partition's replicas
    has it, and the leader replies with the outcome.
 5. **Retry.** On `contended` or `too_old`, the front end re-executes the
@@ -5420,22 +5817,36 @@ can't change the outcome (below):
     the same proposal.
   - **A re-sent proposal keeps its horizon deadline** (§6.3). Past it, the
     leader rejects it with `too_old` and the front end re-executes.
-- **Leader changes.** A new leader rebuilds its validation table and
-  idempotency table from every entry in its log since the window's start,
-  committed or not, and from its prepared transactions' intents, before it
-  accepts proposals; until then, proposals get `too_old`. Entries a
-  previous leader appended but never committed are either committed by the
-  new leader, as Raft does with its own term's no-op, or overwritten, and
-  overwritten entries' write sets leave the table with them. The rebuilt
-  table's floor never goes below the first index still in the log, so a
-  truncated log can't make the table claim coverage it doesn't have: an
-  older `S` gets `too_old` (`WalValidate.tla`, configs `WalValidate_trunc`
-  and `WalValidate_truncfix`). The leader's last-value map for field
-  operations (§8) is rebuilt the same way, from the window floor,
-  including uncommitted entries.
+- **Leader changes.** A new leader rebuilds both tables before it
+  accepts proposals; until then, proposals get `too_old`. Skipping the
+  rebuild lets a conflict commit (`WalValidate_norebuild`).
+  - **The validation table** is rebuilt from every entry in its log since
+    the window's start, committed or not, and from its prepared
+    transactions' intents.
+  - **The idempotency table** is rebuilt from the state machine's
+    snapshot of it, plus every log entry after the snapshot, committed or
+    not. The log alone isn't enough: the idempotency window (24 hours)
+    outlives the log, which snapshots and archiving truncate.
+  - **Uncommitted entries.** Entries a previous leader appended but never
+    committed are either committed by the new leader, as Raft does with
+    its own term's no-op, or overwritten, and overwritten entries' write
+    sets and keys leave the tables with them.
+  - **The window starts no earlier than the log.** After a truncation or
+    a snapshot install, a leader's validation window starts no earlier
+    than its first log entry, so the rebuilt table never claims coverage
+    it doesn't have: a proposal whose `S` has a prefix below that gets
+    `too_old`. A leader that rebuilt from a truncated log without this
+    rule let a conflict commit (`WalValidate_trunc`; the fix passes,
+    `WalValidate_truncfix`).
+  - **The last-value map** for field operations (§8) is rebuilt like the
+    validation table, from the window floor, including uncommitted
+    entries.
 - **What's durable where.** The log (Raft replicas, then the archive) is
   durable. The idempotency table is part of the WAL's Raft state machine,
-  in its snapshots, for the idempotency window. The validation table and
+  on disk in the state machine's own store and in its snapshots, for the
+  idempotency window. It stores only `key → (dot, failure code?)`: a
+  committed key's outcome is re-derived from the entry at that dot, so
+  the table stays small over a 24-hour window. The validation table and
   the last-value map are
   memory only, rebuilt from the log.
 - **The isolation guarantee.** Committed mutations are serializable, in a
@@ -5462,19 +5873,44 @@ can't change the outcome (below):
   recorded and checked there, whatever shape the mutation commits in: a
   single-partition entry at the anchor, or a two-phase commit whose home is
   the anchor. The anchor's Raft state machine keeps recent keys, with the
-  committed entry's dot and outcome, for the idempotency window (24 hours
-  by default, longer than any client retries), and includes them in its
-  snapshots. A retried mutation whose key is there gets the original
+  committed entry's dot or the failure's code, for the idempotency window
+  (24 hours by default, longer than any client retries), and includes
+  them in its snapshots. A retried mutation whose key is there gets the original
   outcome, even if re-executing it now would touch different partitions.
   A retry that reaches a different front end while the original is still
   in flight is caught the same way.
-  - **One outcome per key.** Attempts rejected with `contended`,
-    `too_old`, `stale_registry`, or `not_leader`, and two-phase commits
-    that abort, record nothing. A failure the client would see (a
-    `assert` error, `invalid`, `denied`, a bound crossed) is proposed as
-    a **failure record**: the leader records it as the key's one
-    outcome, or returns the existing outcome if the key is already
-    decided. So a key's single outcome is a commit or a recorded failure.
+  - **One outcome per key.** A key's single outcome is a commit or a
+    recorded failure.
+    - **Retryable rejections don't consume the key.** Attempts rejected
+      with `contended`, `too_old`, `stale_registry`, `not_leader`, or
+      `splitting`, and two-phase commits that abort, record nothing.
+    - **Client-visible failures go through the anchor when the key may
+      already have an outcome.** A failure the client would see (a failed
+      `assert`, `lease_lost`, an empty claim, `invalid`, `denied`, a
+      bound crossed) goes through the anchor when the key may already
+      have one: the client marked the request as a retry, or this front
+      end sent a proposal for the key whose outcome is unknown. Then the
+      front end sends the key and the error to the anchor's leader. If
+      the key is in its idempotency table, the leader answers from it,
+      after confirming it's still leader with a fresh quorum check, as a
+      read-index call does, so a deposed leader can't answer; the
+      outcome may be a commit from an earlier attempt. Otherwise it
+      appends a **failure record**, which becomes the key's one outcome;
+      the append itself needs a current-term quorum, so it needs no
+      separate check.
+    - **The fast path.** A first attempt that the client didn't mark as a
+      retry, and that this front end never proposed, can't have an
+      earlier outcome, and its failure is reported directly. Admission
+      prices failure records like writes (§15), since each is an append.
+      The fast path is pending a re-check in `WalValidate.tla` (§18).
+    - **Why.** A front end that reported a re-execution's failure itself
+      could tell the client "failed" for a call an earlier attempt had
+      committed, through another front end or before a timeout
+      (`WalValidate_fail`, `WalValidate_probe`).
+    - **Clients accept a failure only from the anchor.** After a retry,
+      the client libraries treat a failure as final only when it carries
+      the anchor's confirmation; anything else is an unknown outcome, and
+      they retry with the same key.
 - **Registry barriers.** Every registry change (a new schema head, an
   index definition, a policy deploy or promotion, an operation set's
   activation) is an entry in the meta partition, with a dot.
@@ -5525,7 +5961,13 @@ can't change the outcome (below):
     tasks instead of conflicting (§8).
   - **Retries.** A claim carries an idempotency key like any mutation, so
     one retried after an unknown outcome returns the leases it took the
-    first time.
+    first time. For claims this check is the only protection: claims skip
+    contended candidates instead of conflicting, so validation never
+    catches a duplicate, and without the key check at append a retried
+    claim takes a second node (`WalValidate_claim_idem`).
+  - **The fence is necessary.** Without the generation check on writes
+    under a lease, a stale holder's writes land after the node is claimed
+    again (`WalValidate_claim_nofence`).
   - **Lease expiry.** The leader's sweeper appends `@lease_expired` for
     leases whose expiry has passed by its clock plus a skew allowance
     (§8).
@@ -5538,23 +5980,53 @@ plus the new dot), and the observed changes when the mutation declares
 
 - **The log is archived.** Sealed log segments go to the object store,
   per partition, by index range, checksummed.
-  - **Protocol.** A segment is sealed at a size or age boundary. The WAL
-    leader uploads it, verifies it, and records the archived range in its
-    state machine. Only then may the replicas truncate it, and only below
-    the lowest index that every materializer and tailer of the partition
-    has reported applying, or below a Raft snapshot that covers it. It
-    never passes the oldest prepare whose release hasn't committed (§8).
+  - **Protocol.** A segment is sealed at a size or age boundary (on a
+    single node, every second by default, §9.6). The WAL leader uploads
+    it, verifies it, and records the archived range in its state
+    machine. Only then may the replicas truncate it, and only below the
+    lowest index that every materializer and view maintainer of the
+    partition has reported applying, or below a Raft snapshot that covers
+    it. It never passes the oldest prepare whose release hasn't committed
+    (§8).
+  - **Progress leases.** Each materializer and view maintainer holds a
+    progress lease on the partition, renewed with its reports; an expired
+    lease is ignored, so a consumer that went away doesn't hold
+    truncation back forever. Other tailers (front ends, search indexers)
+    don't hold truncation back at all, and read the archive if they fall
+    behind.
   - **Falling behind.** A replica that falls below the truncation point
     installs a Raft snapshot. A materializer or tailer that falls below it
     reads the archived segments, then the replicas.
+  - **Truncation and snapshots shrink the validation window.** A leader
+    whose log starts at index `f`, after a truncation or a snapshot
+    install, starts its window no earlier than `f` and rejects older
+    proposals with `too_old` (§10.3, `WalValidate_trunc`,
+    `WalValidate_truncfix`). The idempotency table is in the snapshot, so
+    it survives truncation.
 - **Materialized state has checkpoints.** A SlateDB checkpoint pins a
   partition's state at an applied index, in the object store. Checkpoints
   let a materializer start without replaying the whole log, give
   point-in-time restore its starting points, and seed a split's children
   (§9.6).
+- **Fetch.** Every tail is a long-poll fetch,
+  `fetch(from_index, max_bytes, max_wait)` (§17).
+  - **Each response carries** the partition's `(commit index,
+    leader-lease stamp)` from its leader, which followers relay unchanged,
+    and the serving node's incarnation ID, which changes when the node
+    restarts, so a tailer can tell when evidence from before a restart no
+    longer holds (§6.3, §9.6).
+  - **Where to fetch.** Tailers on the latency path (materializers, and
+    front ends' horizon tails) fetch from the partition's leader, or the
+    leader pushes its commit index to them eagerly; fetching from a
+    follower is for catching up and bulk reads.
+  - `max_wait` is at most `(B − 2ε)/4`, so an idle partition still
+    refreshes horizon evidence within the bound (§6.3).
 - **Protocol: a materializer.**
-  - **Tailing.** It reads committed entries over the WAL's gRPC stream,
-    from any replica, not as a Raft learner, so it never slows the quorum.
+  - **Tailing.** It reads committed entries with long-poll fetches,
+    `fetch(from_index, max_bytes, max_wait)` as in Kafka's fetch, from any
+    replica, not as a Raft learner, so it never slows the quorum. Shep's
+    RPC has no server streams (§17), so every tail is a sequence of
+    fetches.
     It skips Void, Internal, and Failure entries (§10.1).
   - **Applying.** It applies each entry, stamped, with its derived index
     entries and ghosts and the entry's commit time, in one SlateDB write
@@ -6256,18 +6728,17 @@ So phase 2 has two triggers:
   - **Subscribers' own nodes are routed too.** Each subscriber's actor and
     viewer nodes are registered with the topic, so their `@deleted_at`
     reaches it. A subscription's actor and viewer are fixed by its
-    credential, so there are no mapping facts to follow and nothing to
+    token, so there are no mapping facts to follow and nothing to
     re-register.
-  - **So are their credentials.** Revoking the key a subscription was
-    opened with closes it with `denied`, as front ends tail the system
-    partition.
+  - **Tokens end subscriptions.** A subscription whose token expires
+    without a `reauth` closes (§6.3). Revoking a credential at the auth
+    service takes effect when its tokens expire.
   - **Deleting the subscriber's actor closes its stream** with `denied`,
     before any later push, so an offboarded user's subscriptions stop at
     once (§6.3).
   - **Deleting the subscriber's viewer** (for example, the user an agent
     works for) closes its stream with `denied` too, as §6.3 rejects a
-    deleted viewer, and the act-for keys issued for that viewer are
-    revoked.
+    deleted viewer, whatever the subscriber's token says.
   - **Without this routing,** revoking access wouldn't hide quotes a
     subscriber already has.
 
@@ -6362,14 +6833,17 @@ references, because quotes cross channels.
     bus and no topic ownership, and its cost is bounded by the number of
     front ends, not the number of subscribers.
 - **Stepping.** Each front end follows the frontiers published in the
-  meta partition (§9.7), and for each new frontier reads, from WAL
-  replicas, the entries of only the partitions its topics' footprints
-  touch, between its topics' version and the new frontier. The WAL pushes
-  new frontiers and commits to followers, so nothing polls. A topic
-  reads materializers at the frontier, so what it reads and the entries it
-  applies always describe the same version.
-  - **Splits.** A split's children appear in the meta partition (§9.6),
-    and front ends start following them at the split's version.
+  meta partition (§9.7). It keeps long-poll fetches (§17) open on the
+  partitions its topics' footprints touch, and buffers their entries as
+  they commit, so nothing busy-polls. For each new frontier, a topic
+  takes the buffered entries between its version and the frontier, and
+  reads only materializers, at the frontier, so what it reads and the
+  entries it applies always describe the same version.
+  - **Splits.** A front end learns of a split from the split entry in
+    the parent's log, and starts following the children at the split's
+    version. As with the horizon (§6.3), the parent's entries and
+    evidence don't count past the split entry, and the topic pauses for
+    a range until it has the child's.
   - **Registry changes** are crossed atomically, as above: the frontier
     that first includes a registry dot is where the topic re-plans.
 - **Soft state.** Topics, reference sets, and subscriber lists live in
@@ -6389,7 +6863,8 @@ references, because quotes cross channels.
   - route a topic's subscribers to the same front ends, so phase 1 runs
     once
   - run phase 1 on topic owners, and fan `Δcore` out to the front ends
-    holding connections
+    holding connections, which fetch it with long-polls like any other
+    internal feed (§17)
   - split tailing by partition, so a front end reads only the logs its
     topics need
 
@@ -6414,10 +6889,13 @@ references, because quotes cross channels.
     queries and mutations.
 - **Limits.** Subscriptions count against admission control: per
   connection, per app, per front end, and per topic fan-out (§15).
-- **Expiring tokens.** A subscription opened with a browser token or
-  `db.as_token` gets a `reauth` update when the token expires. The client
-  runtime refreshes the token and resumes. If it doesn't within a short
-  grace period, the stream closes (§6.3).
+- **Expiring tokens.** Every subscription runs under a token, and gets a
+  `reauth` update 60 seconds before it expires. The client runtime asks
+  its token provider, or the page, for a fresh token with the same
+  claims; Shep checks it as on connect. At expiry the stream pauses, with
+  its state kept, and if no token comes within a short grace period, it
+  closes (§6.3). A feed needs no `reauth`: each poll is a request, and
+  carries a current token.
 
 ### 13.5 Worked example: the Slack clone
 
@@ -6442,7 +6920,7 @@ Browsers talk to Shep directly. There is no app-owned real-time service.
   # shep/ops/post.edgeql
   with
     ch := assert_exists(<Channel>$channel),
-    ok := assert((global viewer in ch.members) ?? false,          # One; false with no viewer
+    ok := assert(global viewer in ch.members,                     # One; false with no viewer (§4.0)
                  message := 'not_a_member'),
     m  := (insert Message {
             text := <str>$text,
@@ -6454,7 +6932,7 @@ Browsers talk to Shep directly. There is no app-owned real-time service.
   select m.id;
   ```
 - **Opening a channel.** The browser subscribes to `in_channel(c)` with
-  the user's SSO token. The first update is a resync with the newest
+  the user's token from the auth service. The first update is a resync with the newest
   messages. Later updates are deltas, and scrolling up grows the live
   range.
 - **Posting.** The browser calls `post`, an ordinary mutation. The
@@ -6563,10 +7041,10 @@ of production's registry, with the candidates under test applied on top
   - usage tracking
 - **Schema names are global too.** Each name is reserved to its owning
   app, so no universe can register `users` under a different owner.
-- **API keys are global, scoped by universe.** A key belongs to an app and
-  lists the universes it may use, along with its permissions (§6.3).
-  Production keys are issued separately and never work against a test
-  universe. Test keys can never reach production.
+- **Credentials aren't Shep's.** The external auth service issues the
+  tokens apps and people present, each naming one universe (§6.3). A
+  token for a test universe can't be used against production: the
+  universe claim must match the host.
 - **Everything else is per universe.**
   - Registered versions, type and field ID assignments, policies,
     operation sets, dependencies, in-service tracking, data, and the
@@ -6580,41 +7058,46 @@ of production's registry, with the candidates under test applied on top
     still changes. They never get production numbers.
   - The hash check at connect catches a binary or bundle built from
     different content than the universe holds.
-- **Where global state lives.** Each fleet, production and
-  non-production, has its own system partition, a Raft group on seed nodes
+- **Where fleet state lives.** Each fleet, production and
+  non-production, is its own WAL cluster with its own WAL controller
   (§9.6). So no test, CI run, or `shep dev` session writes to anything
-  production depends on. The system partition holds:
-  - apps, and the origins each app registered per universe
-  - API keys for the fleet's universes: production keys only in
-    production's, test and dev keys only in the other
-  - quotas (§15)
-  - the fleet's universes, with their immutable IDs
-  - schema-name reservations
-  - the fleet's WAL membership and which universes it hosts
-  - the deployment's login mapping (§6.3)
+  production depends on.
+  - **The WAL controller** holds the fleet's WAL nodes and its universe
+    directory: which universes exist, with their immutable IDs and names,
+    and their partitions and replicas.
+  - **Production's registry** holds the app and schema-name records.
+    Every universe's registry holds the origins each app registered for
+    it, and everything in the per-universe list above.
+  - **Not in Shep:** credentials, identities, and act-for consent, which
+    belong to the external auth service (§6.3); and quotas, which are
+    open (open question 27).
 
-  **Apps and schema names have one authority:** production's system
-  partition. The non-production fleet's system partition keeps a
-  read-only copy of them, which it follows, so an app's name and schema
-  reservations mean the same thing in every universe.
+  **Apps and schema names have one authority:** production's registry.
+  A test or dev universe reads them from its base: the base at version
+  S is production's registry as of S (§14.3), so it already contains
+  production's app and name records as of S. There's no separate copy to
+  follow, and an app's name and schema reservations mean the same thing
+  in every universe.
 - **Names are registered in production first.**
   - **Only production registers names.** App names and schema-name
-    reservations are created only in production's control plane, by an
-    operator or a CI job holding production credentials:
+    reservations are created only in production's registry, by an
+    operator or a CI job holding a production token with the `deploy`
+    scope:
     `shep app create <name>` and `shep schema reserve <name> --app <app>`
     (§4.1.3).
-  - **Non-production only follows.** It never forwards a registration to
-    production, and never records a name of its own next to its copy.
+  - **Non-production only reads.** It never forwards a registration to
+    production, and never records a name of its own next to its base's.
     Either would let two fleets disagree about who owns a name
     (`Bootstrap_forward`, `Bootstrap_local` in `formal/tla`).
-  - **The copy propagates within 30 seconds.** The non-production system
-    partition follows production's app and name records continuously, and
-    a new name reaches it within that bound.
+  - **A new name reaches new bases.** A name registered in production is
+    in every base built from a version after it. Bases are built from
+    production's registry as it changes, so a new name reaches the next
+    base within a short bound (30 seconds by default).
   - **A brand-new app waits for its name.** Its first `shep dev` session or
-    test run checks the non-production copy and, until the name arrives,
-    fails with: "name `foo` isn't registered in production yet; register
-    it with `shep app create foo` (needs production credentials) and wait
-    for it to propagate (up to 30 seconds)." A new schema name works the
+    test run checks its base and, until the name is there, fails with:
+    "name `foo` isn't registered in production yet; register it with
+    `shep app create foo` (needs a production token) and wait for it to
+    reach the test bases (up to 30 seconds)." A new schema name works the
     same way with `shep schema reserve`.
 
 ### 14.2 Kinds and lifecycle
@@ -6626,12 +7109,20 @@ of production's registry, with the candidates under test applied on top
 | `dev` | a developer's `shep dev` | while `shep dev` runs, plus its TTL | hot only |
 | `test` | one test or test run | minutes (TTL) | hot only, dumped on failure |
 
-- **Names.** Universe names are DNS labels (§14.3). `prod` is the
-  production universe's name, and it and names like it are reserved.
+- **Names.** Universes are named by DNS names (§14.3), so the rule is DNS
+  validity: non-empty, at most 253 characters in all, made of labels of
+  1–63 characters each, using letters, digits, and hyphens, with no label
+  starting or ending with a hyphen. Names are
+  case-insensitive, and stored lowercased. These limits are constants.
+  `prod` is the production universe's name, and it and names like it
+  are reserved.
 
 - **Ephemeral universes expire.** Each one has a TTL, refreshed by a
-  heartbeat from its owner (the test harness or `shep dev`). A reaper
-  drops expired universes, so crashed test runs don't leak them.
+  heartbeat from its owner (the test harness or `shep dev`). The TTL and
+  its heartbeats are entries in the universe's own meta partition, so
+  they never load the controller. The controller's reaper reads them and
+  appends only `drop_universe` for an expired one, so crashed test runs
+  don't leak universes.
 
 **Test and dev universes are production plus candidates.** A test, a CI
 run, or a `shep dev` session is about *candidates*, usually the ones in the
@@ -6696,8 +7187,8 @@ universe is built from two parts:
 - **CI for any language.** CI uses
   `shep universe create --overlay <project dirs> [--base-version S]`, where
   each project's `shep.toml` names its schema, policies, and operations.
-  It prints a universe-scoped API key, whose prefix names the universe's
-  host.
+  It needs a token with `manage_universes`, and prints the universe's
+  name, which tokens for it then carry as their audience.
 - **Dev.** `shep dev` is the same thing, long-lived: it creates a dev
   universe on the non-production fleet, keeps it alive with a heartbeat,
   and re-applies the overlay whenever a source file is saved. Nothing runs
@@ -6727,14 +7218,17 @@ async fn closing_an_issue() -> Result<(), shep::Error> {
 
 ### 14.3 Mapping universes onto storage
 
-- **A universe is its own partitions.** Each universe has its own meta
-  partition (§3), its own data partitions and their Raft groups, and its
-  own prefix in the object store, keyed by its immutable ID. Nothing is
-  shared below the WAL cluster's machines.
+- **A universe is its own partitions: a cell.** Each universe has its own
+  meta partition (§3), its own data partitions and their Raft groups, and
+  its own prefix in the object store, keyed by its immutable ID. The WAL
+  controller creates and drops them with universe commands (§9.6), and
+  holds the universe directory. Nothing else is shared below the WAL
+  cluster's machines.
   - **Production** runs on its own WAL cluster, materializers, and front
-    ends.
+    ends, and starts with one universe, `prod`.
   - **Non-production universes** share a separate fleet that runs as its
-    own deployment.
+    own deployment and hosts many universes. A single-node install hosts
+    its dev and test universes beside production instead (§9.6).
   - **Result.** Nothing a test does (load, registry churn, a runaway
     query) can reach production, and nothing in one test universe can
     reach another.
@@ -6743,14 +7237,15 @@ async fn closing_an_issue() -> Result<(), shep::Error> {
     read filtering correctly.
   - **Teardown.** Dropping a universe would become a mass delete.
   - **With partitions per universe**, isolation is structural, and
-    dropping a universe means removing its Raft groups and deleting its
-    object-store prefix.
+    dropping a universe is one controller command: the reconcilers remove
+    its Raft groups, and its object-store prefix is deleted.
 - **Creating a test universe is cheap.**
   - **The base.** For each base version S, the service builds a base once:
-    a meta partition holding production's registry as of S, with no data.
-    The partition map, split plans, and published frontiers are reset in
-    it, since they name production's partitions. It's checkpointed in the
-    object store.
+    a meta partition holding production's registry as of S, with no data,
+    and its published frontiers reset, since they name production's
+    partitions. It's checkpointed in the object store. The partition map
+    isn't in it: it's controller state, and a new universe's partitions
+    come from its create command.
   - **Per test.** A universe's meta partition starts from that
     checkpoint as a Raft snapshot at the base's index, so its log
     continues from there: every key it copied has a stamp below the new
@@ -6758,8 +7253,8 @@ async fn closing_an_issue() -> Result<(), shep::Error> {
     without copying data. Partition IDs are per universe, so the copy's
     IDs collide with nothing. The overlay is applied on top. Nothing is
     built per type, because indexes are only key ranges (§3).
-  - **Rust tests run in one process.** `shep::test::db` runs every
-    component in the test's own process (§9.6), with an in-memory object
+  - **Rust tests run in one process.** `shep::test::db` runs the
+    single-node deployment in the test's own process (§9.6), with an in-memory object
     store, from the base registry fetched once per S and cached. Each
     placement group gets its own partition, home partitions are picked at
     random, and a little apply lag is injected, so two-phase commit,
@@ -6778,7 +7273,7 @@ async fn closing_an_issue() -> Result<(), shep::Error> {
   one universe, and the host says which.
   - **Hosts.** Production is `shep.internal`. Every other universe is
     `<universe>.shep.internal`, such as `staging.shep.internal` or
-    `test-8f2c.shep.internal`. Universe names are DNS labels.
+    `test-8f2c.shep.internal`. Universe names follow DNS rules (§14.2).
   - **Paths are the same everywhere.** `/g/<app>/graphql`, `/js/<app>/...`,
     and the rest mean the same thing on every host.
   - **No DNS change per universe.** Wildcard DNS records and wildcard TLS
@@ -6795,11 +7290,10 @@ async fn closing_an_issue() -> Result<(), shep::Error> {
       for GraphiQL. Downloads use a separate site (§16.4).
     - **Routing.** Load balancers, TLS, rate limits, and logs can be set
       per universe from the host alone, before a request is parsed.
-  - **One value picks it.** An API key valid in one universe names it in
-    its prefix, and so the host (§6.3), so most apps configure nothing.
-    `SHEP_URL` overrides it for keys valid in several. Browsers get the
-    host from the app's import map (§7.4), and the CLI from `shep login`
-    (§7.2).
+  - **One value picks it.** A token names its universe (§6.3), and the
+    client libraries derive the host from it, so most apps configure
+    nothing. `SHEP_URL` overrides it. Browsers get the host from the app's
+    import map (§7.4).
 
 ## 15. Capacity and admission control
 
@@ -6810,8 +7304,8 @@ measured resources before it runs, and every request runs within a budget.
 ### 15.1 What is measured
 
 Each piece of work is attributed to its universe, app, operation (§7.1),
-actor class (the app itself, an end user, an agent or other actor-bound
-key, or a person in an ad-hoc session), and partition.
+actor class (the app itself, an end user, an agent, or a person in an
+ad-hoc session), and partition, all taken from the token's claims.
 
 | Resource | Measured as | Where |
 |---|---|---|
@@ -6855,15 +7349,9 @@ shed with `overloaded`, so a misconfigured front end can't swamp them.
    - A front end above its memory high watermark accepts no new streaming
      connections, and the load balancer sends them to other front ends.
 2. **Requests.**
-   - **Quotas per app,** in cost units per second for each resource class
-     (reads, writes, subscriptions), with a per-user quota inside an app
-     for browser traffic.
-     - **Configured globally.** Quotas live in the system partition, like
-       apps (§14.1).
-     - **Enforced locally.** Each front end enforces its share of an app's
-       quota: the quota divided among front ends, rebalanced periodically
-       from observed load. Enforcement is approximate and needs no shared
-       counter.
+   - **Per-app limits are open.** Admission keys work on the token's
+     `client_id` claim, so per-app accounting is exact, but how quotas are
+     configured and enforced is open question 27.
    - **Adaptive concurrency limits per partition.** Each front end limits
      its concurrent reads per materializer and its proposals per WAL
      leader. The limit grows while latency stays at
@@ -6886,8 +7374,7 @@ shed with `overloaded`, so a misconfigured front end can't swamp them.
      below it:
      - archiving and log truncation, and compaction
      - two-phase commit decisions and releases
-     - front ends' tails of the system, meta, actor, and viewer
-       partitions, and the commit-index reads that go with them, which the
+     - front ends' tails of the meta, actor, and viewer partitions, and the commit-index reads that go with them, which the
        authorization horizon depends on (§6.3)
      - frontier publication (§9.7)
      - registry barrier delivery (§10.3)
@@ -6946,19 +7433,20 @@ shed with `overloaded`, so a misconfigured front end can't swamp them.
   |---|---|---|
   | `overloaded` | Shep is shedding this class right now, a component it needs is unavailable past the request's deadline, or its own retries (`contended`, `too_old`, §10.3) ran out. The response names which, for dashboards | Retry after `retry_after`, with backoff and jitter |
   | `unavailable` | The front end can't show it's within the authorization horizon (§6.3), so it fails closed rather than answer from state that may be stale | Retry with backoff; alert if it persists, since it means a front end is cut off from a leader |
-  | `quota_exceeded` | The app or user is over quota | Retry after the quota window; the app's owners are alerted |
+  | `quota_exceeded` | Reserved for per-app quotas, once they exist (open question 27) | Retry after the quota window |
   | `budget_exceeded` | The request ran over its budget | For a declared operation, retry once at the raised cost estimate |
   | `too_expensive` | An ad-hoc query can never fit a budget | Don't retry; the person changes the query |
 
 - **Retry budgets.** Client libraries cap retries at a fraction of recent
-  successful requests, as gRPC does, so retries can't amplify an overload.
+  successful requests, as gRPC's retry throttling does, so retries can't
+  amplify an overload.
   Idempotency keys make mutation retries safe (§8).
 
 ### 15.4 Operating it
 
-- **Quotas are per app and per universe,** set with `shep app quota set`.
-  New apps get defaults. Test and dev universes have their own small
-  defaults, and they run on a separate fleet anyway (§14.3).
+- **Quotas are open** (open question 27). Admission control already
+  measures and sheds per app, from the token's `client_id` claim, and test and
+  dev universes run on a separate fleet anyway (§14.3).
 - **`shep top`** shows live cost by app and operation, per resource, and
   what is being shed.
 - **Every rejection is counted** by app, operation, class, and reason.
@@ -6967,7 +7455,7 @@ shed with `overloaded`, so a misconfigured front end can't swamp them.
   saturation and assert three things:
   - goodput stays flat
   - classes are shed in order
-  - one app over its quota doesn't raise another app's latency
+  - one app's overload doesn't raise another app's latency
 
 ## 16. Files and text search
 
@@ -7211,7 +7699,7 @@ attach.
 
 1. **Begin.** The client asks Shep for an upload against a file field:
    `begin_upload(field, name, media_type, size, sha256?, from?)`.
-   - Shep checks the field's limits and the app's byte quota (§15).
+   - Shep checks the field's limits (§16.1).
      Policies run at attach, once the owning node is known.
    - Shep returns an **upload**: an ID, where to send the bytes, if
      anywhere, and an expiry.
@@ -7352,31 +7840,44 @@ A link is minted whenever an operation includes a file, and checked again
 when it is used.
 
 - **The link** is a Shep URL on a separate files domain, one host per
-  universe: `https://shep-files.internal/f/<token>` for production and
-  `https://<universe>.shep-files.internal/f/<token>` for the rest. The
+  universe: `https://shep-files.internal/f/<front end>.<handle>` for
+  production and `https://<universe>.shep-files.internal/f/<front
+  end>.<handle>` for the rest. The
   files domain is a different site from `shep.internal`, so downloaded
-  content never shares cookies or storage with Shep or with apps. The
-  token is signed and names the universe, the app, the actor, the viewer,
-  the credential that minted it, the file, and an expiry, by default one
-  hour.
-  Minting one is a signature, so including links costs almost nothing.
-- **Links never cross universes.** A token is accepted only on its own
-  universe's files host.
-- **Using it.** Shep verifies the token, checks that the minting
-  credential is still valid (a revoked key's links stop working), checks
-  that neither the actor nor the viewer is deleted, runs
+  content never shares cookies or storage with Shep or with apps.
+- **The handle is opaque, not signed, and soft state.** Shep signs
+  nothing to authenticate anyone (§6.3), so a handle is 128 random bits,
+  prefixed with the ID of the front end that minted it. That front end
+  keeps what it stands for in memory: `handle → (app, actor, viewer,
+  file, token jti, expiry)`. The expiry is one hour by default, and never
+  later than the minting token's own expiry.
+  - **Using one.** The files host forwards the request to the named
+    front end over shep-rpc. If that front end is gone, the link 404s,
+    and the client library mints a fresh one.
+  - **Cost.** Minting is a memory write, and using a link is one RPC hop
+    to its front end. There are no WAL writes for handles. A restarted
+    front end loses its handles, which costs clients a re-mint.
+- **Links never cross universes.** A handle is looked up only in its own
+  universe, on its own files host.
+- **Using it.** The front end looks the handle up, rejects it if it's
+  missing or expired, checks that neither the actor nor the viewer is deleted, runs
   `can_op(app, actor, viewer, file)` (§6.8), and then redirects to a presigned `GET` whose expiry is the front end's clock plus one minute less `2ε`, so it works for at most one minute after the check (`AuthHorizon_presign`), or
   serves a small blob from its cache.
 - **Revoking access takes effect on the next use of the link.** The
   check runs at a version that contains the authorization horizon (§6.3),
-  so an actor removed from a channel, a deleted actor, or a revoked key
-  can't use a link given an hour earlier, within the revocation bound.
+  so an actor removed from a channel, or a deleted actor or viewer,
+  can't use a link given an hour earlier, within the revocation bound. A
+  revoked credential's links stop working when the minting token would
+  have expired, since a link never outlives it.
 - **A link is a bearer capability for up to an hour.** Anyone holding it
   can use it, as its actor, for as long as that actor can still read the
   file. Its expiry limits how long a leaked link works.
-- **The redirect is a residual capability.** Once the check passes, the
-  presigned `GET` it redirects to works without Shep for up to one minute,
-  for anyone holding it. Revocation can't reach it in that minute.
+- **The redirect is a residual capability.** Presigned S3 URLs are the
+  object store's own credential mechanism, not Shep authentication, and
+  Shep keeps using them. Once the check passes, the presigned `GET` it
+  redirects to works without Shep for up to one minute, for anyone
+  holding it. Revocation can't reach it in that minute. Proxy mode, and
+  strict revocation below, avoid presigned URLs entirely.
 - **Strict revocation, for sensitive fields.** It's an annotation in a
   policy file, not in the schema, so it deploys like any policy and
   applies to every version (§6.2):
@@ -7396,7 +7897,9 @@ when it is used.
   for active types such as HTML and SVG.
 - **Links expire; files don't.** The client libraries mint fresh links for
   files whose links are about to expire, so an app that holds a page of
-  messages for hours keeps working links. A live query mints links for
+  messages for hours keeps working links: for live queries, `reauth`
+  extends a subscription's handles to the new token's expiry (§6.3); for
+  other reads, `db.refresh_links(files)` re-mints them. A live query mints links for
   each subscriber in phase 2, because a link names its actor (§13.2).
 - **People.** `shep file get Issue:<key>.spec > spec.pdf` downloads as
   yourself (§7.2).
@@ -7682,10 +8185,9 @@ a causally closed version, like a materialized query (§12).
   its immutable ID, and its own blobs. Dropping a universe deletes them
   (§14.3). Test and dev universes start empty, like everything else in
   them: production content is never copied.
-- **Admission control (§15).** Uploads count against per-app quotas for
-  bytes uploaded and bytes stored, and downloads for bytes served. Begin
-  checks the quota against the declared size, so an over-quota upload is
-  refused before any bytes move.
+- **Admission control (§15).** Uploads are measured per app in bytes
+  uploaded and bytes stored, and downloads in bytes served, so per-app
+  byte quotas can be added when quotas are (open question 27).
 - **Quotas count what an app references.** An app's stored bytes are the
   sizes of the blobs its files point to, whether or not another app
   stored them first. Deduplication saves the universe storage, but never
@@ -7745,7 +8247,7 @@ Sources: [Slack upload URL](https://docs.slack.dev/reference/methods/files.getUp
 
 ```
 crates/
-  shep             Rust client: Db, actor handles (incl. as_token),
+  shep             Rust client: Db, token providers, actor handles,
                    bookmarks, primitives, subscriptions and feeds, batch,
                    shep::fanout (re-exports macros)
   shep-macros      #[shep::ops] (collects the operation set), query! and
@@ -7779,19 +8281,31 @@ crates/
   shep-version     dots, dotted version vectors, contexts, causal
                    frontiers and closing versions, token encoding, merge
                    and compaction, lineage across splits
-  shep-wal         the WAL: openraft groups per partition, log storage,
+  shep-raft        Shep's multi-raft, forked from openraft 0.10.0-alpha.37:
+                   openraft's engine and runtime (pipelined appends,
+                   heartbeat workers, submitted vs. flushed I/O), changed
+                   only where Redpanda differs: heartbeats batched per
+                   node pair, lightweight heartbeats, follower-admitted
+                   recovery, and the flush rules; each group on its
+                   owning core's runtime; one log per group
+  shep-wal         the WAL: Raft groups per partition on shep-raft, log storage,
                    leader validation (validation table over key ranges,
                    idempotency keys with failure records, void entries,
                    registry barriers, claim), field-operation resolution
                    with the last-value map, two-phase commit participant
                    and decisions, splits, segment archiving to the object
-                   store. Built (openraft 0.9, gRPC with tonic)
-  shep-wal-api     the WAL's gRPC service definitions: proposals with
+                   store; thread-per-core, one current_thread runtime per
+                   core, with node-local core assignment of replicas.
+                   Built on openraft 0.9; moving to shep-raft
+  shep-rpc         Shep's RPC, copied from Redpanda's (src/v/rpc): framing,
+                   pipelining with out-of-order responses, envelopes;
+                   an enum over the network and in-process transports
+  shep-wal-api     the WAL's RPC methods and envelopes: proposals with
                    key-range read and write sets, op and value records,
-                   outcomes, and the committed-entry tail stream
+                   outcomes, and long-poll fetch of committed entries
   shep-wal-client  the client front ends and readers use: proposing,
                    leader discovery and `not_leader` retries, re-sending
-                   with idempotency keys, and tailing
+                   with idempotency keys, and fetch-based tailing
   shep-value       a small shared value codec (scalars, lists, byte sizes
                    for size bounds), used by the WAL and shep-log, so the
                    WAL never depends on the delta format
@@ -7853,20 +8367,22 @@ crates/
                    its log, the per-node reconciler, the partition
                    balancer, founding and joins from the seed list, and
                    the metadata feed front ends cache
-  shep-control     each universe's meta partition: the registry (apps,
-                   schema names, versions, policies, operation sets),
+  shep-control     each universe's meta partition: the registry (versions,
+                   policies, operation sets; apps and schema names in
+                   production's),
                    registry barriers, the published frontier, universe
-                   creation from a base checkpoint, TTL reaper
-  shep-node        the binary: composes any set of components, all of them
-                   in one process (tests, local runs) or one role per
-                   process (WAL, materializer, search indexer, view
-                   maintainer, front end)
+                   creation from a base checkpoint, TTLs and heartbeats
+  shep-node        the binary: composes any set of components, from all
+                   of them in one binary on one node with replication
+                   factor 1 (a supported production deployment, and the
+                   test harness) to one role per process (WAL and
+                   controller, materializer, search indexer, view
+                   maintainer, front end, extraction)
   shep-cli         deploy; schema check / register / status / show; ops
                    check / show / status; gen ts; deps add /
                    update; dev (remote dev universes); policy show /
-                   matrix / explain / test; login / query /
-                   shell / get; file get / reprocess; top; app quota; key
-                   create; universe create / list / drop; log tail /
+                   matrix / explain / test; query /
+                   shell / get; file get / reprocess; top; universe create / list / drop; log tail /
                    export / replay; reading the named #[shep::ops]
                    module
 
@@ -7888,13 +8404,43 @@ Shep doesn't depend on Gel either. `shep-ql` copies Gel's tokenizer and
 uses its grammar as a reference, with attribution; Gel's type and
 cardinality inference is Python and isn't reused (§4.0).
 
-Stack: tokio, tower, axum, tonic (gRPC), openraft, slatedb, object_store,
-async-graphql (dynamic), tantivy, z3 (or easy-smt with an external
-solver), wasmtime, DBSP (Feldera's crate, or an in-house subset; §12).
+Stack: tokio, axum, shep-raft (forked from openraft), slatedb,
+object_store, async-graphql (dynamic), tantivy, z3 (or easy-smt with an external solver), wasmtime,
+DBSP (Feldera's crate, or an in-house subset; §12). No gRPC, tonic, or
+prost: internal RPC is Shep's own.
 
-Every component is a Tower service behind a trait, so the transport
-between them is a deployment choice: in-memory channels in one process,
-or the network.
+**Internal RPC, copied from Redpanda.** Components talk over `shep-rpc`,
+modeled on Redpanda's `src/v/rpc`, not gRPC:
+- **Frame.** A 26-byte little-endian header: version (1 byte), a
+  crc32c checksum of the rest of the header (4), compression (1),
+  payload size (4), the method ID on requests or a status on responses
+  (4), a correlation ID (4), and an xxhash64 checksum of the payload (8).
+- **Pipelining.** A connection carries many requests at once; responses
+  come back out of order, matched by correlation ID.
+- **Envelopes.** Payloads are serde-style envelopes: a `u8` version, a
+  `u8` compat_version (the oldest version a reader must understand), and
+  a `u32` size, then the fields. Fields evolve append-only: a newer
+  writer adds fields at the end, an older reader skips what it doesn't
+  know using the size, and a reader rejects an envelope whose
+  compat_version is newer than its own version. That's the whole
+  wire-compatibility rule between Shep's own processes.
+- **No streams.** There are no server streams. Anything that would be one
+  is a long-poll fetch, `(from_index, max_bytes, max_wait)`, as in
+  Kafka's fetch: log tailing by materializers, search indexers, view
+  maintainers, and front ends, and the feed between internal components
+  for live queries.
+- **Client-facing APIs keep their own transports:** the native protocol
+  over HTTP/2 for Rust clients, and GraphQL over HTTP and WebSockets for
+  browsers (§7.3, §7.4).
+
+**Enums, not traits.** Shep prefers enums and enum dispatch to traits,
+including for real and test implementations: the transport, the object
+store, the clock, the token verifier, and the like are each an enum with
+real and test variants (the verifier's test variant takes claims
+directly, §6.3). The topology, one process or many, is chosen
+separately from the variants (§9.6): a production single node uses the
+in-process transport with the real object store and verifier. Which
+variants exist in which builds is decided per case.
 
 ## 18. Milestones
 
@@ -7904,12 +8450,17 @@ or the network.
 2. **The WAL and materialization, in one process.** This replaces milestone
    1's Postgres storage while the code is small, because everything after
    it builds on the log and on versions:
-   - the WAL: openraft groups per partition, log storage, and leader
+   - the WAL: Raft groups per partition, log storage, and leader
      validation with the validation table (write sets entered at append),
      key-range read and write sets, idempotency keys with failure
      records, void entries, `not_leader`, `too_old`, and leader changes
-     (§10.3). **Built** (`shep-wal`, `shep-wal-api`, `shep-wal-client`,
-     `shep-version`)
+     (§10.3). **Built today** (`shep-wal`, `shep-wal-api`,
+     `shep-wal-client`, `shep-version`): those protocols on openraft 0.9,
+     a multi-threaded runtime, and gRPC with tonic
+   - **to replace what's built:** tonic with `shep-rpc` (§17); the
+     thread-per-core runtime with node-local core assignment (§3, §9.9);
+     `shep-raft` in place of openraft (§9.9); and `shep-controller`, the
+     WAL controller (§9.6)
    - materializers: SlateDB per partition, the key layout with stamps,
      applying entries, derived index entries and ghosts, causal
      frontiers, snapshot reads at a DVV, `at_least`, and restart from the
@@ -7925,8 +8476,9 @@ or the network.
    - per-field dots, links with their `l` keys, local index entries, ghost
      index entries, and ghost links, which come with the key layout, and
      derived `revision` and `updated_at` (§3)
-   - the single-process deployment, with in-memory transport and object
-     store, which every later milestone's tests use (§9.6)
+   - the single-node deployment, with the in-process transport and
+     in-memory object store variants, which every later milestone's tests
+     use (§9.6)
    - causal replay; the replay check carries over
 
    Tests to write here:
@@ -7942,10 +8494,10 @@ or the network.
    - a materializer crash mid-apply: it resumes from its applied index,
      and reads at every version match a fresh replay
    - N concurrent mutations on disjoint keys all commit without retries
-   - fault injection in the single-process deployment: worker death
+   - fault injection in the single-node deployment: worker death
      mid-claim, object-store stalls, leader changes during appends, and an
-     isolated front end that can't reach the system partition, which must
-     fail closed (§6.3)
+     isolated front end that can't reach a meta partition's leader, which
+     must fail closed (§6.3)
 
    **Exit criterion: one vertical slice.** Mutations, snapshot reads, one
    live query, and recovery after each injected fault, end to end, with
@@ -8028,12 +8580,10 @@ or the network.
    - **Actors, viewers, and keys.** Viewer types, requests carrying (app,
      actor, viewer), per-schema `global actor` declarations, deleted
      actors and viewers, actor types in operation sets, policy functions,
-     policy pins, and shared abstract policy types (§6.1), actor handles including `as_token`
-     and `.by()` (which brings SSO token verification forward from
-     milestone 12), agent registration and two-party act-for keys,
-     bookmarks with separate write positions, API keys
-     with permissions and actor-bound keys that carry their viewer,
-     universes picked by key (§6.3), and `shep deploy`.
+     and policy pins (§6.1); bearer-token verification against the auth
+     service's JWKS, with claims, scopes, and expiry, and actor handles
+     with token providers (§6.3, §7.3); bookmarks with separate write
+     positions; universes picked by token; and `shep deploy`.
    - **The test harness,** with `seed` and the working tree's policies.
 5. **Transactions.** Transaction IR, ShepQL mutations (ShepQL phase 3:
    DML, `assert` ordering, `if`, `unless conflict`, patch merging, key
@@ -8070,7 +8620,7 @@ or the network.
    - Resource accounting per request: task CPU time, the tracking
      allocator, and materializer and WAL statistics.
    - Cost models corrected by measurement, execution budgets, connection
-     caps, per-app quotas, adaptive concurrency limits per partition, and
+     caps, adaptive concurrency limits per partition, and
      priority classes.
    - The overload errors, and retry budgets in the clients.
    - Load tests past saturation.
@@ -8134,21 +8684,21 @@ or the network.
 12. **GraphQL, TypeScript, and people.**
     - GraphQL per operation set, with documents as operations, served JS
       modules, offline TypeScript generation (`shep gen ts`) from
-      `.edgeql` files (ShepQL phase 4), end-user token auth from browsers (token verification
-      itself lands in milestone 4), and GraphQL subscriptions for live
-      queries.
-    - Ad-hoc sessions: `shep login`, `shep query` and `shep shell` in
-      ShepQL, `shep get`, and GraphiQL, in their own admission class.
+      `.edgeql` files (ShepQL phase 4), browser tokens from the auth
+      service (verification itself lands in milestone 4), and GraphQL
+      subscriptions for live queries.
+    - Ad-hoc sessions: `shep query` and `shep shell` in ShepQL, `shep
+      get`, and GraphiQL, in their own admission class.
     - The Slack clone's browser front end subscribes to live queries
       directly.
 13. **Distribution and scale-out.**
     - **Components in their own processes.** The WAL cluster with many
       Raft groups per node, materializers with replicas, search indexers,
       view maintainers, and front ends, deployed separately, with the
-      system partition on seed nodes (§9.6).
+      WAL controller on every WAL node, founded from the seed list (§9.6).
     - **Many partitions per universe.** Routing from keys, the partition
       map, splits at group boundaries by size and load with the placement
-      controller, closing versions across partitions, the published
+      balancer on the WAL controller, closing versions across partitions, the published
       frontier (§9.7), and live-query topology: topic routing and stepping
       by partition (§13.3).
     - **Two-phase commit (§8).** One dot per transaction, read-only
@@ -8174,6 +8724,44 @@ or the network.
     - the solver-backed policy checks: writer lockout, diff reports as
       `(∨A) ∧ ¬(∨D)`, and proofs of property tests
 
+**Testing.** Shep's tests follow one layout: no unit tests; each crate's
+tests in `crates/<c>/tests`, against its public API; end-to-end tests in
+`tests/test-<aspect>`, against `shep-node`. Where another project has
+already written the tests a component needs, Shep imports or adapts them
+rather than writing new ones. Deterministic simulation isn't used for
+now: the TLA+ specs, imported suites, and fault-injection tests cover
+that ground.
+- **Raft (`crates/shep-raft/tests`).** openraft's whole test suite is
+  vendored in the fork, engine and integration tests alike, and all 837
+  pass. Redpanda's Raft tests (`src/v/raft` tests: leadership transfer,
+  replication with failures, configuration changes, recovery, and
+  heartbeat batching) are ported where they test what the fork changes:
+  batched heartbeats, flush rules, and follower-admitted recovery.
+- **RPC (`crates/shep-rpc/tests`).** Redpanda's `src/v/rpc` tests:
+  framing and checksums, out-of-order responses, envelope versioning and
+  compat_version, timeouts, and connection loss mid-request.
+- **Controller (`crates/shep-controller/tests`).** Adapted from Redpanda's
+  `src/v/cluster` tests for the topic table, members table, controller
+  backend reconciliation, partition moves, and cluster discovery, plus
+  Shep's own split commands.
+- **WAL (`crates/shep-wal/tests`).** The configurations of
+  `WalValidate.tla`, `TwoPhase.tla`, and `FrontierMaterialize.tla`, each
+  as a test, and Jepsen-style histories checked with Elle for
+  serializability under injected faults.
+- **SlateDB and Tantivy.** Their own suites run in CI against the pinned
+  versions (§19).
+- **End to end (`tests/test-<aspect>`).** By aspect: `test-replay`,
+  `test-privacy`, `test-live`, `test-files`, `test-search`,
+  `test-cutover`, `test-faults`, and `test-single-node`.
+- **The single-node deployment is tested as a deployment.**
+  `tests/test-single-node` runs the full binary with replication factor
+  1 as production would, over a local-directory object store: restart
+  and recovery from the local log and the archive, a split with both
+  children on the node, growing to three nodes by joins and moves, and
+  the same consistency checks as the multi-node suites. Every other
+  end-to-end suite also runs against it, since it's the harness's
+  default.
+
 **ShepQL phases.** The language (§4.0) lands across milestones:
 
 - **Phase 0 (design, now).** The dialect spec (§4.0, §21), the policy
@@ -8187,8 +8775,9 @@ or the network.
     back: EdgeQL for queries and mutations only, with a smaller
     Shep-designed syntax for schemas and policies.
   - **Negative tests,** each a mistake this design's own drafts made:
-    `assert(global viewer in ch.members)` where the viewer can be absent
-    (must say: not One; suggest `?? false`); writing `i.project` from a
+    `assert(i.assignee = global viewer)`, where the assignee can be
+    absent (must say: not One; suggest `?? false`), and `?? false` on
+    `global viewer in ch.members` (must flag it as redundant); writing `i.project` from a
     key-cast issue into a required link (optional, unless proven visible,
     §4.1.1); `<optional Issue>$issue` passed to a single-target update;
     `global actor` written to an `agents::Agent` link without
@@ -8226,10 +8815,44 @@ knowing a hash grants nothing, §16.3), and `LiveRevocation.tla` checks
 that revocations and deleted actors and viewers reach live streams
 before any later push (§13.2).
 
-**Specs in progress**, in `formal/tla`: `WalValidate.tla` (validation,
-leader change, idempotency), `Split.tla` (splits, lineage, and the
-physical winner, SR-1), and `RegistryBarrier.tla` (barriers and
-backfill).
+**Specs in progress**, in `formal/tla`:
+- `SegmentLog.tla`: one group's segment log and kvstore through crashes:
+  the three offsets, suffix and prefix truncation, the clean-shutdown
+  marker, and snapshot install, with reader configs for concurrent reads
+  against the `truncating` flag and epoch, checking that no read mixes
+  sides of a truncation (§9.9).
+- `RaftDriver.tla`: `shep-raft`'s runtime with the fork's changes:
+  pipelined appends, commit over flushed offsets clamped to the term,
+  batched heartbeats, prevote and stickiness, and follower-admitted
+  recovery (§9.9).
+- `CoreMove.tla`: moving a replica between cores with persisted
+  markers, crashes between steps, and a core-count change at restart
+  (§9.9).
+- `ControllerReconcile.tla` and `Split.tla`: the controller fold, moves
+  with cancellation, vnode revisions, and the split protocol with `p`'s
+  log deciding between the split entry and `split_aborted`, routing from
+  the split entry, and handoff by any later leader (§9.6). `Split.tla`
+  also covers lineage and the physical winner (SR-1); its earlier
+  version modeled the placement controller in the meta partition.
+- `RegistryBarrier.tla` (barriers and backfill).
+- A re-run of `WalValidate.tla` with validation and append as one atomic
+  step, as `shep-raft` does them, to check whether the void-entry rule
+  (§9.1) is still needed, and the fast path for client-visible failures
+  (§10.3), which is pending re-check against `_fail` and `_probe`.
+
+`WalValidate.tla` (one partition's Raft group with elections,
+truncation, and snapshot install, under §10.3's validation, idempotency,
+`too_old`, retries, and claims with leases, §8, §10.3) is checked: seven
+configs pass, up to 15.5M distinct states, and its failing configs are
+the counterexamples behind §10.3's rules: write sets entered at append
+(`_c1`, `_claim_c1`), the window after truncation (`_trunc`; the fix
+`_truncfix` passes), failures reported through the anchor (`_fail`,
+`_probe`), the idempotency check for claims (`_claim_idem`), and the
+necessity of rebuilding on leader change, checking idempotency at
+append, range predicates, `too_old`, and the lease fence (`_norebuild`,
+`_idemcommit`, `_norange`, `_notooold`, `_claim_nofence`). Findings are
+in `formal/tla/FINDINGS-wal.md`. It doesn't model two-phase commit,
+barriers, splits, membership changes, pipelining, or real time.
 
 `TwoPhase.tla` (two-phase commit with anchor homes, deadlines,
 forgetting with lookahead, read intents, barriers, and splits, §8) is
@@ -8256,6 +8879,11 @@ system partition; `Bootstrap_selfmember`). Findings are in
 `formal/tla/FINDINGS-live-bootstrap.md`, including how app and schema
 names flow between fleets: registered in production first, and only
 followed elsewhere (§14.1, `Bootstrap_forward`, `Bootstrap_local`).
+`Bootstrap.tla` models the old system partition on seed nodes; it needs
+updating for the controller group on every WAL node, founded from the
+static seed list and changed only through its own joint consensus
+(§9.6). The name-flow results carry over, with production's registry in
+place of its system partition.
 
 `AuthHorizon.tla` (the authorization horizon, §6.3) is also checked. With
 the fixes above it passes. Its failing configs are the counterexamples
@@ -8265,7 +8893,10 @@ deadline on proposals and decisions (`_inflight`, `_reuse`), and the
 presigned expiry (`_presign`). Findings are in
 `formal/tla/FINDINGS-auth-horizon.md`. The model predates the
 credential-based actor model (§6.3): its `map` partition corresponds to
-the viewer's partition. Its `AuthHorizon_viewerapponly*` configs model
+the viewer's partition. Its `sys` partition's key-revocation case is
+superseded: credential revocation is the auth service's, bounded by
+token expiry, and Shep keeps no key state to tail (§6.3). Its
+`AuthHorizon_viewerapponly*` configs model
 the old rule that an app-only allow matches only the app acting as
 itself, which §6.1 drops; they're kept as history.
 
@@ -8306,26 +8937,27 @@ are in `formal/tla/FINDINGS-cutover.md`. It models a tightening step only.
 - `Planner.lean`: skipping a Stable guard preserves outcome-serializability
   (`outcome_serializable`, `readAt_le_serial`, `stab_upClosed`), and a
   guard over a mutable lifecycle doesn't (`mutableLifecycle_unsound`)
-  (§7.6). **Needs restating:** its `Guard`/`geval` model CEL's
-  error-absorbing `&&` and `||`; under ShepQL guards are two-valued
-  (§6.1), so `geval`, `GStab`, and `stab_upClosed` are restated over
-  `Bool`. The proofs should get shorter.
+  (§7.6). Restated over `Bool` for ShepQL's two-valued guards
+  (`gstab_sound`, `stab_neg_closed`; `trueDefault_unsound`).
 - `LeaderOps.lean`: the context rule, with either context form, gives
   every condition of `wf_stateAt_closed` (`leader_wf`, `ctx_closed`,
   `selfPrefix_closed`, `ctx_pathDisjoint`); resolution at the log
   position never crosses a bound under pipelining (`bounded_leader`);
   counterexamples `ctxOmitPrev_not_set`, `unrecordedRemoval_not_set`,
   `committedResolve_crosses_bound` (§8, §9.5, §10.3)
-- `Polarity.lean`: a decision that isn't RevocationSensitive never
-  over-grants when stale (`vis_mono`, `history_admit_mono`);
-  counterexamples `denyMutable_overgrants`, `ignoreVisible_overgrants`,
-  `denyDelegate_overgrants`, `allowError_overgrants` (§6.1, §7.6).
-  **Needs restating:** its `Cond` uses CEL's error absorption, its
-  `evalRules` is ordered first-match, and `ErrMode` chooses how errors
-  count. Under ShepQL, conditions are two-valued and `evalRules` is
-  `(∨A) ∧ ¬(∨D)`; `ErrMode` goes, and `allowError_overgrants` becomes
-  moot, since there are no errors. RevocationSensitive drops "earlier"
-  from its deny condition (§7.6).
+- `Polarity.lean`, restated for union minus deny and two-valued guards,
+  with every allow Stable: a decision that isn't RevocationSensitive
+  never over-grants when stale, with or without a viewer (`vis_mono`,
+  `history_admit_mono`, `fieldVis_mono`); counterexamples
+  `denyMutable_overgrants`, `allowMutable_overgrants`,
+  `ignoreVisible_overgrants`, `denyDelegate_overgrants`,
+  `fieldDenyMutable_overgrants`; polarity through `not`
+  (`port_visible_safe`, `port_safe`) (§6.1, §7.6). The CEL model is in
+  `PolarityCEL.lean`, superseded.
+- `Totality.lean`, `PolicyCombine.lean`, `Checks.lean`,
+  `PatchMerge.lean`, `LeaderOps.lean`'s `FieldOps`, and
+  `PlaceholdersQL.lean`: the ShepQL restatement round's other results,
+  listed with the obligations below.
 - `Disciplines.lean`: front-end discipline checks keep frozen facts at
   their creation value and permanent lifecycles unretracted
   (`frozen_eq_creation`, `present_mono`, `ty_unique`); counterexample
@@ -8335,13 +8967,24 @@ are in `formal/tla/FINDINGS-cutover.md`. It models a tightening step only.
 from each participant's validation to the validity of a two-phase
 commit's merged delta; the planner results with more than one partition,
 including cross-partition expansion of the self-prefix flag; a pending
-`prevₖ` that is a prepared two-phase commit intent; `claim`; and the link
+`prevₖ` that is a prepared two-phase commit intent; `claim`; the link
 between the key-value check `Planner.Respects` and the fact-level checks
-`FrozenOK`/`PermOK` (argued, not proven).
+`FrozenOK`/`PermOK` (argued, not proven); function inlining and
+`shep::walk`'s `stop_at` in the totality model; guards that read other
+nodes' fields in `Polarity.lean`; int64 overflow in leader operations;
+and the liveness of the work
+queue, which `WalValidate.tla` couldn't check. A claimed task eventually
+completes only if workers retry after an empty claim, a lease lasts
+longer than a task's completion time plus clock skew, and every leader
+runs the lease sweeper (§8).
 
 **Still to write:** `claim` leases (§8), shape-changing cutover steps
-(§4.2), and the interactions two-phase commit × registry barrier and split
-× registry barrier. For the
+(§4.2), the interactions two-phase commit × registry barrier and split
+× registry barrier, and a **controller-reconciler spec** (§9.6): the
+controller log's start and finish commands, every node's reconciler
+creating and removing replicas, a crash between start and finish, a new
+controller leader resuming a split or move with fresh balancer state,
+and replicas fenced by their creation revision. For the
 consistency planner (§7.6), the TLA+ parts: skipping Stable guards
 across partitions, field operations under pipelining with leader changes,
 and the two-step rollout of a discipline weakening (`Planner.tla`, in
@@ -8378,7 +9021,9 @@ protocols rely on, and this revision's rules cite it:
   content, given that field policies don't read hideable fields; corpus
   statistics do leak it (§16.6)
 - `Principals.lean` (supersedes the mapping part of
-  `ViewerMapping.lean`): credentials fix the actor and the viewer. Proven
+  `ViewerMapping.lean`): credentials fix the actor and the viewer. These
+  results are about `(actor, viewer)` as a credential states them, so
+  they hold unchanged with tokens from an external auth service. Proven
   in both its first-match model and its `UMD` model (union minus deny,
   two-valued guards, an atom on an absent principal false):
   `canOp_deleted_actor`, `canOp_deleted_viewer`,
@@ -8393,41 +9038,52 @@ protocols rely on, and this revision's rules cite it:
     or `or`, so the per-atom rule is proven only for them; and its
     `appOnly` guards and `canOp_appOnly_with_viewer` model the app-only
     rule §6.1 drops.
+  - Its `Issuance` section (two-party act-for keys,
+    `actfor_key_two_party`, `bound_key_inert`) models key issuance inside
+    Shep, which is now the auth service's, and is kept as history.
   - `LiveRevocation.tla`, `LiveFrontier.tla`, and `AuthHorizon.tla` still
     need updating to the credential model.
 
 **Obligations for the Lean restatement round (§4.0, §6.1, §8):**
 
-1. **Restate `Polarity.lean`** for two-valued guards and union minus
-   deny: drop `ErrMode` and `allowError_overgrants`, and use
-   RevocationSensitive's v1 form, every allow Stable (§7.6).
-2. **Restate `Planner.lean`**: `geval`, `GStab`, and `stab_upClosed` over
-   `Bool`.
-3. **The per-atom absent-principal rule,** with `not`, `and`, and `or`:
-   extend `Principals.lean`'s `UMD` guards and re-prove its results,
-   dropping the app-only guards. Show `exists global viewer` behaves as
-   an ordinary atom.
-4. **Totality inference is sound:** a guard the checker types One
-   evaluates to exactly one boolean on every state, so decisions are
-   two-valued.
-5. **Field-level combination:** `type_allowed ∧ (no field allows ∨
-   ∨A_f) ∧ ¬∨D_f` is default deny for fields with allows, and never
-   grants a field operation the type denies (§6.1).
-6. **The check encoding:** a check holds iff `¬defined ∨ value`, and the
-   SMT option-lifting agrees with ShepQL's element-wise empty-set
-   semantics on the subset (§4.5).
-7. **Patch merging ≈ PutPut through lenses:** merging a mutation's
-   patches to one node, then applying them through a version's lens,
-   equals applying them in sequence (§8, §4.4 law 5).
-8. **Leader operations equal the evaluator:** each op in §8's table,
-   applied to a base value including `{}`, gives what the evaluator
-   computes from its form.
-9. **Placeholders, again.** Re-establish `query_placeholder_eq_absent`'s
-   premise ("nothing reads `@placeholder`") for ShepQL's `exists`,
-   `.__type__`, and key casts that are `{}` for placeholders.
-10. **The Ent porting rewrite** (optional, it backs advice in §6.1):
-    ordered first-match equals union minus deny after `D'_j = D_j ∧
-    ¬(∨_{i<j} A_i)`.
+Every file uses only the axioms `propext`, `Classical.choice`, and
+`Quot.sound`; findings are in `formal/lean/FINDINGS.md`, "ShepQL
+restatement round".
+
+1. **Done: `Polarity.lean` restated** for two-valued guards and union
+   minus deny, with every allow Stable (`vis_mono`, `history_admit_mono`,
+   `fieldVis_mono`; counterexamples `denyMutable_overgrants`,
+   `allowMutable_overgrants`, `ignoreVisible_overgrants`,
+   `denyDelegate_overgrants`, `fieldDenyMutable_overgrants`; polarity
+   through `not`, `port_visible_safe`, `port_safe`). The CEL model is
+   kept as `PolarityCEL.lean`, superseded; `ErrMode` and
+   `allowError_overgrants` no longer apply.
+2. **Done: `Planner.lean` over `Bool`** (`gstab_sound`, `stab_upClosed`,
+   `stab_neg_closed`; counterexample `trueDefault_unsound`, §7.6).
+3. **Pending: the per-atom absent-principal rule** over `Principals.lean`'s
+   `UMD` guards, with `not`, `and`, and `or`, dropping the app-only
+   guards. (The typing side is done: `viewerIn_one`,
+   `viewerIn_not_differs` in `Totality.lean`.)
+4. **Done: totality inference is sound** (`decision_two_valued`,
+   `card_sound`, `total_eval` in `Totality.lean`; `placeholder_hop_not_total`).
+5. **Done: field-level combination** is default deny and never exceeds
+   the type (`field_default_deny`, `field_le_type`,
+   `field_type_default_deny` in `PolicyCombine.lean`; `field_not_replace`,
+   `first_field_allow_narrows`, §6.1).
+6. **Done: the check encoding** (`enc_agrees`, `check_iff`, `guard_iff`
+   in `Checks.lean`; `ite_naive_disagrees`, §4.5).
+7. **Done: patch merging ≈ PutPut** (`merge_eq_seq`, `mergeAll_perm` in
+   `PatchMerge.lean`; `merge_accepts_invalid_prefix`, §8).
+8. **Done: leader operations equal the evaluator** (the `*_eq` theorems
+   and `resolved_eq_eval_at_logpos` in `LeaderOps.lean`, `FieldOps`;
+   `optionalArg_unsets`, `max_optionalArg_unset`, `add_max_not_comm`,
+   §8).
+9. **Done: placeholders read as absent in ShepQL,** in both read
+   contexts (`evalQ_placeholder_eq_absent`, `typeFact_eq` in
+   `PlaceholdersQL.lean`; the premise is necessary,
+   `lifecycleExists_distinguishes`).
+10. **Done: the Ent port is exact** (`port_exact`, `port_denies_first`,
+    `port_entDefault` in `PolicyCombine.lean`, §6.1).
 
 The TLA+ models are protocol models with no dependence on the policy or
 query language, and are unaffected.
@@ -8441,16 +9097,25 @@ DBSP, and adapters.
   storage instead of inheriting them from Postgres. Correctness under
   crashes, partitions, and leader changes is where storage systems spend
   their lives. The mitigation is TLA+ specs for every distributed protocol
-  before its code (§18), deterministic simulation of the single-process
-  deployment with injected failures, and the replay check on every test
-  universe.
-- **openraft and SlateDB maturity.** Both are young. Shep depends on
-  openraft's correctness under membership changes and on SlateDB's
+  before its code (§18), fault-injection tests of the single-node and
+  multi-node deployments, imported test suites, and the replay check on
+  every test universe. Deterministic simulation isn't used for now.
+- **Owning Raft, and SlateDB's maturity.** `shep-raft` is a fork of
+  openraft 0.10 with targeted changes (heartbeat batching, recovery
+  admission, flush rules), not a new runtime, so the risk is smaller
+  than owning a Raft implementation: Shep owns the changed parts, and
+  all of openraft's 837 tests pass in the fork, with Redpanda's Raft
+  tests ported for the changes (§18). SlateDB is young. Shep depends on SlateDB's
   compaction, checkpoints, and object-store behavior. Shep's compaction
   needs to keep each key's newest version and every ghost while dropping
   older versions (§3), which may need a compaction hook upstream. Pin
   versions, run their test suites in CI, and keep both behind Shep's own
-  traits.
+  enums or narrow wrapper types.
+- **A single node's recovery point.** A single-node deployment loses
+  everything committed since the last archived segment if its disk dies,
+  and everything if the object store shares the disk (§9.6). Archiving
+  by age bounds the loss to about a second with an object store
+  elsewhere; installations that can't accept even that need three nodes.
 - **Read latency on cache misses.** SlateDB serves reads from memory and
   local disk caches, but a miss goes to the object store, which takes tens
   of milliseconds. Hot partitions need warm caches and materializer
@@ -8464,12 +9129,15 @@ DBSP, and adapters.
   waits for the release. The home partition decides, so a coordinator
   crash can't block forever, but an unavailable home holds intents for as
   long as it's unavailable: the prepare timeout only starts recovery (§8).
-  A split of a partition holding prepares waits for them too, so writes
-  continue but the split can't (§9.6). Placement keeps two-phase commits rare, and `shep ops check`
+  A split of a partition holding prepares waits for them too: while it
+  drains, new two-phase commits touching the partition get a retryable
+  `splitting` and wait, single-partition writes continue, and the split
+  can't proceed until the prepares are released (§9.6). Placement keeps two-phase commits rare, and `shep ops check`
   names every operation that can need one, including those that only
   validate reads in another group.
 - **Splits.** Moving a key range to new partitions has to keep stamps,
-  versions, and the partition map consistent while writes continue.
+  versions, and the partition map consistent while writes continue, with
+  the decision split between the parent's log and the controller.
   `Split.tla` specifies it (§18). Merges and splits inside
   a group are left out of v1 to keep it small.
 - **Giant groups.** A placement group lives in one partition, so its write
@@ -8500,10 +9168,18 @@ DBSP, and adapters.
   materializer falls behind holds back every view and topic whose
   versions name it. Alert on frontier lag per partition, and keep
   materializer replicas for hot partitions.
-- **Revocation isn't instant.** A deleted actor or a revoked key stops
-  working within the revocation bound (§6.3), on requests and live streams
-  alike, not at once. Keep the bound small, and alert when front ends'
-  tails or materializers fall behind their leaders.
+- **Revocation isn't instant.** A deleted actor or viewer stops working
+  within the revocation bound (§6.3), on requests and live streams alike,
+  not at once. Keep the bound small, and alert when front ends' tails or
+  materializers fall behind their leaders.
+- **A revoked credential lasts until its tokens expire.** Shep keeps no
+  revocation list (§6.3, open question 26), so a leaked token works for
+  its whole lifetime, and so do download links it minted. Keep token
+  lifetimes to minutes.
+- **The auth service is a dependency.** Shep can't authenticate anyone
+  without its public keys, and clients can't refresh tokens without it.
+  Shep caches the JWKS and keeps accepting tokens signed with cached keys
+  while the auth service is down; new tokens wait for it.
 - **Change-query coverage and cost.** Live queries and `observe` are only
   as useful as the
   set of queries the planner can incrementalize, and as cheap as their
@@ -8755,10 +9431,10 @@ DBSP, and adapters.
     checked registry change, or should declaring one always be an
     author's decision?
 23. **Agents with no user.** An agent that works for no one, such as a
-    scheduled maintenance agent, needs a key bound `--for self` or
+    scheduled maintenance agent, needs a token whose viewer is itself, or
     `global actor` policies in every schema it uses (§6.3). Is that
-    enough, or should apps be able to register agents as viewers in their
-    own right, with their own grants?
+    enough, or should agents be viewers in their own right, with their
+    own grants?
 24. **The dialect's name.** ShepQL is a working name, chosen so the
     language doesn't imply compatibility with Gel or EdgeQL, whose
     trademark status is unverified (§4.0, §19). The file extensions
@@ -8770,6 +9446,24 @@ DBSP, and adapters.
     skip the data-partition horizon, but the argument is per row: a stale
     snapshot might admit a row through a different, mutable allow. Is the
     refinement worth its proof?
+26. **A token revocation list.** Shep honors a token until it expires
+    (§6.3), so revoking a leaked credential takes up to a token's
+    lifetime. Should Shep also accept an optional revocation list from
+    the auth service, such as revoked `jti`s or a "not before" time per
+    app or subject, pushed or polled, and folded into the horizon? It
+    would bound revocation like a registry change, at the cost of a
+    dependency on the auth service's availability.
+27. **Quotas.** Admission control measures every request by the token's
+    `client_id` claim (§15), but how per-app and per-user quotas are configured,
+    stored, and enforced, and whether the auth service or Shep owns them,
+    is open. Open question 7 (quota units) depends on it.
+28. **Own multi-raft core.** Decided: `shep-raft`, a fork of openraft
+    0.10's engine and runtime, changed where Redpanda differs (§3, §17).
+    Whether its atomic validate-and-append removes the void-entry rule is
+    being checked (§9.1, §18).
+29. **Controller voters.** Every WAL node is a controller voter (§9.6).
+    Should voters be capped at 5, with other nodes as learners that still
+    hold the whole state, as large Redpanda clusters do?
 
 ## 21. Appendix: ShepQL reference
 

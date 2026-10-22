@@ -1,6 +1,6 @@
 [package]
 name = "shep-wal-api"
-description = "The WAL's client protocol: gRPC definitions and the types around them"
+description = "The WAL's client protocol: messages and method ids on shep-rpc"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,12 +8,11 @@ publish.workspace = true
 
 [dependencies]
 bytes.workspace = true
-prost.workspace = true
+shep-codec.workspace = true
+shep-rpc.workspace = true
 shep-version.workspace = true
 thiserror.workspace = true
-tonic.workspace = true
-tonic-prost.workspace = true
 
-[build-dependencies]
-protox.workspace = true
-tonic-prost-build.workspace = true
+[dev-dependencies]
+shep-codec.workspace = true
+shep-rpc.workspace = true

@@ -528,3 +528,128 @@ a frozen field that was unset at creation.
 - the two-step weakening rollout
 - `claim`
 - a formal link between `Planner.Respects` and `Disc.FrozenOK`/`PermOK`
+
+## ShepQL restatement round (§4.0, §6.1, §8, §18)
+
+The files in this round:
+- `ShepZSet/PolicyCombine.lean`
+- `Polarity.lean`, restated (the old CEL model is in `PolarityCEL.lean`, superseded)
+- `Planner.lean`
+- `Totality.lean`
+- `Checks.lean`
+- `PatchMerge.lean`
+- `LeaderOps.lean`, its `FieldOps` section
+- `PlaceholdersQL.lean`
+
+Every theorem uses only the axioms `propext`, `Classical.choice` and `Quot.sound`. The per-atom obligation in `Principals.lean` (§18 item 3) is handled separately.
+
+### Q1. Polarity under union minus deny, with every allow Stable
+
+**Result** (`vis_mono`, `history_admit_mono`).
+- **Combination model:** guards are two-valued, and a decision is `(∨A) ∧ ¬(∨D)`.
+- **Conditions:** the type is permanent; its `contained_in` link is frozen, with a permanent container; every allow is Stable⁺; and every deny is Stable⁻.
+- **Then:** a stale read decision never over-grants, whether the viewer is present or absent. The same holds for field decisions (`fieldVis_mono`).
+- `ErrMode` and `allowError_overgrants` no longer apply, because ShepQL guards can't error.
+- **Counterexamples:** `denyMutable_overgrants`, `allowMutable_overgrants`, `ignoreVisible_overgrants`, `denyDelegate_overgrants`, `fieldDenyMutable_overgrants`.
+
+**Precision** (`port_visible_safe`). Polarity is tracked through `not`, so `not shep::visible(…)` inside a deny is Stable⁻ when the `visible` is Stable⁺.
+- §7.6 says "`shep::visible` inside a deny is RevocationSensitive outright". That is sound, but it makes every Ent-ported policy whose earlier allow uses `visible` RevocationSensitive.
+- The port actually preserves stability (`port_safe`).
+
+### Q2. Planner guards over `Bool`; a `??` default reads the lifecycle
+
+**Result** (`gstab_sound`, `stab_upClosed`, `stab_neg_closed`).
+
+**Counterexample** (`trueDefault_unsound`). Take `assert((x.f = 1) ?? true)` with `f` readonly.
+- At `S`, `x` doesn't exist yet, so the assert is true.
+- At the log position after `x` is created with `f = 2`, it is false.
+
+So the default reads the lifecycle of the node on its left side:
+- in a Stable⁺ position the default must be `?? false`;
+- in a Stable⁻ position it must be `?? true`.
+
+### Q3. Decisions are two-valued
+
+**Result** (`decision_two_valued`, `card_sound`, `total_eval`). A guard with no partial calls whose inferred cardinality is One evaluates to exactly one boolean.
+
+**Finding: principal atoms.**
+- Under the per-atom rule, `global viewer in s` is One (`viewerIn_one`).
+- Under plain EdgeQL it is AtMostOne (`inViewer_opt`).
+- The two readings agree on the atom alone (`viewerIn_eq_coalesce`) but differ under `not` (`viewerIn_not_differs`).
+
+**Finding: placeholders in policies** (`placeholder_hop_not_total`). A hop through a `required` link to a placeholder-capable type is AtMostOne when read in a policy.
+
+### Q4. Field policies are default deny, and never exceed the type
+
+**Result** (`field_default_deny`, `field_le_type`, `field_type_default_deny`).
+
+**Findings.**
+- The doc's "a field with allows replaces the type's allows" doesn't match the formula (`field_not_replace`).
+- A field's first allow can narrow access (`first_field_allow_narrows`); later allows only widen it.
+
+### Q5. Checks and the SMT option-lifting
+
+**Result** (`enc_agrees`, `check_iff`, `guard_iff`). A check holds iff `¬defined ∨ value`; a guard holds iff `defined ∧ value`.
+
+**Finding** (`ite_naive_disagrees`). `if … else` is defined when its condition is defined and so is the branch it chooses.
+
+### Q6. Patch merging is PutPut
+
+**Result** (`merge_eq_seq`, `mergeAll_perm`). Merging a mutation's patches equals writing them in sequence when every intermediate view is valid.
+
+**Note** (`merge_accepts_invalid_prefix`). The merge is the semantics.
+
+### Q7. Leader field ops equal the evaluator
+
+**Result** (`*_eq`, `resolved_eq_eval_at_logpos`). Each op gives the evaluator's result for every base value, including `{}`.
+
+**Findings.**
+- `e` must have cardinality One (`optionalArg_unsets`, `max_optionalArg_unset`).
+- Ops of different kinds on one field don't commute (`add_max_not_comm`).
+
+### Q8. Placeholders read as absent in ShepQL
+
+**Result** (`evalQ_placeholder_eq_absent`, `typeFact_eq`). This holds in both read contexts, for key casts, hops, `.__type__`, field reads, `exists` and `shep::visible`. The premise is necessary (`lifecycleExists_distinguishes`).
+
+### Q9. The Ent port is exact
+
+**Result** (`port_exact`, `port_denies_first`).
+- Ordered first-match with default deny equals union minus deny once each deny is rewritten as `D'_j = D_j ∧ ¬(∨_{i<j} A_i)`.
+- Ent's own default needs a final `allow true` (`port_entDefault`).
+
+### Not proven
+
+- function inlining, and `shep::walk`'s `stop_at`, in the totality model
+- guards that read other nodes' fields, in `Polarity.lean`
+- the per-atom rule over `UMD`, in `Principals.lean`
+- int64 overflow in leader ops
+
+## Principals (`Principals.lean`)
+
+Every theorem uses only `propext`, `Classical.choice` and `Quot.sound`.
+
+- **Pre-checks.** A request is denied on every node, under every policy and app, when its actor or viewer is deleted, or its viewer is of another type (`canOp_deleted_actor`, `canOp_deleted_viewer`, `canOp_wrongtype_viewer`). Declared actors are enforced (`actorsDecl_enforced`).
+- **Absent principals, per atom.**
+  - With no viewer, a guard equals the same guard with its viewer atoms set to false, under `not`, `and` and `or`; the same holds for the actor (`eval_absent_viewer`, `eval_absent_actor`).
+  - This agrees with applying `?? false` to the whole guard on a bare atom, and whenever both principals are present (`viewerAtom_eq_coalesce`, `evalSet_present`). The two differ under `not` (`viewerAtom_not_differs`, `actorAtom_not_differs`).
+  - Consequence: `allow (not (global viewer in .blocked))` admits the app acting as itself (`negated_viewer_allow_admits_asApp`).
+- **App-only access.** `app = slack and not exists global viewer` admits exactly the app acting as itself (`appOnly_allow_exact`). Without the second atom, an agent acting for a user also gets the grant (`appAllow_without_noviewer_admits_viewer`).
+- **`shep::visible` keeps the viewer** (`visible_preserves_viewer`). Into a schema with another viewer type, it denies (`visible_crosstype_denies`).
+- **Act-for never amplifies** (`canOp_actfor_no_amplification`). It holds under `ActForOK`: at every node reachable through `visible`,
+  - the user passes the actors declaration;
+  - actor atoms only move toward the user;
+  - `visible` is positive in allows and negative in denies.
+
+  `actForOK_of_actorless` gives a syntactic sufficient condition. With no actors declared, the agent can do exactly what the user can (`canOp_actfor_eq_undeclared`).
+- **Counterexamples to act-for.** Each of these amplifies:
+  - an allow on the actor (`actorAllow_amplifies`);
+  - a deny on the viewer's own type (`actorDeny_on_self_amplifies`);
+  - a declaration that leaves out the viewer type (`actorsDecl_excluding_viewer_amplifies`);
+  - `visible` in a deny whose target reads the actor (`visibleDeny_amplifies`).
+
+  The checker's flag, "allows on the actor are flagged", must cover all four.
+- **Superseded:** the first-match restatement, and the two-party key issuance model, since Shep no longer issues credentials.
+
+**Doc fixes these findings call for.** The design doc is frozen by the user, so they are not applied.
+- §6.3, "Actors are opt-in", and §6.8: list the four conditions above, and state both guarantees: equality when no actors are declared, and "no more than the user" under `ActForOK`.
+- §6.1, "Absent principals, per atom": give the `not (global viewer in .blocked)` example. The checker should flag an allow that can hold with no viewer unless it mentions `exists global viewer`.

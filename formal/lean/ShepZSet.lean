@@ -29,4 +29,10 @@ import ShepZSet.Lineage
 import ShepZSet.Disciplines
 import ShepZSet.Planner
 import ShepZSet.LeaderOps
+import ShepZSet.PolicyCombine
 import ShepZSet.Polarity
+import ShepZSet.PolarityCEL
+import ShepZSet.Totality
+import ShepZSet.Checks
+import ShepZSet.PatchMerge
+import ShepZSet.PlaceholdersQL

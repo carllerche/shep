@@ -66,3 +66,22 @@ All 12 positive configs pass and all 14 negative configs fail as intended. Each 
 - **Timing:** frontier publication and clock skew.
 - **Operations:** `claim`, range predicates, phantoms, and retries after `contended`.
 - **Barriers and splits:** at most one barrier per partition. Splits produce a single child.
+
+## Splitting a transaction's home (Split2)
+
+Partition 1 splits into two children:
+- **C1** gets g1, the home's lowest group, and with it the decision records.
+- **C2** gets g2, A's anchor group.
+
+The idempotency table is handed off by snapshot reference, and a drain runs during the split.
+
+| # | Severity | Finding | Config |
+|---|---|---|---|
+| 2PC-9 | high | A retired home's transaction ID must route through the lineage to the child that holds the home's lowest group, where the records went. Only new attempts route by anchor. Routing by anchor lets a timeout append a second decision. | `_split2_lookupanchor` (`_atomic`) fails |
+| 2PC-10 | high | Every idempotency key must go to the child that holds its anchor group. Filtering the keys this way is required, not optional. | `_split2_idemlowest` fails |
+| 2PC-11 | high | The idempotency snapshot must be the table exactly at split entry i. | `_split2_idemsnap` fails |
+| 2PC-12 | medium | The drain must reject new prepares. Waiting only for the prepares held when the drain started strands a prepare at the retired parent. | `_split2_drainsnap` fails |
+| 2PC-13 | medium | Decisions, releases and timeout aborts must keep committing at p during the drain; otherwise it never ends. | `_split2_drainall` fails |
+| 2PC-14 | confirms | Each of these is reachable and resolves correctly: a retry across the split, an expired lookup, a lookup of carried records, a `splitting` rejection, and the drain ending. | `_split2` (10,042,424 states) and `_split2_live` pass; the witnesses fire |
+
+**Pending re-runs.** The disk filled before these regression configs ran: `_noregcheck`, `_outage`, `_readonly`, `_retry`, `_skew`, `_split`, `_splitlost`, `_twohomes`, `_wait`.

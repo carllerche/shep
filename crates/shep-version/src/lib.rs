@@ -8,11 +8,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
+use shep_codec::{Decode, DecodeError, Encode};
+
 /// A partition of a universe. Each partition has its own replicated log.
 ///
 /// IDs are assigned in increasing order and never reused, so a partition's ID
 /// is also its generation (§9.1).
-#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Encode, Decode)]
+#[codec(transparent)]
 pub struct PartitionId(pub u64);
 
 impl fmt::Display for PartitionId {
@@ -24,7 +27,7 @@ impl fmt::Display for PartitionId {
 /// A position in a partition's log: `(partition, index)`.
 ///
 /// Index 0 is the log's initial entry, which every version contains.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Encode, Decode)]
 pub struct Dot {
     pub partition: PartitionId,
     pub index: u64,
@@ -216,5 +219,52 @@ impl fmt::Display for Dvv {
             }
         }
         write!(f, "}}")
+    }
+}
+
+/// On the wire, a version is its partitions in order, each as its prefix and
+/// its extras. Decoding normalizes, so any listing of the same dots decodes
+/// to the same version.
+#[derive(Encode, Decode)]
+struct WirePart {
+    partition: PartitionId,
+    prefix: u64,
+    extras: Vec<u64>,
+}
+
+impl Encode for Dvv {
+    fn encode(&self, buf: &mut bytes::BytesMut) {
+        self.wire().encode(buf)
+    }
+
+    fn encoded_len(&self) -> usize {
+        self.wire().encoded_len()
+    }
+}
+
+impl Decode for Dvv {
+    fn decode(buf: &mut bytes::Bytes) -> Result<Dvv, DecodeError> {
+        let parts = Vec::<WirePart>::decode(buf)?;
+        let mut v = Dvv::new();
+        for p in parts {
+            v.raise_prefix(p.partition, p.prefix);
+            for i in p.extras {
+                v.insert(Dot::new(p.partition, i));
+            }
+        }
+        Ok(v)
+    }
+}
+
+impl Dvv {
+    fn wire(&self) -> Vec<WirePart> {
+        self.parts
+            .iter()
+            .map(|(&partition, c)| WirePart {
+                partition,
+                prefix: c.prefix,
+                extras: c.extras.iter().copied().collect(),
+            })
+            .collect()
     }
 }

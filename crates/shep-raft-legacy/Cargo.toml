@@ -1,0 +1,31 @@
+[package]
+name = "shep-raft-legacy"
+description = "openraft's legacy network adapters, vendored as test support for shep-raft-engine"
+version.workspace = true
+edition.workspace = true
+license = "MIT OR Apache-2.0"
+publish.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+openraft = { package = "shep-raft-engine", path = "../shep-raft-engine", default-features = false }
+openraft-macros = "=0.10.0-alpha.37"
+
+anyerror = "0.1.10"
+derive_more = { version = "2.1.1", features = ["std", "from", "try_into", "display"] }
+display-more = "0.2.6"
+futures = "0.3"
+serde = { version = "1.0.114", features = ["derive", "rc"], optional = true }
+thiserror.workspace = true
+tokio = { workspace = true }
+tracing.workspace = true
+
+[features]
+default = []
+serde = ["dep:serde", "openraft/serde"]
+
+[dev-dependencies]
+openraft = { package = "shep-raft-engine", path = "../shep-raft-engine", default-features = false, features = ["tokio-rt"] }
+serde_json = "1.0.57"

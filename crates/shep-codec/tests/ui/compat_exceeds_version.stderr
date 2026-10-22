@@ -1,0 +1,5 @@
+error: compat (2) exceeds version (1): this definition couldn't read its own data
+ --> tests/ui/compat_exceeds_version.rs:3:8
+  |
+3 | struct Msg {
+  |        ^^^

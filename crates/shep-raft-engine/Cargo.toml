@@ -1,0 +1,73 @@
+[package]
+name = "shep-raft-engine"
+description = "Raft engine forked from openraft 0.10.0-alpha.37 (see FORK.md)"
+version.workspace = true
+edition.workspace = true
+license = "MIT OR Apache-2.0"
+publish.workspace = true
+
+[lib]
+# The fork keeps openraft's crate-internal paths and docs as they are.
+doctest = false
+
+[dependencies]
+openraft-macros = "=0.10.0-alpha.37"
+openraft-rt = "=0.10.0-alpha.37"
+openraft-rt-tokio = { version = "=0.10.0-alpha.37", optional = true }
+
+anyerror = "0.1.10"
+backoff-series = "0.1.1"
+base2histogram = "0.2.3"
+chrono = "0.4"
+derive_more = { version = "2.1.1", features = ["std", "from", "try_into", "display"] }
+display-more = "0.2.6"
+futures-util = "0.3"
+itertools = "0.15"
+maplit = "1.0.2"
+peel-off = "0.1.0"
+quorum-set = "0.2.0"
+rand = "0.10"
+smallvec = "1"
+thiserror.workspace = true
+tracing.workspace = true
+validit = "0.2.6"
+serde = { version = "1.0.114", features = ["derive", "rc"], optional = true }
+
+[dev-dependencies]
+# openraft's integration tests (`tests/`) name the support crates by their
+# upstream names; the memstore dependency also turns on `serde` and
+# `type-alias` here.
+openraft-legacy = { package = "shep-raft-legacy", path = "../shep-raft-legacy", features = ["serde"] }
+openraft-memstore = { package = "shep-raft-memstore", path = "../shep-raft-memstore" }
+openraft-rt-tokio = "=0.10.0-alpha.37"
+
+anyerror = "0.1.10"
+anyhow = "1.0.63"
+bincode = "1.3"
+derive_more = { version = "2.1.1", features = ["std", "from", "try_into", "display"] }
+futures = "0.3"
+pretty_assertions = "1.0.0"
+serde = { version = "1.0.114", features = ["derive", "rc"] }
+serde_json = "1.0.57"
+test-harness = "0.3.0"
+tokio = { workspace = true }
+tracing-subscriber.workspace = true
+
+[features]
+default = ["tokio-rt"]
+tokio-rt = ["dep:openraft-rt-tokio"]
+single-threaded = ["openraft-rt/single-threaded", "openraft-rt-tokio?/single-threaded", "openraft-macros/single-threaded"]
+# Upstream features this fork never enables; declared so `cfg(feature = ..)`
+# code in the vendored sources doesn't warn. They go as the fork is trimmed.
+serde = ["dep:serde"]
+runtime-stats = []
+clap = []
+bench = []
+metrics-logids = []
+type-alias = []
+singlethreaded = []
+single-term-leader = []
+loosen-follower-log-revert = []
+compat = []
+bt = []
+adapt-network-v1 = []

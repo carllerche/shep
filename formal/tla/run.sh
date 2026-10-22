@@ -16,5 +16,11 @@ cd "$DIR"
 # One TLC at a time per machine: concurrent runs each take every core and a
 # large heap, and swap. lockf waits for the previous run to finish.
 LOCK="${TLC_LOCK:-$DIR/.tlc.lock}"
-exec /usr/bin/lockf -k "$LOCK" java -Xmx${TLC_HEAP:-6g} -XX:+UseParallelGC -cp "$JAR" tlc2.TLC -workers auto -deadlock -cleanup -noGenerateSpecTE \
+# TLC's -cleanup skips the states directory when a run fails or is killed, and
+# large runs leave gigabytes behind, so remove it ourselves however we exit.
+trap 'rm -rf "$META"' EXIT
+trap 'exit 130' INT TERM HUP
+set +e
+/usr/bin/lockf -k "$LOCK" java -Xmx${TLC_HEAP:-6g} -XX:+UseParallelGC -cp "$JAR" tlc2.TLC -workers auto -deadlock -cleanup -noGenerateSpecTE \
   -metadir "$META" -config "$CFG" "$@" "$SPEC.tla"
+exit $?

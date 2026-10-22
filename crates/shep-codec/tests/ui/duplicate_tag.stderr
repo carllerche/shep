@@ -1,0 +1,5 @@
+error: tag 0 is already used by variant `Put`
+ --> tests/ui/duplicate_tag.rs:5:5
+  |
+5 |     Delete,
+  |     ^^^^^^

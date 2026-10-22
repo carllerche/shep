@@ -85,3 +85,63 @@ The `_sanity` and `_sanity_claim` configs show that every behaviour the model re
 - claims with n > 1
 - pipelining
 - liveness of the work queue
+
+## Follow-up: shep-raft (atomic validate+append, flushed commit, fast path, refusal at receipt)
+
+| # | Severity | Finding | Config |
+|---|---|---|---|
+| W7 | decision | The void-entry rule is needed only when validation and append are separate steps. When validate+append is one atomic step within one term, the rule never fires and can be dropped. If a validated entry is ever handed to raft separately, raft must refuse any entry whose term differs from the one it was validated in. | `_split` fails; `_split_void` passes; every atomic config passes with VoidRule = FALSE (VoidNeverFires) |
+| W8 | high | Commit must count flushed copies only. Counting unflushed appends loses a committed entry when a replica crashes. | `_flush_unflushed` fails; `_flush` passes |
+| W9 | high | An idempotency hit on an uncommitted entry must wait for it to commit, and return `not_leader` if the entry is overwritten. | `_hit_now` fails |
+| W10 | medium-high | The failure fast path is sound when retries are marked. A client that has retried must drop late direct failures from abandoned attempts. | `_fast` and `_fast_probe` pass; `_fast_nomark` fails |
+| W11 | high | NotAppended applies only to a refusal at receipt. LogEntryDiscarded and unknown outcomes must stay Pending. A refused slot left Pending blocks its resend forever. | `_refuse`, `_refuse_terms` and `_refuse_live` pass; `_refuse_discard`, `_refuse_unknown` and `_refuse_live_pending` fail |
+| W12 | high | Raft must receive validated entries in validation order: one FIFO queue per leader term, with no reordering across cores. | `_refuse_reorder` fails |
+| W13 | wording | A deposed leader commits nothing, but a later leader whose log holds its entries can commit them. This is safe, because each was validated against everything before it in that log. | `_sanity_shep` |
+
+### Counterexamples
+
+**W7, the split-step variant (`_split`).**
+1. Leader s1 validates q2 in term 1 and holds it.
+2. s1 is deposed, and receives s2's copy of q2 by AppendEntries.
+3. s1 is re-elected in term 3 and appends the q2 it was holding.
+4. q2 commits twice.
+
+**W8 (`_flush_unflushed`).**
+1. s1's no-op is replicated, unflushed, to s3, and committed on that unflushed ack.
+2. s1 crashes and loses the no-op.
+3. s1 is re-elected, with s2's vote, without the entry.
+
+**W11, LogEntryDiscarded treated as NotAppended (`_refuse_discard`).**
+1. A late LogEntryDiscarded arrives for s1's old copy of an entry.
+2. Meanwhile s1, re-elected, has a rebuilt table holding s2's copy of the same proposal at that index.
+3. The discard drops that slot, so the resend validates afresh and commits a second time.
+
+**W12 (`_refuse_reorder`).** A guard validated before a write into its range is received by raft after the write, so it commits with a stale range read.
+
+### Results
+
+| Config | Result | Distinct states | Time |
+|---|---|---|---|
+| `WalValidate` (atomic, no void rule) | pass | 12,536,642 | 8m |
+| `_terms` | pass | 2,402,961 | 1m |
+| `_window` | pass | 2,326,280 | 1m |
+| `_split_void` | pass | 21,170,004 | 11m |
+| `_flush` | pass | 2,948,541 | 2m |
+| `_fast` | pass | 5,302,607 | 5m |
+| `_fast_probe` | pass | 200,826 | 7s |
+| `_refuse` | pass | 45,862 | 1s |
+| `_refuse_terms` | pass | 18,046,256 | 7m |
+| `_refuse_live` | pass | 1,274 | 1s |
+
+**To re-run:** `_flush` and `_split` predate the final spec; the disk filled before they could be re-run on it. `_truncfix` and `_claim*` were checked in round 1 only.
+
+**Model assumption:** a client that has retried accepts an unanchored failure only from the attempt it is still waiting on.
+
+**Implementation status (2026-10-22).**
+- **W7: the void rule stays.** The code is the `_split` variant, which `_split_void` covers.
+  - The proposer reads the term from openraft's metrics watch, which can lag the engine.
+  - `client_write_ff` appends in the engine's current term without checking the term the entry was validated in.
+  - Dropping the rule would need a conditional append inside the engine.
+- **W12 is confirmed.** There is one proposer task per group. It admits a proposal, then awaits `client_write_ff` enqueuing it on the engine's single API channel, before it takes the next message. So the order of validation equals the order of receipt.
+- **W8 is confirmed.** The leader counts itself only on `LocalIO` after fdatasync, and followers ack only after the same flush.
+- **W9 and W11 match the code.** W10 waits for the front ends.

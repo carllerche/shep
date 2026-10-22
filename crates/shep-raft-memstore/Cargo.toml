@@ -1,0 +1,27 @@
+[package]
+name = "shep-raft-memstore"
+description = "openraft's in-memory log store and state machine, vendored as test support for shep-raft-engine"
+version.workspace = true
+edition.workspace = true
+license = "MIT OR Apache-2.0"
+publish.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+openraft = { package = "shep-raft-engine", path = "../shep-raft-engine", features = ["serde", "type-alias"] }
+openraft-legacy = { package = "shep-raft-legacy", path = "../shep-raft-legacy" }
+openraft-rt-tokio = "=0.10.0-alpha.37"
+
+derive_more = { version = "2.1.1", features = ["std", "from", "try_into", "display"] }
+futures = "0.3"
+serde = { version = "1.0.114", features = ["derive", "rc"] }
+serde_json = "1.0.57"
+tokio = { workspace = true }
+tracing.workspace = true
+
+[features]
+bt = ["openraft/bt"]
+single-term-leader = []
+rt-sim = []

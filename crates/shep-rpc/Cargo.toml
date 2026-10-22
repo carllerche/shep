@@ -1,0 +1,20 @@
+[package]
+name = "shep-rpc"
+description = "Pipelined, checksummed request/response RPC over TCP, after Redpanda's internal RPC"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+bytes.workspace = true
+crc32c.workspace = true
+futures.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+xxhash-rust.workspace = true
+
+[dev-dependencies]
+rand.workspace = true

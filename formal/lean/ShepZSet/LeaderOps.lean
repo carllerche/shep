@@ -51,6 +51,12 @@ prefix-comparable.
   * `committedResolve_crosses_bound`: resolving against committed state only, with
     pipelining, accepts two `subtract(1)`s on a stock of 1. The net effect is `−1`, the log
     records `0` (a lost update), and the second delta's old value is false.
+* **Each op equals the evaluator** (section `FieldOps`, restatement-round obligation 8): for every
+  form in §8's table and every base value, including `{}`, the leader's op gives the ShepQL
+  evaluator's result (`addOpt_eq`, `max_eq`, `pushOpt_eq`, …), and so, with
+  `leaderVal_eq_serial`, the evaluator's result at the entry's log position
+  (`resolved_eq_eval_at_logpos`). `optionalArg_unsets`: `e` must be One. `add_max_not_comm`:
+  mixed op kinds on one field don't commute.
 -/
 import ShepZSet.Disciplines
 import ShepZSet.Validation
@@ -785,6 +791,248 @@ theorem committedResolve_crosses_bound :
     omega
 
 end Bounded
+
+/-! ## Each leader operation equals the evaluator (§8's table)
+
+Restatement-round obligation 8 (§18). For each form in §8's table, the ShepQL evaluator
+computes the new field value from the form, at the base value `b`, which may be `{}` (unset);
+the leader computes it from the op record. We prove they agree for every base value, including
+`{}`, whenever `e` is One (a single value).
+
+* **The evaluator.** A field's value is a set: `b.toList` for a single field (`none` is `{}`).
+  `+`, `-`, `++`, and the array constructor `[v]` are element-wise (product over their
+  arguments), `??` takes its left side unless it is `{}`, and `max` over a set is `{}` on `{}`.
+  Assigning a set to a single field (`assign`) unsets it on `{}`, sets it on one value, and is
+  an error on more. `tags += V` and `tags -= V` on a `multi` property are set union and
+  difference (`multi` properties are sets, §4.0 item 7).
+* **The leader.** `add n`, `sub n`: `(b ?? 0) ± n`; `max v`: `max({b, v})`, `v` when `b` is
+  unset; `insert v`, `remove v`: set insert and erase; `push x`, `extend xs`: `(b ?? []) ++ …`.
+
+Results: `addReq_eq`, `subReq_eq`, `addOpt_eq`, `subOpt_eq`, `max_eq`, `insert_eq`,
+`remove_eq`, `pushReq_eq`, `pushOpt_eq`, `extendReq_eq`, `extendOpt_eq`, and
+`resolved_eq_eval_at_logpos` (with `leaderVal_eq_serial`: the leader's resolved write is the
+evaluator's result at the entry's log position). For `for` loops: `add_add`, `sub_add`,
+`max_max`, `push_push`, `insert_seq`. Boundaries:
+
+* `addReq_unset`: `.x + e` on an unset `x` unsets it, which no `add n` does: why the optional
+  forms need `?? 0` (the design's own argument).
+* `optionalArg_unsets`, `max_optionalArg_unset` (**doc finding**): with `e` optional and absent,
+  `(.x ?? 0) + e` unsets the field and `max({.x, e})` keeps an unset field unset; no op record
+  produces either. §8's "when it qualifies" should require `e` to be One.
+* `add_max_not_comm` (**doc finding**): `add` and `max` on one field don't commute, so "in a
+  `for`, operations on one field sum" needs a rule for mixed kinds (apply in statement order,
+  or reject the mix).
+-/
+
+namespace FieldOps
+
+/-- Element-wise application over the product. -/
+def prod {α β γ : Type*} (f : α → β → γ) (xs : List α) (ys : List β) : List γ :=
+  xs.flatMap (fun x => ys.map (f x))
+
+/-- `a ?? b` on sets. -/
+def coalesceL {α : Type*} (xs ys : List α) : List α := if xs = [] then ys else xs
+
+/-- EdgeQL's `max` over a set: `{}` on `{}`. -/
+def maxL (xs : List ℤ) : List ℤ := match xs.max? with
+  | none => []
+  | some m => [m]
+
+/-- Assigning a set to a single field: `{}` unsets, one value sets, more is an error (`none`). -/
+def assign {α : Type*} : List α → Option (Option α)
+  | [] => some none
+  | [v] => some (some v)
+  | _ :: _ :: _ => none
+
+/-! ### Counters -/
+
+/-- `x := .x + e` (`x` required). -/
+def evalAddReq (b : Option ℤ) (es : List ℤ) : Option (Option ℤ) :=
+  assign (prod (· + ·) b.toList es)
+
+/-- `x := .x - e` (`x` required). -/
+def evalSubReq (b : Option ℤ) (es : List ℤ) : Option (Option ℤ) :=
+  assign (prod (· - ·) b.toList es)
+
+/-- `x := (.x ?? 0) + e`. -/
+def evalAddOpt (b : Option ℤ) (es : List ℤ) : Option (Option ℤ) :=
+  assign (prod (· + ·) (coalesceL b.toList [0]) es)
+
+/-- `x := (.x ?? 0) - e`. -/
+def evalSubOpt (b : Option ℤ) (es : List ℤ) : Option (Option ℤ) :=
+  assign (prod (· - ·) (coalesceL b.toList [0]) es)
+
+/-- `x := max({.x, e})`. -/
+def evalMax (b : Option ℤ) (es : List ℤ) : Option (Option ℤ) := assign (maxL (b.toList ++ es))
+
+/-- The leader's `add n`: `(b ?? 0) + n`. -/
+def opAdd (n : ℤ) (b : Option ℤ) : Option ℤ := some (b.getD 0 + n)
+
+/-- The leader's `sub n`: `(b ?? 0) - n`. -/
+def opSub (n : ℤ) (b : Option ℤ) : Option ℤ := some (b.getD 0 - n)
+
+/-- The leader's `max v`: `v` when `b` is unset. -/
+def opMax (v : ℤ) : Option ℤ → Option ℤ
+  | none => some v
+  | some b => some (max b v)
+
+theorem addReq_eq (b n : ℤ) : evalAddReq (some b) [n] = some (opAdd n (some b)) := rfl
+
+theorem subReq_eq (b n : ℤ) : evalSubReq (some b) [n] = some (opSub n (some b)) := rfl
+
+theorem addOpt_eq (b : Option ℤ) (n : ℤ) : evalAddOpt b [n] = some (opAdd n b) := by
+  cases b <;> rfl
+
+theorem subOpt_eq (b : Option ℤ) (n : ℤ) : evalSubOpt b [n] = some (opSub n b) := by
+  cases b <;> rfl
+
+theorem max_eq (b : Option ℤ) (v : ℤ) : evalMax b [v] = some (opMax v b) := by
+  cases b with
+  | none => rfl
+  | some b =>
+    simp only [evalMax, Option.toList_some, List.cons_append, List.nil_append, maxL, opMax]
+    rw [List.max?_cons]
+    simp [assign]
+
+/-- **`.x + e` on an unset `x` unsets it**, which no `add n` does. -/
+theorem addReq_unset (n : ℤ) : evalAddReq none [n] = some none ∧ ∀ m, opAdd m none ≠ none :=
+  ⟨rfl, fun _ h => by simp [opAdd] at h⟩
+
+/-- **With `e` optional and absent**, `(.x ?? 0) + e` and `(.x ?? 0) - e` unset the field, which
+no op record does. -/
+theorem optionalArg_unsets (b : Option ℤ) :
+    evalAddOpt b [] = some none ∧ evalSubOpt b [] = some none ∧
+      ∀ m, opAdd m b ≠ none ∧ opSub m b ≠ none := by
+  refine ⟨?_, ?_, fun m => ⟨by simp [opAdd], by simp [opSub]⟩⟩ <;>
+    cases b <;> rfl
+
+/-- With `e` absent, `max({.x, e})` keeps an unset field unset, which no `max v` does. -/
+theorem max_optionalArg_unset : evalMax none [] = some none ∧ ∀ v, opMax v none ≠ none :=
+  ⟨rfl, fun _ h => by simp [opMax] at h⟩
+
+/-! ### Sets (`multi` properties) -/
+
+section Sets
+variable {α : Type*} [DecidableEq α]
+
+/-- `tags += V`: union. -/
+def evalInsert (b : Finset α) (vs : List α) : Finset α := b ∪ vs.toFinset
+
+/-- `tags -= V`: difference. -/
+def evalRemove (b : Finset α) (vs : List α) : Finset α := b \ vs.toFinset
+
+def opInsert (v : α) (b : Finset α) : Finset α := insert v b
+def opRemove (v : α) (b : Finset α) : Finset α := b.erase v
+
+theorem insert_eq (b : Finset α) (v : α) : evalInsert b [v] = opInsert v b := by
+  ext x; simp [evalInsert, opInsert]
+
+theorem remove_eq (b : Finset α) (v : α) : evalRemove b [v] = opRemove v b := by
+  ext x; simp [evalRemove, opRemove, and_comm]
+
+/-- `tags += V` with several values is the inserts in order (`{}` adds nothing). -/
+theorem insert_seq (b : Finset α) (vs : List α) :
+    evalInsert b vs = vs.foldl (fun s v => opInsert v s) b := by
+  induction vs generalizing b with
+  | nil => simp [evalInsert]
+  | cons v vs ih =>
+    rw [List.foldl_cons, ← ih]
+    ext x; simp [evalInsert, opInsert]
+
+end Sets
+
+/-! ### Arrays -/
+
+section Arrays
+variable {α : Type*}
+
+/-- The array constructor `[v]`, element-wise in `v`. -/
+def arr1 (es : List α) : List (List α) := es.map (fun v => [v])
+
+/-- `arr := .arr ++ [v]` (`arr` required). -/
+def evalPushReq (b : Option (List α)) (es : List α) : Option (Option (List α)) :=
+  assign (prod (· ++ ·) b.toList (arr1 es))
+
+/-- `arr := (.arr ?? []) ++ [v]`. -/
+def evalPushOpt (b : Option (List α)) (es : List α) : Option (Option (List α)) :=
+  assign (prod (· ++ ·) (coalesceL b.toList [[]]) (arr1 es))
+
+/-- `arr := .arr ++ e` (`arr` required). -/
+def evalExtendReq (b : Option (List α)) (xss : List (List α)) : Option (Option (List α)) :=
+  assign (prod (· ++ ·) b.toList xss)
+
+/-- `arr := (.arr ?? []) ++ e`. -/
+def evalExtendOpt (b : Option (List α)) (xss : List (List α)) : Option (Option (List α)) :=
+  assign (prod (· ++ ·) (coalesceL b.toList [[]]) xss)
+
+def opPush (x : α) (b : Option (List α)) : Option (List α) := some (b.getD [] ++ [x])
+def opExtend (xs : List α) (b : Option (List α)) : Option (List α) := some (b.getD [] ++ xs)
+
+theorem pushReq_eq (b : List α) (x : α) : evalPushReq (some b) [x] = some (opPush x (some b)) :=
+  rfl
+
+theorem pushOpt_eq (b : Option (List α)) (x : α) : evalPushOpt b [x] = some (opPush x b) := by
+  cases b <;> rfl
+
+theorem extendReq_eq (b xs : List α) :
+    evalExtendReq (some b) [xs] = some (opExtend xs (some b)) := rfl
+
+theorem extendOpt_eq (b : Option (List α)) (xs : List α) :
+    evalExtendOpt b [xs] = some (opExtend xs b) := by
+  cases b <;> rfl
+
+theorem push_push (x y : α) (b : Option (List α)) :
+    opPush y (opPush x b) = opExtend [x, y] b := by
+  simp [opPush, opExtend]
+
+end Arrays
+
+/-! ### Operations on one field in a `for` -/
+
+theorem add_add (n m : ℤ) (b : Option ℤ) : opAdd m (opAdd n b) = opAdd (n + m) b := by
+  simp [opAdd, add_assoc]
+
+theorem sub_add (n m : ℤ) (b : Option ℤ) : opSub m (opAdd n b) = opAdd (n - m) b := by
+  simp [opAdd, opSub]; ring
+
+theorem max_max (v w : ℤ) (b : Option ℤ) : opMax w (opMax v b) = opMax (max v w) b := by
+  cases b <;> simp [opMax, max_assoc]
+
+/-- **`add` and `max` don't commute.** -/
+theorem add_max_not_comm : opMax 3 (opAdd 5 (some 0)) ≠ opAdd 5 (opMax 3 (some 0)) := by
+  decide
+
+/-! ### At the log position -/
+
+section AtLogPos
+
+open Validation
+
+variable {K Val Dot : Type*} {L : ℕ → Entry K Val Dot} {init : K → Val}
+
+/-- **The leader's resolved write is the evaluator's result at the entry's log position**, for
+any op whose result equals the evaluator's form at every base value (the theorems above). -/
+theorem resolved_eq_eval_at_logpos {ctx : Dot → Finset Dot} {S : Finset Dot} {e : ℕ} {k : K}
+    (op : Val → Val) (form : Val → Option Val) (hof : ∀ b, form b = some (op b))
+    (hord : ∀ j j', j < j' → j' < e → Writes (L j) k → Writes (L j') k →
+      (L j).stamp ∈ ctx (L j').stamp)
+    (hSc : CausallyClosed ctx S) :
+    form (serial L init e k) = some (op (leaderVal L init S e k)) := by
+  rw [leaderVal_eq_serial hord hSc, hof]
+
+/-- For example, `x := (.x ?? 0) + n`. -/
+theorem addOpt_at_logpos {L : ℕ → Entry K (Option ℤ) Dot} {init : K → Option ℤ}
+    {ctx : Dot → Finset Dot} {S : Finset Dot} {e : ℕ} {k : K} (n : ℤ)
+    (hord : ∀ j j', j < j' → j' < e → Writes (L j) k → Writes (L j') k →
+      (L j).stamp ∈ ctx (L j').stamp)
+    (hSc : CausallyClosed ctx S) :
+    evalAddOpt (serial L init e k) [n] = some (opAdd n (leaderVal L init S e k)) :=
+  resolved_eq_eval_at_logpos (opAdd n) (fun b => evalAddOpt b [n]) (fun b => addOpt_eq b n)
+    hord hSc
+
+end AtLogPos
+
+end FieldOps
 
 end LeaderOps
 end Shep

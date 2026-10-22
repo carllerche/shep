@@ -91,9 +91,10 @@ async fn a_torn_write_is_truncated_on_recovery() {
     read_node_log(&cluster, victim, P1, last).await;
     cluster.stop(victim).await;
     // A record whose header promises more than was written.
-    let seg = std::fs::read_dir(cluster.replica_dir(victim, P1).join("log"))
+    let seg = std::fs::read_dir(cluster.replica_dir(victim, P1))
         .unwrap()
         .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|e| e == "log"))
         .max()
         .unwrap();
     let len = std::fs::metadata(&seg).unwrap().len();
@@ -119,12 +120,20 @@ async fn a_torn_write_is_truncated_on_recovery() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn segments_roll_over() {
-    let mut cluster = Cluster::start_with(3, &[P1], |c| c.segment_size = 512).await;
+    let mut cluster =
+        Cluster::start_with(3, &[P1], |c| c.raft.storage.log.segment_size = 512).await;
     let committed = commit_n(&cluster, 60).await;
     let last = committed.last().unwrap().1.dot.index;
     let before = read_log(&cluster.client, P1, last).await;
-    let segments = std::fs::read_dir(cluster.replica_dir(0, P1).join("log"))
+    let segments = std::fs::read_dir(cluster.replica_dir(0, P1))
         .unwrap()
+        .filter(|e| {
+            e.as_ref()
+                .unwrap()
+                .path()
+                .extension()
+                .is_some_and(|e| e == "log")
+        })
         .count();
     assert!(segments > 5, "{segments} segments");
 

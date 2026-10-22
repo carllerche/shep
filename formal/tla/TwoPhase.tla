@@ -4,6 +4,19 @@
 (* §10.3 (validation, intents, read-only participants, registry barriers), *)
 (* §9.6 (splits).                                                          *)
 (*                                                                         *)
+(* Split2 (design v49 §9.6 "Protocol: a split", §8 "Finding a retired      *)
+(* home", §10.3 idempotency): partition 1 holds two placement groups, g1   *)
+(* (its lowest; key x) and g2 (the anchor group of request A; no keys). It *)
+(* splits into C1 = NP+1 (g1) and C2 = NP+2 (g2). The drain starts first:  *)
+(* partition 1 rejects new prepares with a retryable `splitting` (the     *)
+(* attempt aborts; a retry is a fresh attempt) and the split entry waits   *)
+(* until no prepare at 1 is unreleased. The decision records go to C1, the *)
+(* child holding the home's lowest group; a transaction ID whose home is   *)
+(* 1 is routed there. A retry of A after the split is anchored at g2, so   *)
+(* its home is C2, which checks the idempotency key against the parent's   *)
+(* idempotency table at the split index, installed from a snapshot         *)
+(* reference in its first entry.                                           *)
+(*                                                                         *)
 (* Partitions are logs. Raft is abstract: an append is committed at once,  *)
 (* and the leader is the validator. Intents, the validation table and each *)
 (* participant's per-transaction state are derived from the log, which is  *)
@@ -71,15 +84,37 @@ CONSTANTS
                  \*   unreleased at its partition
   Split,         \* partition 1 may split into partition NP+1 (one child)
   SplitCarry,    \* a split carries the parent's decision records to the child
-  Outages        \* partitions can be unavailable (liveness under availability)
+  Outages,       \* partitions can be unavailable (liveness under availability)
+  Split2,        \* partition 1 may split into C1 (g1, x) and C2 (g2, A's anchor)
+  DrainRule,     \* Split2's drain at 1: "reject" (design): new prepares get
+                 \*   `splitting`; the split waits until no prepare at 1 is
+                 \*   unreleased. "snapshot": new prepares are accepted, and the
+                 \*   split waits only for those held when the drain started.
+                 \*   "all": decisions and releases at 1 are rejected too
+  LookupRoute,   \* where a transaction ID whose home split is routed:
+                 \*   "lowest": the child holding the home's lowest group, where
+                 \*   the records go (design); "anchor": the anchor group's child
+  IdemTo,        \* which child gets the parent's idempotency keys: "anchor": the
+                 \*   child holding each key's anchor group (design); "lowest":
+                 \*   the child that gets the decision records
+  IdemSnap       \* the idempotency snapshot: "split": at the split index
+                 \*   (design); "earlier": any earlier index (e.g. the last
+                 \*   periodic snapshot), with nothing replayed after it
 
 ASSUME StampMode \in {"decision", "local"} /\ OnIntent \in {"reject", "wait"}
 ASSUME PartHomeView \in {"prepare", "max"} /\ HomeRule \in {"anchor", "first"}
 ASSUME ForgetRule \in {"never", "released", "deadline"} /\ NP \in {2, 3}
 ASSUME RegCheck \in {"none", "decide", "drain"}
+ASSUME ~ (Split /\ Split2) /\ (Split2 => NP = 2)
+ASSUME DrainRule \in {"reject", "snapshot", "all"} /\ LookupRoute \in {"lowest", "anchor"}
+ASSUME IdemTo \in {"anchor", "lowest"} /\ IdemSnap \in {"split", "earlier"}
 
-C == NP + 1                                    \* the split child of partition 1
-Parts == IF Split THEN 1..(NP + 1) ELSE 1..NP
+C == NP + 1                                    \* the split child of partition 1 (Split2: C1)
+C1 == NP + 1
+C2 == NP + 2                                   \* Split2: the child holding g2
+Splits == Split \/ Split2
+Children == IF Split THEN {C} ELSE IF Split2 THEN {C1, C2} ELSE {}
+Parts == IF Split THEN 1..(NP + 1) ELSE IF Split2 THEN 1..(NP + 2) ELSE 1..NP
 KeyHome == [k \in {"x", "y", "z"} |-> CASE k = "x" -> 1 [] k = "y" -> 2 [] k = "z" -> 3]
 Keys == {k \in {"x", "y", "z"} : KeyHome[k] <= NP}
 NoDot == <<0, 0>>
@@ -90,6 +125,9 @@ Prior(a) == CASE a = "I2" -> "I1" [] a = "A2" -> "A" [] OTHER -> "none"
 Anchor(r) == CASE r \in {"A", "B", "R1", "MX", "C"} -> 1
                [] r \in {"R2", "MY", "I"} -> 2
                [] r = "MZ" -> 3
+\* Split2: requests anchored at partition 1 whose anchor group is g2
+AnchorG2(r) == Split2 /\ r \in {"A", "B"}
+AnchorChild(r) == IF AnchorG2(r) THEN C2 ELSE C1
 
 \* reads and writes of an attempt, given what it read of y. "I" finds the
 \* node it writes through y, so its participants are discovered at runtime.
@@ -120,11 +158,13 @@ VARIABLES
   msgs,     \* msgs[a][q]: undelivered copies of a's prepare to q
   rej,      \* some prepare of a was rejected
   park,     \* OnIntent = "wait": partitions where a's proposal is parked
+  sp,       \* Split2: [draining, drainSet (prepared at 1 when the drain
+            \*   started), snapIdx (the idempotency snapshot's index at 1)]
   stale,    \* ghost: committed although a read was no longer current
   regbad    \* ghost: committed although a participant's barrier was newer
             \*        than the registry its part was validated under
 
-vars == <<log, rec, retired, up, expired, pc, snap, rd, plan, msgs, rej, park, stale, regbad>>
+vars == <<log, rec, retired, up, expired, pc, snap, rd, plan, msgs, rej, park, stale, regbad, sp>>
 
 (*************************** logs, dots, contexts **************************)
 
@@ -141,10 +181,17 @@ Max(S) == CHOOSE x \in S : \A y \in S : y <= x
 Min(S) == CHOOSE x \in S : \A y \in S : x <= y
 MaxIdx(V, q) == IF \E d \in V : d[1] = q THEN Max({d[2] : d \in {e \in V : e[1] = q}}) ELSE 0
 
-Route(p) == IF Split /\ p = 1 /\ retired THEN C ELSE p
-Lineage(p) == IF Split /\ p \in {1, C} THEN {1, C} ELSE {p}
+Route(p) == IF Splits /\ p = 1 /\ retired THEN C ELSE p
+Lineage(p) == IF Split /\ p \in {1, C} THEN {1, C}
+              ELSE IF Split2 /\ p = 1 THEN {1, C1, C2}
+              ELSE IF Split2 /\ p \in {C1, C2} THEN {1, p}
+              ELSE {p}
+\* where a transaction ID's home is routed (Split2: LookupRoute)
+HRoute(h) == IF Split2 /\ h = 1 /\ retired /\ LookupRoute = "anchor" THEN C2 ELSE Route(h)
+\* the anchor partition of a request, now
+AnchorRoute(r) == IF AnchorG2(r) /\ retired THEN C2 ELSE Route(Anchor(r))
 KP(k) == Route(KeyHome[k])
-SplitAt == IF Split /\ retired THEN CHOOSE i \in Idx(1) : log[1][i].k = "split" ELSE 0
+SplitAt == IF Splits /\ retired THEN CHOOSE i \in Idx(1) : log[1][i].k = "split" ELSE 0
 
 Entry(k, a, ctx, out, dd, w, reg) ==
   [k |-> k, a |-> a, key |-> Req(a), ctx |-> ctx, out |-> out, dd |-> dd, w |-> w, reg |-> reg]
@@ -177,28 +224,36 @@ Known(h, a) == a \in rec[h]
 DecAt(h, a) == Last(LinDec(h, a))
 
 \* ground truth: the decision in the log of the coordinator's home lineage
-TrueHome(a) == Route(plan[a].home)
+TrueHome(a) == HRoute(plan[a].home)
 TrueDec(a) == IF LinDec(plan[a].home, a) = {} THEN NoDot ELSE First(LinDec(plan[a].home, a))
 TrueOut(a) == IF TrueDec(a) = NoDot THEN "none" ELSE E(TrueDec(a)).out
 TrueCommit(a) == TrueOut(a) = "commit"
 
 \* the home a participant asks
-PartHome(a, q) == IF PartHomeView = "max" THEN Max(plan[a].P) ELSE Route(plan[a].home)
+PartHome(a, q) == IF PartHomeView = "max" THEN Max(plan[a].P) ELSE HRoute(plan[a].home)
 
 \* "at most one commit per idempotency key", as home h sees it. Idempotency
 \* records are kept for the idempotency window (longer than any run here),
 \* and a split hands the window to the child (the lineage).
+\* Split2: a child's table holds its own entries' keys, and the parent's
+\* keys up to the snapshot index, if they were handed to it (IdemTo)
+IdemSees(h, a, p, i) ==
+  IF ~ Split2 THEN p \in Lineage(h)
+  ELSE \/ p = h
+       \/ /\ p = 1 /\ h \in {C1, C2} /\ i <= sp.snapIdx
+          /\ h = (IF IdemTo = "anchor" THEN AnchorChild(Req(a)) ELSE C1)
 IdemCommitted(h, a) ==
   \E b \in Attempts \ {a} :
      /\ Req(b) = Req(a)
-     /\ \E p \in Lineage(h) : \E i \in Idx(p) :
-          log[p][i].a = b /\ (log[p][i].k = "mut" \/ (log[p][i].k = "dec" /\ log[p][i].out = "commit"))
+     /\ \E p \in Parts : \E i \in Idx(p) :
+          /\ IdemSees(h, a, p, i)
+          /\ log[p][i].a = b /\ (log[p][i].k = "mut" \/ (log[p][i].k = "dec" /\ log[p][i].out = "commit"))
 
 IsExpired(a) == Deadline /\ a \in expired
 
 (*************************** versions of a key *****************************)
 
-KeyLin(k) == IF Split /\ KeyHome[k] = 1 THEN <<1, C>> ELSE <<KeyHome[k]>>
+KeyLin(k) == IF Splits /\ KeyHome[k] = 1 THEN <<1, C>> ELSE <<KeyHome[k]>>
 
 Applies(p, e, b, k) ==
   /\ e.a = b
@@ -240,7 +295,7 @@ WritesKey(p, i, k) ==
   \/ e.k = "mut" /\ k \in e.w
   \/ e.k = "rel" /\ e.out = "commit" /\ k \in plan[e.a].W /\ plan[e.a].kp[k] = p
 
-TooOld(a, q) == Split /\ q = C /\ snap[a][1] < SplitAt
+TooOld(a, q) == Splits /\ q \in Children /\ snap[a][1] < SplitAt
 StaleRegistry(a, q) == LatestBar(q) > snap[a][q]
 StampConflict(a, q) ==
   \E i \in Idx(q) : \E k \in PartR(a, q) : WritesKey(q, i, k) /\ ~ InS(StampAt(q, i), snap[a])
@@ -251,7 +306,11 @@ Clash(a, b, q) ==
   \/ PartKeys(b, q) \cap PartW(a, q) # {}
 IntentConflict(a, q) == \E b \in IntentHolders(q) \ {a} : Clash(a, b, q)
 
-CanAppend(p) == up[p] /\ ~ (Split /\ p = 1 /\ retired)
+CanAppend(p) == up[p] /\ ~ (Splits /\ p = 1 /\ retired)
+\* Split2, DrainRule = "all": the draining parent rejects every 2PC record
+Open2PC(p) == ~ (Split2 /\ DrainRule = "all" /\ sp.draining /\ ~ retired /\ p = 1)
+\* Split2: the draining parent rejects a new prepare with `splitting`
+Splitting(q) == Split2 /\ DrainRule # "snapshot" /\ sp.draining /\ q = 1
 
 (*************************** actions ***************************************)
 
@@ -270,6 +329,7 @@ Init ==
   /\ park = [a \in Attempts |-> {}]
   /\ stale = {}
   /\ regbad = {}
+  /\ sp = [draining |-> FALSE, drainSet |-> {}, snapIdx |-> 0]
 
 AppendTo(p, e) == log' = [log EXCEPT ![p] = Append(log[p], e)]
 
@@ -283,7 +343,7 @@ Execute(a) ==
          Pw   == {kp[k] : k \in rw.W}
          Pr   == {kp[k] : k \in rw.R}
          P0   == Pw \cup (IF ReadOnlyParts THEN Pr ELSE {})
-         home == IF HomeRule = "first" THEN Min(P0) ELSE Route(Anchor(Req(a)))
+         home == IF HomeRule = "first" THEN Min(P0) ELSE AnchorRoute(Req(a))
          P    == P0 \cup {home}
      IN /\ snap' = [snap EXCEPT ![a] = [p \in Parts |-> Len(log[p])]]
         /\ rd' = [rd EXCEPT ![a] = [k \in Keys |-> IF k \in rw.R THEN Latest(k) ELSE "none"]]
@@ -294,22 +354,22 @@ Execute(a) ==
              ELSE /\ pc' = [pc EXCEPT ![a] = "preparing"]
                   /\ msgs' = [msgs EXCEPT ![a] =
                                 [q \in Parts |-> IF q \in P THEN (IF Dup THEN 2 ELSE 1) ELSE 0]]
-  /\ UNCHANGED <<log, rec, retired, up, expired, rej, park, stale, regbad>>
+  /\ UNCHANGED <<sp, log, rec, retired, up, expired, rej, park, stale, regbad>>
 
 \* single-partition mutation: validate and append (§10.3)
 SingleValidate(a, q) ==
   IF IdemCommitted(q, a)
     THEN /\ pc' = [pc EXCEPT ![a] = "done"] /\ park' = [park EXCEPT ![a] = {}]
-         /\ UNCHANGED <<log, stale>>
+         /\ UNCHANGED <<sp, log, stale>>
   ELSE IF TooOld(a, q) \/ StaleRegistry(a, q) \/ StampConflict(a, q)
     THEN /\ pc' = [pc EXCEPT ![a] = "failed"] /\ park' = [park EXCEPT ![a] = {}]
-         /\ UNCHANGED <<log, stale>>
+         /\ UNCHANGED <<sp, log, stale>>
   ELSE IF IntentConflict(a, q)
     THEN IF OnIntent = "wait"
            THEN /\ pc' = [pc EXCEPT ![a] = "parked"] /\ park' = [park EXCEPT ![a] = {q}]
-                /\ UNCHANGED <<log, stale>>
+                /\ UNCHANGED <<sp, log, stale>>
            ELSE /\ pc' = [pc EXCEPT ![a] = "failed"] /\ park' = [park EXCEPT ![a] = {}]
-                /\ UNCHANGED <<log, stale>>
+                /\ UNCHANGED <<sp, log, stale>>
   ELSE /\ AppendTo(q, Entry("mut", a, Dots(snap[a]), "none", NoDot, plan[a].W, LatestBar(q)))
        /\ stale' = IF StaleReads(a) THEN stale \cup {a} ELSE stale
        /\ pc' = [pc EXCEPT ![a] = "done"] /\ park' = [park EXCEPT ![a] = {}]
@@ -318,18 +378,18 @@ Propose(a) ==
   /\ pc[a] = "single"
   /\ LET q == CHOOSE p \in plan[a].P : TRUE IN
        /\ up[q]
-       /\ IF Split /\ q = 1 /\ retired
+       /\ IF Splits /\ q = 1 /\ retired
             THEN /\ pc' = [pc EXCEPT ![a] = "failed"]     \* moved
-                 /\ UNCHANGED <<log, stale, park>>
+                 /\ UNCHANGED <<sp, log, stale, park>>
             ELSE SingleValidate(a, q)
-  /\ UNCHANGED <<rec, retired, up, expired, snap, rd, plan, msgs, rej, regbad>>
+  /\ UNCHANGED <<sp, rec, retired, up, expired, snap, rd, plan, msgs, rej, regbad>>
 
 UnparkSingle(a) ==
   /\ pc[a] = "parked"
   /\ LET q == CHOOSE p \in park[a] : TRUE IN
        /\ CanAppend(q) /\ ~ IntentConflict(a, q)
        /\ SingleValidate(a, q)
-  /\ UNCHANGED <<rec, retired, up, expired, snap, rd, plan, msgs, rej, regbad>>
+  /\ UNCHANGED <<sp, rec, retired, up, expired, snap, rd, plan, msgs, rej, regbad>>
 
 \* a participant validates a prepare and appends it, recording the registry
 \* dot it was validated under (§8 step 1)
@@ -339,7 +399,7 @@ PrepValidate(a, q) ==
          /\ UNCHANGED log
   ELSE IF IntentConflict(a, q)
     THEN IF OnIntent = "wait"
-           THEN /\ park' = [park EXCEPT ![a] = park[a] \cup {q}] /\ UNCHANGED <<log, rej>>
+           THEN /\ park' = [park EXCEPT ![a] = park[a] \cup {q}] /\ UNCHANGED <<sp, log, rej>>
            ELSE /\ rej' = [rej EXCEPT ![a] = TRUE] /\ park' = [park EXCEPT ![a] = park[a] \ {q}]
                 /\ UNCHANGED log
   ELSE /\ AppendTo(q, Entry("prep", a, Dots(snap[a]), "none", NoDot, {}, LatestBar(q)))
@@ -357,18 +417,20 @@ Deliver(a, q) ==
   /\ q \notin park[a]
   /\ up[q]
   /\ msgs' = [msgs EXCEPT ![a][q] = @ - 1]
-  /\ IF (Split /\ q = 1 /\ retired) \/ IsExpired(a)
-       THEN /\ rej' = [rej EXCEPT ![a] = TRUE] /\ UNCHANGED <<log, park>>  \* moved / expired
+  /\ IF (Splits /\ q = 1 /\ retired) \/ IsExpired(a)
+       THEN /\ rej' = [rej EXCEPT ![a] = TRUE] /\ UNCHANGED <<sp, log, park>>  \* moved / expired
      ELSE IF Remembers(a, q)
-       THEN UNCHANGED <<log, rej, park>>                                  \* known ID
+       THEN UNCHANGED <<sp, log, rej, park>>                                  \* known ID
+     ELSE IF Splitting(q)
+       THEN /\ rej' = [rej EXCEPT ![a] = TRUE] /\ UNCHANGED <<sp, log, park>>  \* splitting
      ELSE PrepValidate(a, q)
-  /\ UNCHANGED <<rec, retired, up, expired, pc, snap, rd, plan, stale, regbad>>
+  /\ UNCHANGED <<sp, rec, retired, up, expired, pc, snap, rd, plan, stale, regbad>>
 
 UnparkPrep(a, q) ==
   /\ q \in park[a]
   /\ CanAppend(q) /\ ~ IntentConflict(a, q)
   /\ PrepValidate(a, q)
-  /\ UNCHANGED <<rec, retired, up, expired, pc, snap, rd, plan, msgs, stale, regbad>>
+  /\ UNCHANGED <<sp, rec, retired, up, expired, pc, snap, rd, plan, msgs, stale, regbad>>
 
 DecCtx(a) ==
   Dots(snap[a]) \cup
@@ -388,50 +450,50 @@ Decide(a) ==
   /\ ~ rej[a]
   /\ \A q \in plan[a].P : HasPrep(a, q)
   /\ LET h == TrueHome(a) IN
-       /\ CanAppend(h)
+       /\ CanAppend(h) /\ Open2PC(h)
        /\ IF Known(h, a) \/ IsExpired(a)
-            THEN UNCHANGED <<log, rec, stale, regbad>>
+            THEN UNCHANGED <<sp, log, rec, stale, regbad>>
           ELSE IF (RegCheck # "none" /\ RegNewer(a)) \/ IdemCommitted(h, a)
-            THEN AppendDecision(h, a, "abort") /\ UNCHANGED <<stale, regbad>>
+            THEN AppendDecision(h, a, "abort") /\ UNCHANGED <<sp, stale, regbad>>
           ELSE /\ AppendDecision(h, a, "commit")
                /\ stale' = IF StaleReads(a) THEN stale \cup {a} ELSE stale
                /\ regbad' = IF RegNewer(a) THEN regbad \cup {a} ELSE regbad
   /\ pc' = [pc EXCEPT ![a] = "releasing"]
-  /\ UNCHANGED <<retired, up, expired, snap, rd, plan, msgs, rej, park>>
+  /\ UNCHANGED <<sp, retired, up, expired, snap, rd, plan, msgs, rej, park>>
 
 CoordAbort(a) ==
   /\ pc[a] = "preparing"
   /\ rej[a]
   /\ LET h == TrueHome(a) IN
-       /\ CanAppend(h)
-       /\ IF Known(h, a) \/ IsExpired(a) THEN UNCHANGED <<log, rec>>
+       /\ CanAppend(h) /\ Open2PC(h)
+       /\ IF Known(h, a) \/ IsExpired(a) THEN UNCHANGED <<sp, log, rec>>
           ELSE AppendDecision(h, a, "abort")
   /\ pc' = [pc EXCEPT ![a] = "releasing"]
-  /\ UNCHANGED <<retired, up, expired, snap, rd, plan, msgs, rej, park, stale, regbad>>
+  /\ UNCHANGED <<sp, retired, up, expired, snap, rd, plan, msgs, rej, park, stale, regbad>>
 
 \* prepare timeout at q: the home has no decision, so q appends the abort
 \* there. Time is abstract: this can fire at any point.
 TimeoutAbort(a, q) ==
   /\ Unreleased(a, q)
   /\ LET h == PartHome(a, q) IN
-       /\ CanAppend(h)
+       /\ CanAppend(h) /\ Open2PC(h)
        /\ ~ Known(h, a)
        /\ ~ IsExpired(a)
        /\ AppendDecision(h, a, "abort")
-  /\ UNCHANGED <<retired, up, expired, pc, snap, rd, plan, msgs, rej, park, stale, regbad>>
+  /\ UNCHANGED <<sp, retired, up, expired, pc, snap, rd, plan, msgs, rej, park, stale, regbad>>
 
 \* intent release at q, from the decision at home h, sent by the coordinator
 \* or learned by q after its timeout (the same entry either way); past the
 \* deadline with no decision, the home answers "expired" and q aborts
 ReleaseFrom(a, q, h) ==
   /\ Unreleased(a, q)
-  /\ CanAppend(q)
+  /\ CanAppend(q) /\ Open2PC(q)
   /\ up[h]
   /\ IF Known(h, a)
        THEN LET d == DecAt(h, a) IN AppendTo(q, Entry("rel", a, {d}, E(d).out, d, {}, 0))
        ELSE /\ IsExpired(a)
             /\ AppendTo(q, Entry("rel", a, {}, "abort", NoDot, {}, 0))
-  /\ UNCHANGED <<rec, retired, up, expired, pc, snap, rd, plan, msgs, rej, park, stale, regbad>>
+  /\ UNCHANGED <<sp, rec, retired, up, expired, pc, snap, rd, plan, msgs, rej, park, stale, regbad>>
 
 Release(a, q) == ReleaseFrom(a, q, PartHome(a, q))
 CoordRelease(a, q) == pc[a] = "releasing" /\ ReleaseFrom(a, q, TrueHome(a))
@@ -445,12 +507,12 @@ ForgetDec(a) ==
        /\ a \in rec[h]
        /\ \A q \in Parts : ~ Unreleased(a, q)
        /\ rec' = [rec EXCEPT ![h] = @ \ {a}]
-  /\ UNCHANGED <<log, retired, up, expired, pc, snap, rd, plan, msgs, rej, park, stale, regbad>>
+  /\ UNCHANGED <<sp, log, retired, up, expired, pc, snap, rd, plan, msgs, rej, park, stale, regbad>>
 
 Expire(a) ==
   /\ Deadline /\ pc[a] # "idle" /\ a \notin expired
   /\ expired' = expired \cup {a}
-  /\ UNCHANGED <<log, rec, retired, up, pc, snap, rd, plan, msgs, rej, park, stale, regbad>>
+  /\ UNCHANGED <<sp, log, rec, retired, up, pc, snap, rd, plan, msgs, rej, park, stale, regbad>>
 
 \* a registry barrier reaches q (one per partition here)
 Barrier(q) ==
@@ -458,7 +520,7 @@ Barrier(q) ==
   /\ LatestBar(q) = 0
   /\ RegCheck = "drain" => IntentHolders(q) = {}
   /\ AppendTo(q, Entry("bar", "none", {}, "none", NoDot, {}, 0))
-  /\ UNCHANGED <<rec, retired, up, expired, pc, snap, rd, plan, msgs, rej, park, stale, regbad>>
+  /\ UNCHANGED <<sp, rec, retired, up, expired, pc, snap, rd, plan, msgs, rej, park, stale, regbad>>
 
 \* split of partition 1 into C (§9.6), after draining its prepared parts
 DoSplit ==
@@ -470,18 +532,42 @@ DoSplit ==
                           ![C] = Append(log[C], Entry("start", "none", {<<1, i>>}, "none", NoDot, {}, 0))]
   /\ rec' = [rec EXCEPT ![C] = IF SplitCarry THEN rec[1] ELSE {}, ![1] = {}]
   /\ retired' = TRUE
+  /\ UNCHANGED <<sp, up, expired, pc, snap, rd, plan, msgs, rej, park, stale, regbad>>
+
+\* Split2, step 2: the controller asks 1's leader to split; it starts draining
+StartDrain ==
+  /\ Split2 /\ ~ sp.draining /\ ~ retired
+  /\ sp' = [sp EXCEPT !.draining = TRUE, !.drainSet = IntentHolders(1)]
+  /\ UNCHANGED <<log, rec, retired, up, expired, pc, snap, rd, plan, msgs, rej, park, stale, regbad>>
+
+\* Split2, steps 3-4: the split entry at i, and each child's first entry
+\* (context {<<1, i>>}): C1 gets the decision records; each child installs
+\* the idempotency snapshot before accepting proposals (atomic here)
+DoSplit2 ==
+  /\ Split2 /\ sp.draining /\ ~ retired /\ up[1]
+  /\ IF DrainRule = "snapshot" THEN IntentHolders(1) \cap sp.drainSet = {}
+                              ELSE IntentHolders(1) = {}
+  /\ \A a \in Attempts : 1 \notin park[a]
+  /\ LET i == Len(log[1]) + 1
+         st == Entry("start", "none", {<<1, i>>}, "none", NoDot, {}, 0)
+     IN /\ log' = [log EXCEPT ![1] = Append(log[1], Entry("split", "none", {}, "none", NoDot, {}, 0)),
+                              ![C1] = Append(log[C1], st), ![C2] = Append(log[C2], st)]
+        /\ \E j \in (IF IdemSnap = "split" THEN {i - 1} ELSE 0..(i - 1)) :
+             sp' = [sp EXCEPT !.snapIdx = j]
+  /\ rec' = [rec EXCEPT ![C1] = IF SplitCarry THEN rec[1] ELSE {}, ![1] = {}]
+  /\ retired' = TRUE
   /\ UNCHANGED <<up, expired, pc, snap, rd, plan, msgs, rej, park, stale, regbad>>
 
 CrashCoord(a) ==
   /\ Crash
   /\ pc[a] \in {"preparing", "releasing"}
   /\ pc' = [pc EXCEPT ![a] = "crashed"]
-  /\ UNCHANGED <<log, rec, retired, up, expired, snap, rd, plan, msgs, rej, park, stale, regbad>>
+  /\ UNCHANGED <<sp, log, rec, retired, up, expired, snap, rd, plan, msgs, rej, park, stale, regbad>>
 
 Down(p) == Outages /\ up[p] /\ up' = [up EXCEPT ![p] = FALSE]
-           /\ UNCHANGED <<log, rec, retired, expired, pc, snap, rd, plan, msgs, rej, park, stale, regbad>>
+           /\ UNCHANGED <<sp, log, rec, retired, expired, pc, snap, rd, plan, msgs, rej, park, stale, regbad>>
 Up(p) == Outages /\ ~ up[p] /\ up' = [up EXCEPT ![p] = TRUE]
-         /\ UNCHANGED <<log, rec, retired, expired, pc, snap, rd, plan, msgs, rej, park, stale, regbad>>
+         /\ UNCHANGED <<sp, log, rec, retired, expired, pc, snap, rd, plan, msgs, rej, park, stale, regbad>>
 
 Next ==
   \/ \E a \in Attempts :
@@ -490,7 +576,7 @@ Next ==
        \/ \E q \in Parts :
             \/ Deliver(a, q) \/ UnparkPrep(a, q) \/ TimeoutAbort(a, q) \/ Release(a, q)
             \/ (PartHomeView = "max" /\ CoordRelease(a, q))
-  \/ DoSplit
+  \/ DoSplit \/ StartDrain \/ DoSplit2
   \/ \E p \in Parts : Down(p) \/ Up(p) \/ Barrier(p)
 
 Spec == Init /\ [][Next]_vars
@@ -503,13 +589,13 @@ Fairness ==
        /\ \A q \in Parts :
             /\ WF_vars(Deliver(a, q)) /\ WF_vars(UnparkPrep(a, q))
             /\ WF_vars(TimeoutAbort(a, q)) /\ WF_vars(Release(a, q))
-LiveSpec == Spec /\ Fairness
+LiveSpec == Spec /\ Fairness /\ WF_vars(DoSplit) /\ WF_vars(DoSplit2)
 
 (*************************** what a reader sees ****************************)
 
 \* the home's answer to "was a decided at a dot in V?"
 ResolvesCommitIn(a, q, V) ==
-  LET h == Route(plan[a].home) IN
+  LET h == HRoute(plan[a].home) IN
   Known(h, a) /\ E(DecAt(h, a)).out = "commit" /\ DecAt(h, a) \in V
 
 \* a materializer that holds a's prepare at q in V, but not its release at
@@ -597,7 +683,7 @@ CommitDotOf(a) == IF TrueCommit(a) THEN TrueDec(a) ELSE NoDot
 Learned(a, q) ==
   IF MatLookahead /\ RelIdx(a, q) # {}
   THEN LET i == Min(RelIdx(a, q)) IN IF log[q][i].out = "commit" THEN log[q][i].dd ELSE NoDot
-  ELSE LET h == Route(plan[a].home) IN
+  ELSE LET h == HRoute(plan[a].home) IN
        IF Known(h, a) /\ E(DecAt(h, a)).out = "commit" THEN DecAt(h, a) ELSE NoDot
 ResolveCorrect ==
   \A a \in Attempts, q \in Parts : HasPrep(a, q) => Learned(a, q) = CommitDotOf(a)
@@ -669,6 +755,20 @@ WaitsFor(a, b) == \E q \in park[a] : b \in IntentHolders(q) \ {a} /\ Clash(a, b,
 NoDeadlock == \A a, b \in Attempts : ~ (WaitsFor(a, b) /\ WaitsFor(b, a))
 NeverWaits == \A a \in Attempts : park[a] = {}
 
+\* Split2: a retired partition never holds an unreleased prepare
+NoStrandedPrepare == retired => \A a \in Attempts : ~ Unreleased(a, 1)
+
+\* Split2 witnesses (expected to be violated: the paths are reachable)
+\* a retry after the split, homed at the anchor's child
+NoChildHome == \A a \in Attempts : plan[a].home \notin {C1, C2}
+\* a decision record carried to C1 while a participant is still prepared
+NoCarriedLookup == \A a \in Attempts : ~ (a \in rec[C1] /\ \E q \in Parts : Unreleased(a, q))
+\* a participant still prepared after the split and the deadline
+NoExpiredAfterSplit ==
+  ~ (retired /\ \E a \in Attempts : plan[a].home = 1 /\ a \in expired /\ \E q \in Parts : Unreleased(a, q))
+\* a prepare rejected by the drain
+NoSplittingReject == ~ (sp.draining /\ \E a \in Attempts : rej[a] /\ 1 \in plan[a].P /\ ~ HasPrep(a, 1))
+
 Safety ==
   /\ TypeOK /\ OneDecision /\ ReleaseAgrees /\ AtomicVisibility /\ AbortInvisible
   /\ DecisionContextCovers /\ ResolveCorrect /\ NoDoubleApply /\ AtMostOnce
@@ -689,4 +789,6 @@ EventuallyForgotten ==
   \A a \in Attempts : (TrueOut(a) # "none") ~> (\A h \in Parts : a \notin rec[h])
 \* completion is eventual only while the quorums are available
 CompletionUnderAvailability == (<>[] AllUp) => (IntentsReleased /\ EventuallyDecided)
+\* Split2: a drain that starts ends in the split
+DrainTerminates == sp.draining ~> retired
 =============================================================================

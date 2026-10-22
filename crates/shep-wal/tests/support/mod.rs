@@ -1,4 +1,4 @@
-//! A WAL cluster in this process, on loopback gRPC, plus a toy materializer
+//! A WAL cluster in this process, on loopback shep-rpc, plus a toy materializer
 //! that tails the log so tests can read at versions and check what committed.
 
 #![allow(dead_code)]
@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use futures::StreamExt;
+use shep_smp::{Smp, SmpConfig};
 use shep_wal::{WalConfig, WalNode};
 use shep_wal_client::api::{
     Decided, DecidedStatus, Dot, Dvv, EntryKind, KeyRange, LogEntry, Member, Mutation, PartitionId,
@@ -31,19 +32,29 @@ pub fn init_tracing() {
 
 type Configure = dyn Fn(usize, &mut WalConfig) + Send + Sync;
 
+/// Cores per node.
+pub const CORES: usize = 2;
+
 pub struct Cluster {
-    nodes: Vec<Option<WalNode>>,
+    nodes: Vec<Option<(WalNode, Smp)>>,
     dirs: Vec<TempDir>,
     addrs: Vec<SocketAddr>,
     configure: Arc<Configure>,
+    /// Every node is a seed of a controller-founded cluster.
+    controlled: bool,
     pub client: WalClient,
 }
 
 /// Timeouts short enough for tests, long enough not to flap on a busy machine.
 pub fn test_config(config: &mut WalConfig) {
-    config.heartbeat_interval = Duration::from_millis(100);
-    config.election_timeout = Duration::from_millis(600)..Duration::from_millis(1200);
-    config.commit_timeout = Duration::from_secs(2);
+    config.raft.heartbeat_interval = Duration::from_millis(100);
+    config.raft.election_timeout = Duration::from_millis(600)..Duration::from_millis(1200);
+    config.raft.reconnect = shep_rpc::ReconnectConfig {
+        initial_backoff: Duration::from_millis(50),
+        max_backoff: Duration::from_millis(200),
+        connect_timeout: Duration::from_millis(500),
+    };
+    config.raft.proposals.commit_timeout = Duration::from_secs(2);
 }
 
 impl Cluster {
@@ -87,12 +98,13 @@ impl Cluster {
             dirs: (0..n).map(|_| tempfile::tempdir().unwrap()).collect(),
             addrs,
             configure: Arc::new(configure),
+            controlled: false,
             client,
         };
         for (i, l) in listeners.into_iter().enumerate() {
-            let node = cluster.open(i).await;
+            let (node, smp) = cluster.open(i).await;
             node.serve(l);
-            cluster.nodes.push(Some(node));
+            cluster.nodes.push(Some((node, smp)));
         }
         for &p in partitions {
             cluster.create_partition(p).await;
@@ -100,11 +112,93 @@ impl Cluster {
         cluster
     }
 
-    async fn open(&self, i: usize) -> WalNode {
+    async fn open(&self, i: usize) -> (WalNode, Smp) {
         let mut config = WalConfig::new(i as u64 + 1, self.dirs[i].path());
         test_config(&mut config);
+        if self.controlled {
+            config.seeds = self.members();
+        }
         (self.configure)(i, &mut config);
-        WalNode::open(config).await.unwrap()
+        let smp = Smp::start(SmpConfig {
+            pin: false,
+            ..SmpConfig::with_cores(CORES)
+        })
+        .unwrap();
+        (WalNode::start(config, smp.clone()).await.unwrap(), smp)
+    }
+
+    /// `n` nodes that found a cluster with a WAL controller; partitions come
+    /// from the controller.
+    pub async fn start_controlled(n: usize) -> Cluster {
+        Cluster::start_controlled_some(n, n).await
+    }
+
+    /// Like `start_controlled`, starting only the first `running` nodes; the
+    /// others start with `restart`.
+    pub async fn start_controlled_some(n: usize, running: usize) -> Cluster {
+        Cluster::start_controlled_with(n, running, |_, _| {}).await
+    }
+
+    /// Like `start_controlled_some`, configuring each node by index after its
+    /// seeds are set.
+    pub async fn start_controlled_with(
+        n: usize,
+        running: usize,
+        configure: impl Fn(usize, &mut WalConfig) + Send + Sync + 'static,
+    ) -> Cluster {
+        init_tracing();
+        let mut listeners = Vec::new();
+        let mut addrs = Vec::new();
+        for _ in 0..n {
+            let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            addrs.push(l.local_addr().unwrap());
+            listeners.push(l);
+        }
+        let client = WalClient::with_config(
+            addrs.iter().map(|a| a.to_string()),
+            ClientConfig {
+                propose_deadline: Duration::from_secs(20),
+                ..ClientConfig::default()
+            },
+        )
+        .unwrap();
+        let mut cluster = Cluster {
+            nodes: Vec::new(),
+            dirs: (0..n).map(|_| tempfile::tempdir().unwrap()).collect(),
+            addrs,
+            configure: Arc::new(configure),
+            controlled: true,
+            client,
+        };
+        for (i, l) in listeners.into_iter().enumerate() {
+            if i >= running {
+                drop(l);
+                cluster.nodes.push(None);
+                continue;
+            }
+            let (node, smp) = cluster.open(i).await;
+            node.serve(l);
+            cluster.nodes.push(Some((node, smp)));
+        }
+        cluster
+    }
+
+    /// Waits for every running node to see the cluster founded, and returns
+    /// its ID.
+    pub async fn founded(&self) -> Bytes {
+        for _ in 0..1500 {
+            let mut ids = Vec::new();
+            for (n, _) in self.nodes.iter().flatten() {
+                ids.push(n.controller_state().await.and_then(|s| s.cluster_id));
+            }
+            if let Some(Some(id)) = ids.first()
+                && ids.iter().all(|i| i.as_ref() == Some(id))
+            {
+                return id.clone();
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("the cluster was never founded");
     }
 
     pub fn len(&self) -> usize {
@@ -112,7 +206,7 @@ impl Cluster {
     }
 
     pub fn members(&self) -> Vec<Member> {
-        (0..self.len())
+        (0..self.addrs.len())
             .map(|i| Member {
                 node_id: i as u64 + 1,
                 addr: self.addr(i),
@@ -132,9 +226,9 @@ impl Cluster {
         self.leader(p).await;
     }
 
-    /// Node `i`'s replica directory for `p`.
+    /// Node `i`'s log directory for `p`.
     pub fn replica_dir(&self, i: usize, p: PartitionId) -> std::path::PathBuf {
-        self.dirs[i].path().join("partitions").join(p.0.to_string())
+        self.dirs[i].path().join("logs").join(p.0.to_string())
     }
 
     pub fn addr(&self, i: usize) -> String {
@@ -142,7 +236,7 @@ impl Cluster {
     }
 
     pub fn node(&self, i: usize) -> &WalNode {
-        self.nodes[i].as_ref().expect("node is stopped")
+        &self.nodes[i].as_ref().expect("node is stopped").0
     }
 
     pub fn node_client(&self, i: usize) -> NodeClient {
@@ -162,13 +256,15 @@ impl Cluster {
     /// Like `leader`, but waits for a leader that satisfies `ok`.
     pub async fn leader_where(&self, p: PartitionId, ok: impl Fn(usize) -> bool) -> usize {
         for _ in 0..1000 {
-            let views: Vec<Option<u64>> = self
+            let mut views: Vec<Option<u64>> = Vec::new();
+            for (n, _) in self
                 .nodes
                 .iter()
                 .flatten()
-                .filter(|n| !n.faults().is_partitioned())
-                .map(|n| n.partition_status(p).unwrap().leader.map(|m| m.node_id))
-                .collect();
+                .filter(|(n, _)| !n.faults().is_partitioned())
+            {
+                views.push(n.status(p).await.and_then(|s| s.leader).map(|m| m.node_id));
+            }
             if let Some(&Some(id)) = views.first()
                 && views.iter().all(|v| *v == Some(id))
             {
@@ -184,14 +280,15 @@ impl Cluster {
 
     /// Stops node `i`, as if its process exited.
     pub async fn stop(&mut self, i: usize) {
-        let node = self.nodes[i].take().expect("already stopped");
+        let (node, smp) = self.nodes[i].take().expect("already stopped");
         node.shutdown().await;
+        smp.shutdown().await;
     }
 
     /// Restarts node `i` from its data directory, at its address.
     pub async fn restart(&mut self, i: usize) {
         assert!(self.nodes[i].is_none(), "node {i} is running");
-        let node = self.open(i).await;
+        let (node, smp) = self.open(i).await;
         let mut tries = 0;
         let listener = loop {
             match TcpListener::bind(self.addrs[i]).await {
@@ -205,7 +302,7 @@ impl Cluster {
             }
         };
         node.serve(listener);
-        self.nodes[i] = Some(node);
+        self.nodes[i] = Some((node, smp));
     }
 
     pub async fn shutdown(mut self) {
@@ -322,16 +419,25 @@ pub async fn read_node_log(
     p: PartitionId,
     through: u64,
 ) -> Vec<LogEntry> {
-    let stream = cluster.node_client(i).tail(p, 0).await.unwrap();
-    futures::pin_mut!(stream);
+    let node = cluster.node_client(i);
     let mut out: Vec<LogEntry> = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
     while out.last().is_none_or(|e| e.dot.index < through) {
-        let batch = tokio::time::timeout(Duration::from_secs(20), stream.next())
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "node {i} never served index {through}"
+        );
+        let next = out.last().map_or(0, |e| e.dot.index + 1);
+        match node
+            .fetch(p, next, 1 << 20, Duration::from_millis(200))
             .await
-            .expect("tail stalled")
-            .expect("tail ended")
-            .unwrap();
-        out.extend(batch);
+        {
+            Ok((entries, _)) => out.extend(entries),
+            Err(e) => {
+                tracing::debug!("fetch from node {i}: {e}");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
     }
     out.truncate(through as usize + 1);
     out

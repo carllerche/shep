@@ -47,6 +47,13 @@ fn intersection() {
     assert!(!empty.intersects(&KeyRange::starting_at(b(""))));
 }
 
+fn round_trip<T: shep_codec::Encode + shep_codec::Decode + PartialEq + std::fmt::Debug>(v: &T) {
+    assert_eq!(
+        &shep_codec::from_bytes::<T>(shep_codec::to_bytes(v)).unwrap(),
+        v
+    );
+}
+
 #[test]
 fn proposals_round_trip() {
     let p = Proposal {
@@ -64,18 +71,18 @@ fn proposals_round_trip() {
             reply: b("reply"),
         }),
     };
-    let wire: proto::Proposal = (&p).into();
-    assert_eq!(Proposal::try_from(wire).unwrap(), p);
-
-    let f = Proposal {
+    round_trip(&ProposeRequest {
+        partition: PartitionId(3),
+        proposal: p,
+    });
+    round_trip(&Proposal {
         idempotency_key: b("k"),
         kind: ProposalKind::Failure { reply: b("no") },
-    };
-    assert_eq!(Proposal::try_from(proto::Proposal::from(&f)).unwrap(), f);
+    });
 }
 
 #[test]
-fn responses_round_trip() {
+fn replies_round_trip() {
     let results: Vec<Result<Decided, Rejection>> = vec![
         Ok(Decided {
             dot: Dot::new(PartitionId(3), 12),
@@ -97,15 +104,16 @@ fn responses_round_trip() {
         Err(Rejection::Invalid("bad".into())),
     ];
     for r in results {
-        let wire: proto::ProposeResponse = (&r).into();
-        assert_eq!(Result::<Decided, Rejection>::try_from(wire).unwrap(), r);
+        let reply = ProposeReply::from(r.clone());
+        round_trip(&reply);
+        assert_eq!(Result::<Decided, Rejection>::from(reply), r);
     }
 }
 
 #[test]
 fn log_entries_round_trip() {
     let p = PartitionId(5);
-    let entries = [
+    let kinds = [
         EntryKind::Internal,
         EntryKind::Void,
         EntryKind::Failure {
@@ -119,23 +127,61 @@ fn log_entries_round_trip() {
             payload: b("delta"),
         }),
     ];
-    for (i, kind) in entries.into_iter().enumerate() {
-        let e = LogEntry {
+    let entries: Vec<_> = kinds
+        .into_iter()
+        .enumerate()
+        .map(|(i, kind)| LogEntry {
             dot: Dot::new(p, i as u64),
             term: 7,
             kind,
-        };
-        assert_eq!(LogEntry::from_proto(p, e.to_proto()).unwrap(), e);
-    }
+        })
+        .collect();
+    round_trip(&FetchReply::Entries {
+        entries,
+        applied_index: Some(3),
+    });
+    round_trip(&FetchReply::OutOfRange { start: 10 });
+    round_trip(&FetchRequest {
+        partition: p,
+        from_index: 4,
+        max_bytes: 1 << 20,
+        max_wait_ms: 50,
+    });
 }
 
 #[test]
-fn missing_fields_are_errors() {
-    assert!(Proposal::try_from(proto::Proposal::default()).is_err());
-    assert!(Result::<Decided, Rejection>::try_from(proto::ProposeResponse::default()).is_err());
-    let mutation = proto::Proposal {
-        idempotency_key: b("k"),
-        kind: Some(proto::proposal::Kind::Mutation(proto::Mutation::default())),
-    };
-    assert!(Proposal::try_from(mutation).is_err());
+fn admin_and_status_round_trip() {
+    round_trip(&StatusReply::Status(PartitionStatus {
+        node_id: 1,
+        term: 2,
+        leader: Some(Member {
+            node_id: 1,
+            addr: "a:1".into(),
+        }),
+        last_log_index: 9,
+        applied_index: None,
+        voters: vec![1, 2, 3],
+    }));
+    round_trip(&InitializePartitionRequest {
+        partition: PartitionId(1),
+        members: vec![Member {
+            node_id: 1,
+            addr: "a:1".into(),
+        }],
+    });
+    round_trip(&AdminReply::Failed("x".into()));
+}
+
+#[test]
+fn method_ids_belong_to_the_wal_service() {
+    for m in [
+        method::PROPOSE,
+        method::FETCH,
+        method::STATUS,
+        method::CREATE_PARTITION,
+        method::INITIALIZE_PARTITION,
+    ] {
+        assert!(method::is_wal(m));
+    }
+    assert!(!method::is_wal(shep_rpc::method_id(1, 1)));
 }

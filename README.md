@@ -1,56 +1,63 @@
 # Shep
 
 A versioned graph data service for internal apps, on its own Raft-replicated
-log and SlateDB storage. See [docs/design.md](docs/design.md) for the design.
+log. See [docs/design.md](docs/design.md) for the design.
 
-This is a fresh start: the earlier Postgres prototype (milestone 1) is gone,
-and the implementation is being rebuilt from the WAL up (milestone 2, §18).
+The implementation is being built from the WAL up (milestone 2, §18). The
+WAL is modeled on Redpanda: thread-per-core, Redpanda's RPC framing and
+serialization, segmented logs, and a controller group that every node
+replicates.
 
 ## Layout
 
 | Crate | What it does |
 |---|---|
-| `crates/shep-version` | Dots, dotted version vectors (§9) |
-| `crates/shep-wal-api` | The WAL's client protocol: gRPC definitions and the types around them |
-| `crates/shep-wal` | The WAL: a Raft group per partition (openraft), durable log segments, leader validation (§10.3) |
-| `crates/shep-wal-client` | Client for the WAL: proposals routed to leaders, log tailing |
-| `formal/lean` | Lean 4 proofs of the semantics the design relies on |
-| `formal/tla` | TLA+ models of the protocols; `WalValidate.tla` specifies the WAL |
+| `crates/shep-version` | Dots and dotted version vectors (§9) |
+| `crates/shep-codec` (+ `-derive`) | Binary serialization with versioned envelopes, after Redpanda's `serde` |
+| `crates/shep-rpc` | Internal RPC, after Redpanda's: 26-byte checksummed frames, pipelined calls, reconnect with backoff |
+| `crates/shep-smp` | Thread-per-core: a `current_thread` runtime per core, bounded mailboxes, sharded services |
+| `crates/shep-storage` | Per-core storage, after Redpanda's: segmented logs with coalesced fsync and crash recovery, and a key-value store |
+| `crates/shep-raft-engine` | openraft 0.10.0-alpha.37, forked (see its `FORK.md`), with its test suite |
+| `crates/shep-raft-memstore`, `crates/shep-raft-legacy` | openraft's test-support crates, vendored |
+| `crates/shep-raft` | Embeddable multi-raft per core. Each group runs the embedder's `Machine`, which admits proposals on the leader and applies them everywhere. The crate handles void entries, rebuilding leader-side state, idempotency keys, commit times and tailing. Also: pipelined appends, heartbeats batched per node pair, logs on `shep-storage`, node-local core placement |
+| `crates/shep-wal-api` | The WAL's client protocol |
+| `crates/shep-wal` | The WAL, as an embedder of `shep-raft`: a group per partition whose machine validates proposals (§10.3), and the node's side of the controller |
+| `crates/shep-wal-controller` | The WAL controller, a `Machine` too: members, log sets and partitions, rebuilt from its log (§9.6). A universe is a log set under Shep's rules |
+| `crates/shep-wal-client` | Client: proposals routed to leaders, long-poll log tailing, log sets and universes |
+| `crates/shep-node` | The `shep-node` binary: every service in one process |
+| `tests/test-node` | End-to-end tests that run `shep-node` processes |
+| `formal/lean`, `formal/tla` | Lean proofs and TLA+ models of the design's semantics and protocols |
 
-Each crate's interface is tested from `crates/<crate>/tests/`. There are no
-unit tests in `src`. Tests that span many components go in
-`tests/test-<aspect>` crates.
-
-## The WAL
-
-A WAL node hosts replicas of any number of partitions and serves three gRPC
-services on one address: `shep.wal.v1.Wal` (propose, tail, status),
-`shep.wal.v1.WalAdmin` (create and initialize partitions), and
-`shep.wal.raft.v1.Raft` between replicas. Protos are compiled in-process
-with `protox`, so building needs only Cargo.
-
-- **Proposals** carry a read version `S`, a context, a read set and a write
-  set of key ranges, an opaque payload, and a required idempotency key. The
-  leader rejects with `contended` if an entry in its validation table that
-  `S` doesn't contain wrote inside the read set, and with `too_old` if `S` is
-  older than the table. Write sets enter the table when the entry is handed
-  to Raft, before it commits.
-- **Leader changes.** A new leader rebuilds its validation and idempotency
-  tables from its own log, committed or not, before accepting. Each entry
-  records the term it was validated in; one appended under any other term is
-  void, which closes the race between a leader learning its term and Raft
-  appending.
-- **Idempotency.** A key's first decided outcome is its only outcome. A
-  front end whose re-execution fails records the failure as the key's
-  outcome (`Failure` proposals), per finding FR-W3 in `WalValidate.tla`.
-- **Readers** stream committed entries from any replica (`Tail`).
-- **Storage.** Checksummed records in segment files, written before `append`
-  returns and synced by a background flusher that batches; the vote and
-  snapshots are replaced atomically. A torn final record is truncated on
-  recovery. Nothing is purged yet: archiving comes later (§10.4).
+Each crate's interface is tested from `crates/<crate>/tests/`; there are no
+unit tests in `src` (the vendored openraft crates keep theirs). Tests that
+span many components go in `tests/test-<aspect>` crates.
 
 ## Running
 
 ```sh
 cargo test --workspace
 ```
+
+A single server is a complete deployment, without replication:
+
+```sh
+cargo run -p shep-node -- --id 1 --listen 127.0.0.1:7001 --data-dir ./data/1
+```
+
+A cluster names its founding members on every node:
+
+```sh
+shep-node --id 1 --listen 10.0.0.1:7000 --data-dir /var/lib/shep \
+  --seed 1=10.0.0.1:7000 --seed 2=10.0.0.2:7000 --seed 3=10.0.0.3:7000
+```
+
+## Status
+
+- **Built:** the WAL on its own Raft, validation with read and write sets,
+  idempotency, leader-change rebuilds, crash recovery, long-poll tailing,
+  the controller (founding from seeds, universes with their meta and data
+  partitions, each node reconciling its replicas), and the single binary.
+- **Next:** node join after founding, partition moves and splits, the
+  feature table, cluster identity checks on connect, lightweight heartbeats,
+  follower-admitted recovery, moving replicas between cores, then the
+  materializer.

@@ -1,306 +1,289 @@
-//! A partition replica's Raft state machine.
-//!
-//! The log itself is what readers consume, so the state machine is small: the
-//! idempotency table, which records each key's outcome for the idempotency
-//! window and travels in snapshots (§10.3), and the applied position, which
-//! tells tailers how far the log is committed.
+//! The machines a WAL node's groups run: Shep's partitions, which validate
+//! proposals against a leader-side table (§10.3), and the controller.
 
-use std::collections::{HashMap, VecDeque};
-use std::io;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::collections::HashMap;
 
 use bytes::Bytes;
-use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine, Snapshot};
-use openraft::{AnyError, BasicNode, EntryPayload, LogId, StorageIOError, StoredMembership};
-use prost::Message;
-use shep_wal_api::{Decided, DecidedStatus, Dot, PartitionId};
-use tokio::sync::watch;
+use shep_codec::{Decode, Encode};
+use shep_raft::{Admit, Entry, GroupId, Machine, Resolution};
+use shep_wal_api::{PartitionId, ProposalKind, Rejection};
+use shep_wal_controller::{CONTROLLER_GROUP, ControllerSm, LogSetRules, NameRule, Outcome};
 
-use crate::log_store::{read_atomic, write_atomic};
-use crate::raft_types::{self, Applied, Entry, SnapshotMeta, StorageError, TypeConfig, proto};
+use crate::command::PartitionCommand;
+use crate::table::{SlotIndex, Table};
 
-#[derive(Clone)]
-pub(crate) struct StateMachine {
-    shared: Arc<Shared>,
+/// The most data partitions one universe can have. A universe is a log set
+/// whose first partition is its meta partition and the rest its data.
+pub const MAX_DATA_PARTITIONS: usize = 1024;
+
+/// Shep's rules for log sets: universes, named by DNS domains (§14).
+pub fn universe_rules() -> LogSetRules {
+    LogSetRules {
+        max_partitions: 1 + MAX_DATA_PARTITIONS,
+        names: NameRule::Domain,
+    }
 }
 
-struct Shared {
+/// A partition: the log is what readers consume, so the replicated state is
+/// nothing (shep-raft keeps the idempotency keys). The leader-side state is
+/// the validation table.
+pub struct PartitionSm {
     partition: PartitionId,
-    dir: PathBuf,
-    state: Mutex<State>,
-    applied: watch::Sender<Option<u64>>,
+    leader: Option<Leader>,
 }
 
-#[derive(Default)]
-struct State {
-    last_applied: Option<LogId<u64>>,
-    membership: StoredMembership<u64, BasicNode>,
-    keys: HashMap<Bytes, DecidedKey>,
-    /// Keys in the order they were decided, for forgetting them.
-    order: VecDeque<(u64, Bytes)>,
-    snapshot: Option<(SnapshotMeta, Vec<u8>)>,
-    snapshot_seq: u64,
+struct Leader {
+    table: Table,
+    /// Admissions not yet resolved, to their slots in the table.
+    slots: HashMap<u64, u64>,
 }
 
-#[derive(Clone, Debug)]
-struct DecidedKey {
-    index: u64,
-    commit_time_us: u64,
-    failed: bool,
-    reply: Bytes,
-}
-
-impl State {
-    fn forget_before(&mut self, floor_us: u64) {
-        while let Some((index, key)) = self.order.front() {
-            let Some(rec) = self.keys.get(key) else {
-                self.order.pop_front();
-                continue;
-            };
-            if rec.index != *index {
-                // Superseded; only the newest record counts.
-                self.order.pop_front();
-                continue;
-            }
-            if rec.commit_time_us >= floor_us {
-                break;
-            }
-            self.keys.remove(key);
-            self.order.pop_front();
+impl PartitionSm {
+    pub fn new(partition: PartitionId) -> PartitionSm {
+        PartitionSm {
+            partition,
+            leader: None,
         }
     }
+}
 
-    fn decide(&mut self, key: Bytes, rec: DecidedKey) {
-        if let Some(prev) = self.keys.get(&key) {
-            // The leader checks keys before appending, so this is a bug.
-            tracing::error!(
-                ?key,
-                prev = prev.index,
-                index = rec.index,
-                "idempotency key decided twice"
+impl Machine for PartitionSm {
+    type Proposal = ProposalKind;
+    type Command = PartitionCommand;
+    type Rejection = Rejection;
+    /// Whether the key's outcome is a failure.
+    type Response = bool;
+
+    fn lead(&mut self, term: u64, floor: u64) {
+        self.leader = Some(Leader {
+            table: Table::new(self.partition, term, floor),
+            slots: HashMap::new(),
+        });
+    }
+
+    fn replay(&mut self, entry: &Entry<PartitionCommand>) {
+        if let Some(l) = &mut self.leader {
+            l.table.push(
+                SlotIndex::Known(entry.index),
+                entry.command.write_set(),
+                entry.commit_time_us,
             );
         }
-        self.order.push_back((rec.index, key.clone()));
-        self.keys.insert(key, rec);
     }
 
-    fn encode(&self) -> Vec<u8> {
-        let mut keys: Vec<_> = self.keys.iter().collect();
-        keys.sort_by_key(|(_, r)| r.index);
-        proto::StateMachineSnapshot {
-            keys: keys
-                .into_iter()
-                .map(|(k, r)| proto::DecidedKey {
-                    idempotency_key: k.clone(),
-                    index: r.index,
-                    commit_time_us: r.commit_time_us,
-                    failed: r.failed,
-                    reply: r.reply.clone(),
-                })
-                .collect(),
-        }
-        .encode_to_vec()
-    }
-
-    fn restore(&mut self, meta: &SnapshotMeta, data: &[u8]) -> io::Result<()> {
-        let snap = proto::StateMachineSnapshot::decode(data).map_err(io::Error::other)?;
-        self.keys.clear();
-        self.order.clear();
-        for k in snap.keys {
-            self.decide(
-                k.idempotency_key,
-                DecidedKey {
-                    index: k.index,
-                    commit_time_us: k.commit_time_us,
-                    failed: k.failed,
-                    reply: k.reply,
-                },
-            );
-        }
-        self.last_applied = meta.last_log_id;
-        self.membership = meta.last_membership.clone();
-        self.snapshot = Some((meta.clone(), data.to_vec()));
-        Ok(())
-    }
-}
-
-impl StateMachine {
-    pub(crate) fn open(partition: PartitionId, dir: &Path) -> io::Result<StateMachine> {
-        let mut state = State::default();
-        if let Some(bytes) = read_atomic(dir, "snapshot")? {
-            let stored = proto::StoredSnapshot::decode(&bytes[..]).map_err(io::Error::other)?;
-            let meta =
-                raft_types::snapshot_meta_from_proto(stored.meta).map_err(io::Error::other)?;
-            state.restore(&meta, &stored.data)?;
-        }
-        let (applied, _) = watch::channel(state.last_applied.map(|l| l.index));
-        Ok(StateMachine {
-            shared: Arc::new(Shared {
-                partition,
-                dir: dir.to_path_buf(),
-                state: Mutex::new(state),
-                applied,
-            }),
-        })
-    }
-
-    /// The key's outcome, if it's decided and remembered.
-    pub(crate) fn lookup(&self, key: &[u8]) -> Option<Decided> {
-        let st = self.shared.state.lock().unwrap();
-        st.keys.get(key).map(|r| Decided {
-            dot: Dot::new(self.shared.partition, r.index),
-            commit_time_us: r.commit_time_us,
-            status: if r.failed {
-                DecidedStatus::Failed
-            } else {
-                DecidedStatus::Committed
-            },
-            reply: r.reply.clone(),
-        })
-    }
-
-    /// The highest index applied, which is committed.
-    pub(crate) fn applied_index(&self) -> Option<u64> {
-        *self.shared.applied.borrow()
-    }
-
-    pub(crate) fn subscribe(&self) -> watch::Receiver<Option<u64>> {
-        self.shared.applied.subscribe()
-    }
-
-    /// Waits until `index` is applied.
-    pub(crate) async fn wait_applied(&self, index: u64) {
-        let mut rx = self.subscribe();
-        let _ = rx.wait_for(|a| a.is_some_and(|a| a >= index)).await;
-    }
-
-    fn persist_snapshot(&self, meta: &SnapshotMeta, data: &[u8]) -> io::Result<()> {
-        let stored = proto::StoredSnapshot {
-            meta: Some(raft_types::snapshot_meta_to_proto(meta)),
-            data: data.to_vec().into(),
-        };
-        write_atomic(&self.shared.dir, "snapshot", &stored.encode_to_vec())
-    }
-}
-
-impl RaftSnapshotBuilder<TypeConfig> for StateMachine {
-    async fn build_snapshot(&mut self) -> Result<Snapshot<TypeConfig>, StorageError> {
-        let (meta, data) = {
-            let mut st = self.shared.state.lock().unwrap();
-            st.snapshot_seq += 1;
-            let snapshot_id = match st.last_applied {
-                Some(l) => format!("{}-{}-{}", l.leader_id.term, l.index, st.snapshot_seq),
-                None => format!("none-{}", st.snapshot_seq),
-            };
-            let meta = SnapshotMeta {
-                last_log_id: st.last_applied,
-                last_membership: st.membership.clone(),
-                snapshot_id,
-            };
-            let data = st.encode();
-            st.snapshot = Some((meta.clone(), data.clone()));
-            (meta, data)
-        };
-        self.persist_snapshot(&meta, &data).map_err(|e| {
-            StorageIOError::write_snapshot(Some(meta.signature()), AnyError::new(&e))
-        })?;
-        Ok(Snapshot {
-            meta,
-            snapshot: Box::new(data),
-        })
-    }
-}
-
-impl RaftStateMachine<TypeConfig> for StateMachine {
-    type SnapshotBuilder = StateMachine;
-
-    async fn applied_state(
+    /// Validates a proposal (§10.3): it commits only if no entry its read
+    /// version doesn't contain wrote a key in its read set or a range it
+    /// read, including entries appended but not yet committed.
+    fn admit(
         &mut self,
-    ) -> Result<(Option<LogId<u64>>, StoredMembership<u64, BasicNode>), StorageError> {
-        let st = self.shared.state.lock().unwrap();
-        Ok((st.last_applied, st.membership.clone()))
-    }
-
-    async fn apply<I>(&mut self, entries: I) -> Result<Vec<Applied>, StorageError>
-    where
-        I: IntoIterator<Item = Entry> + Send,
-        I::IntoIter: Send,
-    {
-        let mut out = Vec::new();
-        let last = {
-            let mut st = self.shared.state.lock().unwrap();
-            for entry in entries {
-                let applied = match entry.payload {
-                    EntryPayload::Blank => Applied::Internal,
-                    EntryPayload::Membership(m) => {
-                        st.membership = StoredMembership::new(Some(entry.log_id), m);
-                        Applied::Internal
-                    }
-                    EntryPayload::Normal(cmd) if raft_types::is_void(&entry.log_id, &cmd) => {
-                        Applied::Void
-                    }
-                    EntryPayload::Normal(cmd) => {
-                        st.forget_before(cmd.idempotency_floor_us);
-                        let (failed, reply) = match cmd.kind {
-                            Some(proto::command::Kind::Mutation(m)) => (false, m.reply),
-                            Some(proto::command::Kind::Failure(f)) => (true, f.reply),
-                            None => (true, Bytes::new()),
-                        };
-                        let rec = DecidedKey {
-                            index: entry.log_id.index,
-                            commit_time_us: cmd.commit_time_us,
-                            failed,
-                            reply: reply.clone(),
-                        };
-                        st.decide(cmd.idempotency_key, rec);
-                        Applied::Decided {
-                            failed,
-                            commit_time_us: cmd.commit_time_us,
-                            reply,
-                        }
-                    }
-                };
-                st.last_applied = Some(entry.log_id);
-                out.push(applied);
+        admit: &Admit,
+        proposal: ProposalKind,
+    ) -> Result<PartitionCommand, Rejection> {
+        let p = self.partition;
+        let Some(l) = self
+            .leader
+            .as_mut()
+            .filter(|l| l.table.term() == admit.term)
+        else {
+            return Err(Rejection::UnknownOutcome("no validation table".into()));
+        };
+        l.table.evict(admit.window_start_us, admit.window_entries);
+        let command = match proposal {
+            ProposalKind::Mutation(m) => {
+                if !m.context.includes(&m.read_version) {
+                    let msg = "context must include the read version".into();
+                    return Err(Rejection::Invalid(msg));
+                }
+                let next = admit.next_index;
+                if m.read_version.prefix(p) >= next || m.read_version.extras(p).any(|i| i >= next) {
+                    let msg = "read version names entries past the log's end".into();
+                    return Err(Rejection::Invalid(msg));
+                }
+                if m.read_version.prefix(p) < l.table.floor() {
+                    return Err(Rejection::TooOld);
+                }
+                if l.table.conflicts(&m.read_set, &m.read_version) {
+                    return Err(Rejection::Contended);
+                }
+                PartitionCommand::Mutation {
+                    context: m.context,
+                    write_set: m.write_set,
+                    payload: m.payload,
+                    reply: m.reply,
+                }
             }
-            st.last_applied.map(|l| l.index)
+            ProposalKind::Failure { reply } => PartitionCommand::Failure { reply },
         };
-        self.shared.applied.send_replace(last);
-        Ok(out)
+        let slot = l.table.push(
+            SlotIndex::Pending,
+            command.write_set(),
+            admit.commit_time_us,
+        );
+        l.slots.insert(admit.seq, slot);
+        Ok(command)
     }
 
-    async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
-        self.clone()
+    fn resolve(&mut self, seq: u64, resolution: Resolution) {
+        let Some(l) = &mut self.leader else { return };
+        let Some(slot) = l.slots.remove(&seq) else {
+            return;
+        };
+        let index = match resolution {
+            Resolution::Appended(i) => SlotIndex::Known(i),
+            Resolution::Void(i) => SlotIndex::Void(i),
+            Resolution::NotAppended => SlotIndex::NotAppended,
+            // Its slot stays unseen-by-everyone, which only costs conflicts:
+            // the term is usually over, and the table with it.
+            Resolution::Unknown => return,
+        };
+        l.table.resolve(slot, index);
     }
 
-    async fn begin_receiving_snapshot(&mut self) -> Result<Box<Vec<u8>>, StorageError> {
-        Ok(Box::default())
+    fn apply(&mut self, entry: &Entry<PartitionCommand>) -> bool {
+        entry.command.failed()
     }
 
-    async fn install_snapshot(
+    fn snapshot(&self) -> Bytes {
+        Bytes::new()
+    }
+
+    fn restore(&mut self, _: Bytes) {}
+}
+
+/// Every group a WAL node hosts is the controller or a partition (an enum,
+/// not a trait: the node knows both kinds).
+pub enum GroupSm {
+    Controller(ControllerSm),
+    Partition(PartitionSm),
+}
+
+pub enum GroupProposal {
+    Controller(shep_wal_controller::Proposal),
+    Partition(ProposalKind),
+}
+
+#[derive(Clone, Debug, PartialEq, Encode, Decode)]
+pub enum GroupCommand {
+    Controller(shep_wal_controller::Command),
+    Partition(PartitionCommand),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GroupRejection {
+    Controller(String),
+    Partition(Rejection),
+    /// A proposal for the other kind of group.
+    WrongGroup,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub enum GroupResponse {
+    Controller(Outcome),
+    Partition(bool),
+    /// A command for the other kind of group, which admission never makes.
+    WrongGroup,
+}
+
+impl GroupSm {
+    pub fn for_group(group: GroupId) -> GroupSm {
+        if group == CONTROLLER_GROUP {
+            GroupSm::Controller(ControllerSm::new(universe_rules()))
+        } else {
+            GroupSm::Partition(PartitionSm::new(PartitionId(group.0)))
+        }
+    }
+
+    pub(crate) fn controller(&self) -> Option<&ControllerSm> {
+        match self {
+            GroupSm::Controller(c) => Some(c),
+            GroupSm::Partition(_) => None,
+        }
+    }
+}
+
+impl Machine for GroupSm {
+    type Proposal = GroupProposal;
+    type Command = GroupCommand;
+    type Rejection = GroupRejection;
+    type Response = GroupResponse;
+
+    fn admit(
         &mut self,
-        meta: &SnapshotMeta,
-        snapshot: Box<Vec<u8>>,
-    ) -> Result<(), StorageError> {
-        let err = |e: io::Error| {
-            StorageIOError::write_snapshot(Some(meta.signature()), AnyError::new(&e))
-        };
-        self.persist_snapshot(meta, &snapshot).map_err(err)?;
-        let last = {
-            let mut st = self.shared.state.lock().unwrap();
-            st.restore(meta, &snapshot).map_err(err)?;
-            st.last_applied.map(|l| l.index)
-        };
-        self.shared.applied.send_replace(last);
-        Ok(())
+        admit: &Admit,
+        proposal: GroupProposal,
+    ) -> Result<GroupCommand, GroupRejection> {
+        match (self, proposal) {
+            (GroupSm::Controller(c), GroupProposal::Controller(p)) => c
+                .admit(admit, p)
+                .map(GroupCommand::Controller)
+                .map_err(GroupRejection::Controller),
+            (GroupSm::Partition(s), GroupProposal::Partition(p)) => s
+                .admit(admit, p)
+                .map(GroupCommand::Partition)
+                .map_err(GroupRejection::Partition),
+            _ => Err(GroupRejection::WrongGroup),
+        }
     }
 
-    async fn get_current_snapshot(&mut self) -> Result<Option<Snapshot<TypeConfig>>, StorageError> {
-        let st = self.shared.state.lock().unwrap();
-        Ok(st.snapshot.as_ref().map(|(meta, data)| Snapshot {
-            meta: meta.clone(),
-            snapshot: Box::new(data.clone()),
-        }))
+    fn lead(&mut self, term: u64, floor: u64) {
+        match self {
+            GroupSm::Controller(c) => c.lead(term, floor),
+            GroupSm::Partition(p) => p.lead(term, floor),
+        }
+    }
+
+    fn replay(&mut self, entry: &Entry<GroupCommand>) {
+        match (self, &entry.command) {
+            (GroupSm::Controller(c), GroupCommand::Controller(cmd)) => c.replay(&with(entry, cmd)),
+            (GroupSm::Partition(p), GroupCommand::Partition(cmd)) => p.replay(&with(entry, cmd)),
+            _ => {}
+        }
+    }
+
+    fn resolve(&mut self, seq: u64, resolution: Resolution) {
+        match self {
+            GroupSm::Controller(c) => c.resolve(seq, resolution),
+            GroupSm::Partition(p) => p.resolve(seq, resolution),
+        }
+    }
+
+    fn apply(&mut self, entry: &Entry<GroupCommand>) -> GroupResponse {
+        match (self, &entry.command) {
+            (GroupSm::Controller(c), GroupCommand::Controller(cmd)) => {
+                GroupResponse::Controller(c.apply(&with(entry, cmd)))
+            }
+            (GroupSm::Partition(p), GroupCommand::Partition(cmd)) => {
+                GroupResponse::Partition(p.apply(&with(entry, cmd)))
+            }
+            _ => {
+                tracing::error!(index = entry.index, "a command for another kind of group");
+                GroupResponse::WrongGroup
+            }
+        }
+    }
+
+    fn snapshot(&self) -> Bytes {
+        match self {
+            GroupSm::Controller(c) => c.snapshot(),
+            GroupSm::Partition(p) => p.snapshot(),
+        }
+    }
+
+    fn restore(&mut self, snapshot: Bytes) {
+        match self {
+            GroupSm::Controller(c) => c.restore(snapshot),
+            GroupSm::Partition(p) => p.restore(snapshot),
+        }
+    }
+}
+
+/// `entry` with its command narrowed to one kind of group's.
+fn with<C: Clone>(entry: &Entry<GroupCommand>, command: &C) -> Entry<C> {
+    Entry {
+        index: entry.index,
+        term: entry.term,
+        commit_time_us: entry.commit_time_us,
+        key: entry.key.clone(),
+        command: command.clone(),
     }
 }

@@ -1,0 +1,5 @@
+error: `#[codec(default)]` fields must be trailing: a field can only be missing from old data if every field after it is too
+ --> tests/ui/default_not_trailing.rs:5:5
+  |
+5 |     b: u8,
+  |     ^

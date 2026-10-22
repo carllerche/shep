@@ -1,0 +1,133 @@
+//! RaftNetwork trait for chunk-based snapshot transmission.
+//!
+//! This is the v1 network API that uses `install_snapshot()` for chunked snapshot transfer.
+//! For new implementations, prefer `RaftNetworkV2` which uses `full_snapshot()`.
+
+use std::time::Duration;
+
+use anyerror::AnyError;
+use openraft::OptionalSend;
+use openraft::OptionalSync;
+use openraft::RaftTypeConfig;
+use openraft::errors::RPCError;
+use openraft::errors::RaftError;
+use openraft::errors::Unreachable;
+use openraft::network::Backoff;
+use openraft::network::RPCOption;
+use openraft::raft::AppendEntriesRequest;
+use openraft::raft::AppendEntriesResponse;
+use openraft::raft::TransferLeaderRequest;
+use openraft::raft::TransferLeaderResponse;
+use openraft::raft::VoteRequest;
+use openraft::raft::VoteResponse;
+use openraft_macros::add_async_trait;
+use openraft_macros::since;
+
+use crate::network_v1::Adapter;
+use crate::network_v1::InstallSnapshotError;
+use crate::network_v1::InstallSnapshotRequest;
+use crate::network_v1::InstallSnapshotResponse;
+
+/// A trait defining the interface for a Raft network between cluster members.
+///
+/// This is the v1 network API that uses chunk-based snapshot transmission via
+/// `install_snapshot()`. For new implementations, consider using
+/// [`RaftNetworkV2`](openraft::network::v2::RaftNetworkV2) instead.
+///
+/// To use this trait with openraft, wrap your implementation with
+/// [`Adapter`] to convert it to `RaftNetworkV2`.
+///
+/// A single network instance is used to connect to a single target node. The network instance is
+/// constructed by the [`RaftNetworkFactory`](`openraft::network::RaftNetworkFactory`).
+#[add_async_trait]
+pub trait RaftNetwork<C>: OptionalSend + OptionalSync + 'static
+where C: RaftTypeConfig
+{
+    /// Send an AppendEntries RPC to the target.
+    ///
+    /// This RPC is used for both log replication and heartbeats from the leader.
+    /// Returns `RPCError::Unreachable` if the target node is unreachable.
+    async fn append_entries(
+        &mut self,
+        rpc: AppendEntriesRequest<C>,
+        option: RPCOption,
+    ) -> Result<AppendEntriesResponse<C>, RPCError<C, RaftError<C>>>;
+
+    /// Send an InstallSnapshot RPC to the target.
+    ///
+    /// Transmits a snapshot chunk to help a lagging follower catch up.
+    /// Called when a follower is too far behind to use log replication.
+    async fn install_snapshot(
+        &mut self,
+        rpc: InstallSnapshotRequest<C>,
+        option: RPCOption,
+    ) -> Result<InstallSnapshotResponse<C>, RPCError<C, RaftError<C, InstallSnapshotError>>>;
+
+    /// Send a RequestVote RPC to the target.
+    ///
+    /// Used during leader election to request votes from other nodes.
+    /// A candidate sends this to all cluster members to become leader.
+    async fn vote(
+        &mut self,
+        rpc: VoteRequest<C>,
+        option: RPCOption,
+    ) -> Result<VoteResponse<C>, RPCError<C, RaftError<C>>>;
+
+    /// Send TransferLeader RPC to the target.
+    ///
+    /// The node received this message should pass it to [`Raft::handle_transfer_leader()`].
+    ///
+    /// This method provides a default implementation that just returns [`Unreachable`] error to
+    /// ignore it. In case the application did not implement it, other nodes just wait for the
+    /// Leader lease to timeout and then restart election.
+    ///
+    /// [`Raft::handle_transfer_leader()`]: openraft::raft::Raft::handle_transfer_leader
+    async fn transfer_leader(
+        &mut self,
+        _req: TransferLeaderRequest<C>,
+        _option: RPCOption,
+    ) -> Result<TransferLeaderResponse<C>, RPCError<C>> {
+        Err(RPCError::Unreachable(Unreachable::new(&AnyError::error(
+            "transfer_leader not implemented",
+        ))))
+    }
+
+    /// Build a backoff instance if the target node is temporarily(or permanently) unreachable.
+    ///
+    /// When a [`Unreachable`](`openraft::error::Unreachable`) error is returned from the `Network`
+    /// methods, Openraft does not retry connecting to a node immediately. Instead, it sleeps
+    /// for a while and retries. The duration of the sleep is determined by the backoff
+    /// instance.
+    ///
+    /// The backoff is an infinite iterator that returns the ith sleep interval before the ith
+    /// retry. The returned instance will be dropped if a successful RPC is made.
+    ///
+    /// By default, it returns a constant backoff of 200 ms.
+    fn backoff(&self) -> Backoff {
+        Backoff::new(std::iter::repeat(Duration::from_millis(200)))
+    }
+
+    /// Convert this `RaftNetwork` into an [`Adapter`] that implements `RaftNetworkV2`.
+    ///
+    /// This is a convenience method equivalent to `Adapter::new(self)`.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// impl RaftNetworkFactory<MyConfig> for MyFactory {
+    ///     type Network = Adapter<MyConfig, MyNetwork, MySnapshotData>;
+    ///
+    ///     async fn new_client(&mut self, target: NodeId, node: Node) -> Self::Network {
+    ///         MyNetwork::new(target, node).into_v2()
+    ///     }
+    /// }
+    /// ```
+    #[since(version = "0.10.0")]
+    fn into_v2<SD>(self) -> Adapter<C, Self, SD>
+    where
+        Self: Sized,
+        SD: OptionalSend + 'static,
+    {
+        Adapter::new(self)
+    }
+}

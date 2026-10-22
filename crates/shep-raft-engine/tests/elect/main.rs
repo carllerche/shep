@@ -1,0 +1,16 @@
+#![cfg_attr(feature = "bt", feature(error_generic_member_access))]
+
+extern crate shep_raft_engine as openraft;
+#[macro_use]
+#[path = "../fixtures/mod.rs"]
+mod fixtures;
+
+// The number indicate the preferred running order for these case.
+// The later tests may depend on the earlier ones.
+
+mod t10_elect_compare_last_log;
+mod t11_elect_seize_leadership;
+mod t12_pre_vote;
+mod t13_elect_while_leader;
+mod t14_one_way_isolation;
+mod t15_lease_gates;

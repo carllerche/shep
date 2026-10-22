@@ -135,3 +135,41 @@ failover.
 **Model change.** The model predates the credential-based actor and viewer
 change. `map` now corresponds to the viewer's partition. Its results carry
 over.
+
+## Token model and review fixes (AH10–AH14)
+
+| # | Severity | Finding | Evidence |
+|---|---|---|---|
+| AH10 | medium | A write admitted just before its token expires is appended up to B later. "Bounded by token lifetime" needs each write's deadline capped at exp + skew. | `_tokendeadline` fails; `_token` passes with the cap |
+| AH11 | high | After a split, the parent's live leader keeps the evidence fresh while the deletion commits at the child. | `_splitparent` fails; `_split` passes with the fix |
+| AH12 | high | A follower must not stamp evidence with its own clock. Relaying the leader's stamp unchanged keeps the bound. | `_followerstamp` fails; `_follower` passes |
+| AH13 | confirms, made precise | An RF = 1 restart may skip the lease wait only if the old incarnation is dead. Incarnation IDs don't carry the bound. | `_restart` passes; `_restartzombie` fails |
+| AH14 | confirms | A deleted viewer is denied even under an app-only allow. | `_viewerapponly` passes; `_viewerapponly_nofix` fails |
+
+**The token bound.** Suppose the auth service revokes a token at tr. Any output after that happens by tr + TokLife + ExpSkew + ε at the latest, plus PL for a presigned download. Writes need the exp cap from AH10. Shep's own revocations still take effect within B.
+
+**Model changes.**
+- The partition called `map` is renamed `viewer`, so `_nomap` is now `_noviewer`.
+- `sys` (Shep-issued keys) is superseded and no longer in the design config.
+
+**Results.**
+
+| Config | Distinct states | TLC time |
+|---|---|---|
+| `AuthHorizon` | 8,970,748 | 39s |
+| `_token` | 3,482,684 | 16s |
+| `_split` | 409,104 | 2s |
+| `_follower` | 3,530,264 | 16s |
+| `_restart` | 723,824 | 3s |
+| `_viewerapponly` | 824,872 | 4s |
+
+Every failing config fails in under 1s. The sanity predicates confirm that commits and pushes at the deadline boundary, and residual downloads, are all reachable.
+
+**Doc fixes these findings call for.** The design doc is frozen, so they are not applied.
+- §6.3: a proposal's or decision's deadline is `min(horizon deadline, exp + skew)`. State the token bound exactly, as above.
+- §6.3, "Leases bound stamps": skipping the lease wait at RF = 1 relies on the old process being dead. For example, take an exclusive lock on the WAL directory.
+- `max_wait ≤ (B−2ε)/4` is an availability rule and is not model-checked.
+
+**Implementation status (2026-10-22).**
+- **AH13 is implemented.** `RaftNode::start` takes an exclusive flock on `<data_dir>/LOCK` before opening anything, and holds it until every core has stopped. A second node on the same directory fails to start with `DataDirLocked`. There are in-process and end-to-end tests. Leader restore is off, so a restarted RF = 1 node elects itself in a new term.
+- **AH10 and AH12 are not yet applicable.** Fetch carries no lease evidence yet, and the WAL checks no tokens yet.

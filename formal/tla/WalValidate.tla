@@ -94,10 +94,25 @@ CONSTANTS
   CheckTooOld,  \* TRUE: reject when S's prefix is below the window start
   Fence,        \* TRUE: `complete` reads the lease key (validated) and
                 \*   requires it live at its generation; FALSE: it doesn't
+  Split,        \* FALSE: the leader validates a proposal and appends it in
+                \*   one atomic step (shep-raft's core loop); TRUE: it
+                \*   validates, and appends the validated entry in a later
+                \*   step, possibly after stepping down and being re-elected
+  VoidRule,     \* TRUE: an entry records the term it was validated in, and
+                \*   if it is in a log at another term it is void (a no-op
+                \*   that consumes no key); FALSE: no such rule
+  Durability,   \* "sync": an append is durable at once, no crashes (the
+                \*   configs above); "flushed": Redpanda's rule, a replica's
+                \*   log is durable up to its flushed offset, a crash loses
+                \*   the rest, commit = a majority of FLUSHED offsets (the
+                \*   leader counts itself only once flushed; followers ack
+                \*   after fsync); "unflushed": as flushed, but commit counts
+                \*   appended, unflushed entries (negative)
+  MaxCrash,     \* bound on replica crashes (with Durability # "sync")
   Truncation,   \* TRUE: replicas may truncate committed log prefixes
   TruncFix,     \* TRUE: a leader's too_old window starts no earlier than
                 \*   the first entry still in its log
-  FailMode      \* what a front end does when a re-execution ends in a
+  FailMode,     \* what a front end does when a re-execution ends in a
                 \* failure it would report to the client (a failed
                 \* `require`, `lease_lost`, a claim with no candidates):
                 \* "local":  returns it itself (the design as written)
@@ -109,9 +124,48 @@ CONSTANTS
                 \*           is in its table, and otherwise appends a failure
                 \*           record under the key (the failure is the key's
                 \*           one outcome)
+                \* "fast":   the fast path: a failure goes through the anchor
+                \*           (as "logged") only when the key may already have
+                \*           an outcome: the attempt carries the client's
+                \*           retry mark. A first attempt returns its failure
+                \*           directly, and the client takes it only if it has
+                \*           not moved on to a retry. With "fast", an attempt
+                \*           is begun (Begin) and runs later (Run), so an
+                \*           abandoned attempt can still be in flight.
+  MarkRetry,    \* "fast": TRUE: the client marks every retry; FALSE: never
+  Refusal,      \* "none": validate+append is one step (every config above)
+                \* otherwise the validator puts a Pending slot in its table
+                \* (it conflicts with everything, holds its key) and hands
+                \* the entry to raft, which later, at receipt, appends it
+                \* (if it is leader in the same term with its lease
+                \* established) or refuses it, never appending:
+                \* "design": a refused slot becomes NotAppended (dropped:
+                \*   conflicts with nothing, key released); appended-then-
+                \*   truncated (LogEntryDiscarded) and unknown stay Pending
+                \* "discard_na": LogEntryDiscarded is also treated as
+                \*   NotAppended: the table drops what it holds at that index
+                \* "unknown_release": an appended entry whose response is
+                \*   unknown has its table records released
+                \* "stay_pending": a refused slot stays Pending (the old
+                \*   behaviour; liveness negative)
+  LeaseWindow,  \* (Refusal) TRUE: a fresh leader refuses writes until its
+                \*   first quorum-acked heartbeat; FALSE: no lease window
+  RecvOrder,    \* (Refusal) "fifo": raft receives entries in the order the
+                \*   validator validated them; "any": in any order (negative)
+  HitReply      \* "wait": an idempotency hit on an appended entry gets its
+                \*   outcome once it commits (Reply), and nothing if it is
+                \*   overwritten (the waiter gets not_leader and retries);
+                \* "immediate": the leader answers a hit from its table at
+                \*   once, committed or not (negative)
 
 ASSUME TableAt \in {"append", "commit"} /\ IdemAt \in {"append", "commit"}
-ASSUME FailMode \in {"local", "probe", "logged"}
+ASSUME FailMode \in {"local", "probe", "logged", "fast"}
+ASSUME HitReply \in {"wait", "immediate"}
+ASSUME Refusal \in {"none", "design", "discard_na", "unknown_release", "stay_pending"}
+ASSUME Refusal # "none" => ~ Split /\ Durability = "sync"
+ASSUME RecvOrder \in {"fifo", "any"}
+ASSUME Durability \in {"sync", "flushed", "unflushed"}
+ASSUME ~ (Truncation /\ Durability # "sync")
 
 Reqs == DOMAIN Prog
 Quorums == {Q \in SUBSET Servers : 2 * Cardinality(Q) > Cardinality(Servers)}
@@ -132,6 +186,7 @@ InitVal(k) == IF k \in BaseKeys THEN "v0" ELSE IF k \in LeaseKeys THEN NoLease E
 Flip(v) == IF v = "v0" THEN "v1" ELSE "v0"
 
 Max(a, b) == IF a > b THEN a ELSE b
+Min(a, b) == IF a < b THEN a ELSE b
 MaxSet(X) == CHOOSE x \in X : \A y \in X : y <= x
 
 NoR == [keys |-> {}, preds |-> {}]
@@ -152,19 +207,41 @@ VARIABLES
   net,          \* proposals sent (never removed: re-sends, duplicates)
   nexec,        \* per request: executions so far
   replies,      \* outcomes delivered to clients: [ik, idx, res]
-  nexp          \* sweeper expiries so far
+  nexp,         \* sweeper expiries so far
+  pend,         \* per replica (Split): the validated entry not yet appended
+  flushed,      \* per replica: its log is durable up to here (not "sync")
+  ncrash,       \* crashes so far
+  running,      \* "fast": per request, the attempts begun and not yet run
+  slots,        \* per replica (Refusal): Pending slots [id, ik, w, term];
+                \*   only those of its current term count
+  inbox,        \* per replica (Refusal): entries handed to raft, not yet
+                \*   received (appended or refused)
+  lease,        \* per replica: the term whose leader lease it established
+  appBy,        \* per replica: entries it appended [id, idx, pid, term],
+                \*   for LogEntryDiscarded / unknown notifications
+  naIds,        \* ghost: slots resolved NotAppended [id, bad], bad: an
+                \*   entry of its proposal and term was in a log then
+  appIds        \* ghost: slot ids ever appended to a log
 
 raftVars == <<term, role, log, commitIndex, first>>
+rcvVars == <<slots, inbox, lease, appBy, naIds, appIds>>
+extVars == <<pend, flushed, ncrash, running, slots, inbox, lease, appBy, naIds, appIds>>
 vars == <<term, role, log, commitIndex, first, vtab, itab, clog, win, iwin,
-          net, nexec, replies, nexp>>
+          net, nexec, replies, nexp, pend, flushed, ncrash, running,
+          slots, inbox, lease, appBy, naIds, appIds>>
 
 (*************************** entries and versions *************************)
 
-IsTxn(e) == e.kind \in {"mut", "claim", "sweep"}     \* writes data
-Keyed(e) == e.kind \in {"mut", "claim", "fail"}      \* has an idempotency key
+\* an entry validated in one term and in a log at another is void (VoidRule)
+Void(e) == VoidRule /\ e.vterm # e.term
+IsTxn(e) == e.kind \in {"mut", "claim", "sweep"} /\ ~ Void(e)   \* writes data
+Keyed(e) == e.kind \in {"mut", "claim", "fail"} /\ ~ Void(e)    \* has an idempotency key
 
+\* vterm: the term it was validated in; dep (ghost): its leader was already
+\* deposed (a quorum in a higher term) when it appended it
 Noop(t) == [term |-> t, kind |-> "noop", ik |-> "", pid |-> <<"", 0>>, S |-> {},
-            R |-> NoR, obs |-> NoObs, w |-> NoW, fence |-> <<>>, iw |-> 0, wn |-> 0]
+            R |-> NoR, obs |-> NoObs, w |-> NoW, fence |-> <<>>, iw |-> 0, wn |-> 0,
+            vterm |-> t, dep |-> FALSE]
 
 Prefix(n) == 1..n
 \* a DVV's prefix: the largest n with 1..n in S
@@ -239,6 +316,7 @@ CanRun(q) ==
 Execs(q) == IF "max" \in DOMAIN Prog[q] THEN Prog[q].max ELSE MaxExec
 
 Execute(q) ==
+  /\ FailMode # "fast"
   /\ nexec[q] < Execs(q)
   /\ ~ \E r \in replies : r.ik = q          \* the client has its outcome
   /\ CanRun(q)
@@ -257,7 +335,45 @@ Execute(q) ==
             THEN replies' = replies \cup {[ik |-> q, idx |-> 0, res |-> "failed"]}
                  /\ UNCHANGED net
             ELSE net' = net \cup {failp} /\ UNCHANGED replies
-  /\ UNCHANGED <<raftVars, vtab, itab, clog, win, iwin, nexp>>
+  /\ UNCHANGED <<raftVars, extVars, vtab, itab, clog, win, iwin, nexp>>
+
+\* "fast": the client begins attempt e (through some front end); it runs
+\* later. Begining attempt e >= 2 means the client gave up waiting on the
+\* earlier ones (they may still be in flight).
+Begin(q) ==
+  /\ FailMode = "fast"
+  /\ nexec[q] < Execs(q)
+  /\ ~ \E r \in replies : r.ik = q
+  /\ CanRun(q)
+  /\ nexec' = [nexec EXCEPT ![q] = nexec[q] + 1]
+  /\ running' = [running EXCEPT ![q] = running[q] \cup {nexec[q] + 1}]
+  /\ UNCHANGED <<raftVars, vtab, itab, clog, win, iwin, net, replies, nexp, pend, flushed, ncrash,
+                 rcvVars>>
+
+Marked(e) == MarkRetry /\ e >= 2
+
+Run(q, e) ==
+  /\ e \in running[q]
+  /\ \E S \in Versions :
+       LET p == Plan(q, e, S)
+           prop == [pid |-> <<q, e>>, ik |-> q, kind |-> p.kind, S |-> S, R |-> p.R,
+                    obs |-> Obs(S, p.R), w |-> p.w, cands |-> p.cands, fence |-> p.fence]
+           failp == [pid |-> <<q, e>>, ik |-> q, kind |-> "fail", S |-> S, R |-> NoR,
+                     obs |-> NoObs, w |-> NoW, cands |-> {}, fence |-> <<>>]
+       IN
+       IF p.ok
+         THEN net' = net \cup {prop} /\ UNCHANGED replies
+       ELSE IF Marked(e)
+         THEN net' = net \cup {failp} /\ UNCHANGED replies
+       \* unmarked: returned directly, taken only by a client still waiting
+       \* on this attempt
+       ELSE /\ replies' = IF e = nexec[q] /\ ~ \E r \in replies : r.ik = q
+                          THEN replies \cup {[ik |-> q, idx |-> 0, res |-> "failed"]}
+                          ELSE replies
+            /\ UNCHANGED net
+  /\ running' = [running EXCEPT ![q] = running[q] \ {e}]
+  /\ UNCHANGED <<raftVars, vtab, itab, clog, win, iwin, nexec, nexp, pend, flushed, ncrash,
+                 rcvVars>>
 
 (*************************** leader: validate and append ******************)
 
@@ -285,34 +401,60 @@ Confirmed(s) ==
   /\ \E i \in 1..commitIndex[s] : log[s][i].term = term[s]
   /\ \E Q \in Quorums : \A q \in Q : term[q] = term[s]
 
+\* a quorum is in a higher term: s's term is over, whether s knows or not
+Deposed(s) == role[s] = "L" /\ \E Q \in Quorums : \A q \in Q : term[q] > term[s]
+
+\* a validated entry: appended in the same step (atomic), or held for a
+\* later AppendPending (Split; one at a time, so validation stays in order)
+\* (Refusal) or handed to raft behind a Pending slot
+SlotId(s, ent) == <<ent.pid, ent.term, s>>
+Accept(s, ent) ==
+  IF Split
+    THEN /\ pend[s] = {}
+         /\ pend' = [pend EXCEPT ![s] = {ent}]
+         /\ UNCHANGED <<log, vtab, itab, slots, inbox>>
+  ELSE IF Refusal # "none"
+    THEN /\ slots' = [slots EXCEPT ![s] = slots[s] \cup
+                        {[id |-> SlotId(s, ent), ik |-> ent.ik, w |-> ent.w, term |-> ent.term]}]
+         /\ inbox' = [inbox EXCEPT ![s] = Append(inbox[s], [id |-> SlotId(s, ent), ent |-> ent])]
+         /\ UNCHANGED <<log, vtab, itab, pend>>
+    ELSE /\ AppendEntry(s, ent)
+         /\ UNCHANGED <<pend, slots, inbox>>
+
+\* the validator's Pending slots of its current term
+PS(s) == {x \in slots[s] : x.term = term[s]}
+
 Process(s, p) ==
   /\ role[s] = "L"
   /\ p \in net
   \* idempotency first: a key in the table gets that entry's outcome (by
   \* Reply, once it commits) and nothing is appended
   /\ ~ \E x \in IT(s) : x.ik = p.ik
+  /\ ~ \E x \in PS(s) : x.ik = p.ik
   /\ LET base == [term |-> term[s], kind |-> p.kind, ik |-> p.ik, pid |-> p.pid,
                   S |-> p.S, R |-> p.R, obs |-> p.obs, w |-> p.w, fence |-> p.fence,
-                  iw |-> iwin, wn |-> win]
+                  iw |-> iwin, wn |-> win, vterm |-> term[s], dep |-> Deposed(s)]
      IN
-     CASE p.kind = "fail" /\ FailMode = "logged" ->
+     CASE p.kind = "fail" /\ FailMode \in {"logged", "fast"} ->
             /\ Len(log[s]) < MaxLen
-            /\ AppendEntry(s, base)
+            /\ Accept(s, base)
             /\ UNCHANGED replies
        [] p.kind = "fail" /\ FailMode = "probe" ->
             /\ Confirmed(s)
             /\ replies' = replies \cup {[ik |-> p.ik, idx |-> 0, res |-> "failed"]}
-            /\ UNCHANGED <<log, vtab, itab>>
+            /\ UNCHANGED <<log, vtab, itab, pend, slots, inbox>>
        [] p.kind = "mut" ->
             /\ Len(log[s]) < MaxLen
             /\ ~ TooOld(s, p)
             /\ ~ \E x \in VT(s) : x.idx \notin p.S /\ Conflicts(x.w, p.R, CheckRanges)
-            /\ AppendEntry(s, base)
+            /\ ~ \E x \in PS(s) : Conflicts(x.w, p.R, CheckRanges)
+            /\ Accept(s, base)
             /\ UNCHANGED replies
        [] p.kind = "claim" ->
             LET avail == {c \in p.cands :
-                            ~ \E x \in VT(s) : x.idx \notin p.S
-                                 /\ (K(c[1]) \in DOMAIN x.w \/ LK(c[1]) \in DOMAIN x.w)}
+                            /\ ~ \E x \in VT(s) : x.idx \notin p.S
+                                   /\ (K(c[1]) \in DOMAIN x.w \/ LK(c[1]) \in DOMAIN x.w)
+                            /\ ~ \E y \in PS(s) : K(c[1]) \in DOMAIN y.w \/ LK(c[1]) \in DOMAIN y.w}
                 take  == IF avail = {} THEN {} ELSE {CHOOSE c \in avail : TRUE}
                 R     == [keys |-> UNION {{K(c[1]), LK(c[1])} : c \in take}, preds |-> {}]
                 w     == [k \in {LK(c[1]) : c \in take} |->
@@ -320,10 +462,113 @@ Process(s, p) ==
                             <<lv[2], <<lv[2][1] + 1, "live">>>>]
             IN /\ Len(log[s]) < MaxLen
                /\ ~ TooOld(s, p)
-               /\ AppendEntry(s, [base EXCEPT !.R = R, !.obs = Obs(p.S, R), !.w = w])
+               /\ Accept(s, [base EXCEPT !.R = R, !.obs = Obs(p.S, R), !.w = w])
                /\ UNCHANGED replies
        [] OTHER -> FALSE
-  /\ UNCHANGED <<term, role, commitIndex, first, clog, win, iwin, net, nexec, nexp>>
+  /\ UNCHANGED <<term, role, commitIndex, first, clog, win, iwin, net, nexec, nexp,
+                 flushed, ncrash, running, lease, appBy, naIds, appIds>>
+
+\* this submission's entry (same proposal, same term) is in some log
+InAnyLog(ent) == \E r \in Servers : \E i \in 1..Len(log[r]) :
+                   log[r][i].pid = ent.pid /\ log[r][i].term = ent.term
+
+\* (Refusal) raft receives an entry the validator handed it: it appends it
+\* if it is leader in the entry's term with its lease established, and
+\* otherwise refuses it at receipt, never appending it
+RemoveAt(sq, k) == SubSeq(sq, 1, k - 1) \o SubSeq(sq, k + 1, Len(sq))
+Receipt(s, k) ==
+  LET x  == inbox[s][k]
+      ok == /\ role[s] = "L" /\ term[s] = x.ent.term
+            /\ (~ LeaseWindow \/ lease[s] = term[s])
+            /\ Len(log[s]) < MaxLen
+      idx == Len(log[s]) + 1
+      track == Refusal \in {"discard_na", "unknown_release"}
+  IN
+  /\ k \in 1..Len(inbox[s])
+  /\ RecvOrder = "fifo" => k = 1
+  /\ inbox' = [inbox EXCEPT ![s] = RemoveAt(inbox[s], k)]
+  /\ IF ok
+       THEN /\ AppendEntry(s, [x.ent EXCEPT !.dep = Deposed(s)])
+            /\ slots' = [slots EXCEPT ![s] = {y \in slots[s] : y.id # x.id}]
+            /\ appIds' = appIds \cup {x.id}
+            /\ appBy' = IF track
+                          THEN [appBy EXCEPT ![s] = appBy[s] \cup
+                                 {[id |-> x.id, idx |-> idx, pid |-> x.ent.pid, term |-> x.ent.term]}]
+                          ELSE appBy
+            /\ UNCHANGED naIds
+       ELSE /\ UNCHANGED <<log, vtab, itab, appIds, appBy>>
+            /\ IF Refusal = "stay_pending"
+                 THEN UNCHANGED <<slots, naIds>>
+                 ELSE /\ slots' = [slots EXCEPT ![s] = {y \in slots[s] : y.id # x.id}]
+                      /\ naIds' = naIds \cup {[id |-> x.id, bad |-> InAnyLog(x.ent)]}
+  /\ UNCHANGED <<term, role, commitIndex, first, clog, win, iwin, net, nexec, replies, nexp,
+                 pend, flushed, ncrash, running, lease>>
+
+\* (Refusal) a fresh leader's first quorum-acked heartbeat establishes its lease
+EstablishLease(s) ==
+  /\ Refusal # "none" /\ LeaseWindow
+  /\ role[s] = "L"
+  /\ lease[s] # term[s]
+  /\ \E Q \in Quorums : \A q \in Q : term[q] = term[s]
+  /\ lease' = [lease EXCEPT ![s] = term[s]]
+  /\ UNCHANGED <<term, role, log, commitIndex, first, vtab, itab, clog, win, iwin, net, nexec,
+                 replies, nexp, pend, flushed, ncrash, running, slots, inbox, appBy, naIds, appIds>>
+
+\* (Refusal = "discard_na", negative) a LogEntryDiscarded notification: an
+\* entry s appended is no longer at its index in s's log; the validator
+\* treats it as NotAppended and drops what its table holds at that index
+Gone(s, a) == ~ (Len(log[s]) >= a.idx /\ log[s][a.idx].pid = a.pid /\ log[s][a.idx].term = a.term)
+Discard(s, a) ==
+  /\ Refusal = "discard_na"
+  /\ a \in appBy[s]
+  /\ Gone(s, a)
+  /\ appBy' = [appBy EXCEPT ![s] = appBy[s] \ {a}]
+  /\ vtab' = [vtab EXCEPT ![s] = {r \in vtab[s] : r.idx # a.idx}]
+  /\ itab' = [itab EXCEPT ![s] = {r \in itab[s] : r.idx # a.idx}]
+  /\ naIds' = naIds \cup {[id |-> a.id, bad |-> TRUE]}
+  /\ UNCHANGED <<raftVars, clog, win, iwin, net, nexec, replies, nexp, pend, flushed, ncrash,
+                 running, slots, inbox, lease, appIds>>
+
+\* (Refusal = "unknown_release", negative) the response for an appended
+\* entry never came; the validator releases its records
+Unknown(s, a) ==
+  /\ Refusal = "unknown_release"
+  /\ a \in appBy[s]
+  /\ role[s] = "L"
+  /\ ~ Gone(s, a)
+  /\ appBy' = [appBy EXCEPT ![s] = appBy[s] \ {a}]
+  /\ vtab' = [vtab EXCEPT ![s] = {r \in vtab[s] : r.idx # a.idx}]
+  /\ itab' = [itab EXCEPT ![s] = {r \in itab[s] : r.idx # a.idx}]
+  /\ UNCHANGED <<raftVars, clog, win, iwin, net, nexec, replies, nexp, pend, flushed, ncrash,
+                 running, slots, inbox, lease, naIds, appIds>>
+
+\* HitReply = "immediate" (negative): a hit in the idempotency table is
+\* answered at once from the table, whether or not the entry has committed
+HitNow(s, p) ==
+  /\ HitReply = "immediate"
+  /\ role[s] = "L"
+  /\ p \in net
+  /\ \E x \in IT(s) :
+       /\ x.ik = p.ik
+       /\ x.idx <= Len(log[s])
+       /\ LET r == [ik |-> p.ik, idx |-> x.idx,
+                    res |-> IF log[s][x.idx].kind = "fail" THEN "failed" ELSE "ok"]
+          IN r \notin replies /\ replies' = replies \cup {r}
+  /\ UNCHANGED <<raftVars, extVars, vtab, itab, clog, win, iwin, net, nexec, nexp>>
+
+\* Split: a leader appends the entry it validated earlier, in its current
+\* term (it may have stepped down and been re-elected since); its tables
+\* were not consulted again
+AppendPending(s) ==
+  /\ Split
+  /\ role[s] = "L"
+  /\ pend[s] # {}
+  /\ Len(log[s]) < MaxLen
+  /\ LET ent == CHOOSE x \in pend[s] : TRUE IN
+     AppendEntry(s, [ent EXCEPT !.term = term[s], !.dep = Deposed(s)])
+  /\ pend' = [pend EXCEPT ![s] = {}]
+  /\ UNCHANGED <<term, role, commitIndex, first, clog, win, iwin, net, nexec, replies, nexp,
+                 flushed, ncrash, running, rcvVars>>
 
 \* the leader's sweeper: by its own clock, a live lease (as its own log,
 \* uncommitted tail included, says) has expired
@@ -335,14 +580,15 @@ Sweep(s, t) ==
   /\ HasClaims
   /\ role[s] = "L"
   /\ nexp < MaxExpire
+  /\ pend[s] = {}            \* (Split) the sweeper goes through the same pipeline
   /\ Len(log[s]) < MaxLen
   /\ lv[2] = "live"
   /\ AppendEntry(s, [term |-> term[s], kind |-> "sweep", ik |-> "", pid |-> <<"", 0>>,
                      S |-> S, R |-> R, obs |-> ObsIn(log[s], S, R),
                      w |-> (LK(t) :> <<lv, <<lv[1], "expired">>>>), fence |-> <<>>,
-                     iw |-> iwin, wn |-> win])
+                     iw |-> iwin, wn |-> win, vterm |-> term[s], dep |-> Deposed(s)])
   /\ nexp' = nexp + 1
-  /\ UNCHANGED <<term, role, commitIndex, first, clog, win, iwin, net, nexec, replies>>
+  /\ UNCHANGED <<term, role, commitIndex, first, clog, win, iwin, net, nexec, replies, extVars>>
 
 (*************************** Raft *****************************************)
 
@@ -376,7 +622,7 @@ BecomeLeader(s, Q) ==
        THEN /\ vtab' = [Drop(vtab, Q) EXCEPT ![s] = RebuildV(s, nl)]
             /\ itab' = [Drop(itab, Q) EXCEPT ![s] = RebuildI(nl)]
        ELSE UNCHANGED <<vtab, itab>>
-  /\ UNCHANGED <<commitIndex, first, clog, win, iwin, net, nexec, replies, nexp>>
+  /\ UNCHANGED <<commitIndex, first, clog, win, iwin, net, nexec, replies, nexp, extVars>>
 
 \* a leader that hears of a higher term steps down
 StepDown(s) ==
@@ -385,12 +631,12 @@ StepDown(s) ==
   /\ role' = [role EXCEPT ![s] = "F"]
   /\ vtab' = Drop(vtab, {s})
   /\ itab' = Drop(itab, {s})
-  /\ UNCHANGED <<term, log, commitIndex, first, clog, win, iwin, net, nexec, replies, nexp>>
+  /\ UNCHANGED <<term, log, commitIndex, first, clog, win, iwin, net, nexec, replies, nexp, extVars>>
 
 \* l replicates its whole log to f (f's conflicting suffix is overwritten);
 \* rejected by f if f's term is higher. If f lacks entries l has truncated,
 \* l installs a snapshot (f's log then starts where l's does).
-AppendEntries(l, f) ==
+AEWhole(l, f) ==
   /\ role[l] = "L"
   /\ l # f
   /\ term[l] >= term[f]
@@ -405,14 +651,68 @@ AppendEntries(l, f) ==
                  IF Len(log[f]) >= first[l] - 1
                     /\ SubSeq(log[f], 1, first[l] - 1) = SubSeq(log[l], 1, first[l] - 1)
                  THEN first[f] ELSE Max(first[f], first[l])]
-  /\ UNCHANGED <<clog, win, iwin, net, nexec, replies, nexp>>
+  /\ UNCHANGED <<clog, win, iwin, net, nexec, replies, nexp, extVars>>
+
+\* not "sync": pipelined AppendEntries. Any prefix 1..n of l's log may
+\* arrive, in any order and more than once (several in flight). f keeps its
+\* log if it already holds that prefix; otherwise it truncates at the
+\* conflict and takes the prefix. What it appends is unflushed.
+LCP(a, b) == MaxSet({k \in 0..Len(a) : k <= Len(b) /\ SubSeq(a, 1, k) = SubSeq(b, 1, k)})
+AEPrefix(l, f, n) ==
+  LET pre == SubSeq(log[l], 1, n)
+      nl  == IF Len(log[f]) >= n /\ SubSeq(log[f], 1, n) = pre THEN log[f] ELSE pre
+      ci  == Max(commitIndex[f], Min(commitIndex[l], n))
+  IN
+  /\ role[l] = "L"
+  /\ l # f
+  /\ term[l] >= term[f]
+  /\ nl # log[f] \/ term[f] # term[l] \/ role[f] # "F" \/ ci # commitIndex[f]
+  /\ log' = [log EXCEPT ![f] = nl]
+  /\ term' = [term EXCEPT ![f] = term[l]]
+  /\ role' = [role EXCEPT ![f] = "F"]
+  /\ vtab' = Drop(vtab, {f})
+  /\ itab' = Drop(itab, {f})
+  /\ commitIndex' = [commitIndex EXCEPT ![f] = ci]
+  /\ flushed' = [flushed EXCEPT ![f] = Min(flushed[f], LCP(log[f], nl))]
+  /\ UNCHANGED <<first, clog, win, iwin, net, nexec, replies, nexp, pend, ncrash, running, rcvVars>>
+
+AppendEntries(l, f) ==
+  IF Durability = "sync" THEN AEWhole(l, f)
+  ELSE \E n \in 1..Len(log[l]) : AEPrefix(l, f, n)
+
+\* a replica fsyncs its whole log
+Flush(s) ==
+  /\ Durability # "sync"
+  /\ flushed[s] < Len(log[s])
+  /\ flushed' = [flushed EXCEPT ![s] = Len(log[s])]
+  /\ UNCHANGED <<raftVars, vtab, itab, clog, win, iwin, net, nexec, replies, nexp, pend, ncrash,
+                 running, rcvVars>>
+
+\* a replica crashes and restarts: it keeps its term (persisted before it
+\* votes or acks) and its flushed log; it loses the unflushed tail, its
+\* commit index, its tables, and anything validated but not appended
+Crash(s) ==
+  /\ Durability # "sync"
+  /\ ncrash < MaxCrash
+  /\ log' = [log EXCEPT ![s] = SubSeq(log[s], 1, flushed[s])]
+  /\ role' = [role EXCEPT ![s] = "F"]
+  /\ commitIndex' = [commitIndex EXCEPT ![s] = 0]
+  /\ vtab' = [vtab EXCEPT ![s] = {}]
+  /\ itab' = [itab EXCEPT ![s] = {}]
+  /\ pend' = [pend EXCEPT ![s] = {}]
+  /\ ncrash' = ncrash + 1
+  /\ UNCHANGED <<term, first, clog, win, iwin, net, nexec, replies, nexp, flushed, running, rcvVars>>
 
 \* commit through a current-term quorum: the highest own-term index that a
 \* quorum of replicas in l's term holds
+\* what a replica's ack for index n means: it holds it ("sync",
+\* "unflushed"), or it has flushed it ("flushed"; the leader counts itself
+\* only once flushed)
+Acked(q, n) == IF Durability = "flushed" THEN flushed[q] >= n ELSE Len(log[q]) >= n
 CommitOK(l, n) ==
   /\ log[l][n].term = term[l]
   /\ \E Q \in Quorums : \A q \in Q :
-       term[q] = term[l] /\ Len(log[q]) >= n /\ log[q][n] = log[l][n]
+       term[q] = term[l] /\ Acked(q, n) /\ log[q][n] = log[l][n]
 AdvanceCommit(l) ==
   /\ role[l] = "L"
   /\ LET ns == {n \in (commitIndex[l] + 1)..Len(log[l]) : CommitOK(l, n)} IN
@@ -420,7 +720,7 @@ AdvanceCommit(l) ==
      /\ LET n == MaxSet(ns) IN
         /\ commitIndex' = [commitIndex EXCEPT ![l] = n]
         /\ clog' = IF n > Len(clog) THEN SubSeq(log[l], 1, n) ELSE clog
-  /\ UNCHANGED <<term, role, log, first, vtab, itab, win, iwin, net, nexec, replies, nexp>>
+  /\ UNCHANGED <<term, role, log, first, vtab, itab, win, iwin, net, nexec, replies, nexp, extVars>>
 
 \* the leader tells a client an entry's outcome once it knows it committed
 \* (the original proposal's reply, or a retry that found the key)
@@ -432,28 +732,29 @@ Reply(s, i) ==
                res |-> IF log[s][i].kind = "fail" THEN "failed" ELSE "ok"]
      IN /\ r \notin replies
         /\ replies' = replies \cup {r}
-  /\ UNCHANGED <<raftVars, vtab, itab, clog, win, iwin, net, nexec, nexp>>
+  /\ UNCHANGED <<raftVars, extVars, vtab, itab, clog, win, iwin, net, nexec, nexp>>
 
 \* §10.4: a replica drops committed entries that every materializer applied
 Truncate(s) ==
   /\ Truncation
   /\ \E n \in first[s]..Len(clog) :
        /\ n <= Len(log[s])
+       /\ (Durability = "sync" \/ n <= flushed[s])
        /\ SubSeq(log[s], 1, n) = SubSeq(clog, 1, n)
        /\ first' = [first EXCEPT ![s] = n + 1]
   /\ UNCHANGED <<term, role, log, commitIndex, vtab, itab, clog, win, iwin, net, nexec,
-                 replies, nexp>>
+                 replies, nexp, extVars>>
 
 \* time passes: the windows' starts move up (never past what is committed;
 \* the idempotency window is the longer one)
 AdvanceWin ==
   /\ win < MaxWin /\ win < Len(clog)
   /\ win' = win + 1
-  /\ UNCHANGED <<raftVars, vtab, itab, clog, iwin, net, nexec, replies, nexp>>
+  /\ UNCHANGED <<raftVars, extVars, vtab, itab, clog, iwin, net, nexec, replies, nexp>>
 AdvanceIWin ==
   /\ iwin < MaxIWin /\ iwin < win
   /\ iwin' = iwin + 1
-  /\ UNCHANGED <<raftVars, vtab, itab, clog, win, net, nexec, replies, nexp>>
+  /\ UNCHANGED <<raftVars, extVars, vtab, itab, clog, win, net, nexec, replies, nexp>>
 
 Init ==
   /\ term = [s \in Servers |-> 0]
@@ -470,6 +771,16 @@ Init ==
   /\ nexec = [q \in Reqs |-> 0]
   /\ replies = {}
   /\ nexp = 0
+  /\ pend = [s \in Servers |-> {}]
+  /\ flushed = [s \in Servers |-> 0]
+  /\ ncrash = 0
+  /\ running = [q \in Reqs |-> {}]
+  /\ slots = [s \in Servers |-> {}]
+  /\ inbox = [s \in Servers |-> << >>]
+  /\ lease = [s \in Servers |-> 0]
+  /\ appBy = [s \in Servers |-> {}]
+  /\ naIds = {}
+  /\ appIds = {}
 
 Next ==
   \/ \E s \in Servers :
@@ -477,15 +788,37 @@ Next ==
        \/ StepDown(s)
        \/ \E f \in Servers : AppendEntries(s, f)
        \/ AdvanceCommit(s)
-       \/ \E p \in net : Process(s, p)
+       \/ \E p \in net : Process(s, p) \/ HitNow(s, p)
        \/ \E t \in Tasks : Sweep(s, t)
        \/ \E i \in 1..MaxLen : Reply(s, i)
        \/ Truncate(s)
-  \/ \E q \in Reqs : Execute(q)
+       \/ AppendPending(s)
+       \/ Flush(s)
+       \/ Crash(s)
+       \/ EstablishLease(s)
+       \/ \E k \in 1..Len(inbox[s]) : Receipt(s, k)
+       \/ \E a \in appBy[s] : Discard(s, a) \/ Unknown(s, a)
+  \/ \E q \in Reqs : Execute(q) \/ Begin(q) \/ \E e \in running[q] : Run(q, e)
   \/ AdvanceWin
   \/ AdvanceIWin
 
 Spec == Init /\ [][Next]_vars
+
+\* liveness (Refusal configs): a stable leader exists (MaxTerm bounds the
+\* elections), raft and the validator keep running, front ends re-send
+LiveSpec ==
+  /\ Spec
+  /\ WF_vars(\E s \in Servers, Q \in Quorums : BecomeLeader(s, Q))
+  /\ \A s \in Servers :
+       /\ WF_vars(EstablishLease(s))
+       /\ WF_vars(\E f \in Servers : AppendEntries(s, f))
+       /\ WF_vars(AdvanceCommit(s))
+       /\ WF_vars(\E p \in net : Process(s, p))
+       /\ WF_vars(\E k \in 1..Len(inbox[s]) : Receipt(s, k))
+       /\ WF_vars(\E i \in 1..MaxLen : Reply(s, i))
+  /\ \A q \in Reqs : WF_vars(Execute(q))
+\* every request eventually gets an outcome
+EventuallyOutcome == \A q \in Reqs : <>(\E r \in replies : r.ik = q)
 
 (*************************** properties ***********************************)
 
@@ -540,7 +873,6 @@ TablesComplete ==
 
 (* 5. A deposed leader commits nothing, and every outcome a client is told *)
 (*    from an entry is durable: the entry is in the committed log.         *)
-Deposed(s) == role[s] = "L" /\ \E Q \in Quorums : \A q \in Q : term[q] > term[s]
 DeposedCommitsNothing ==
   [][\A s \in Servers : Deposed(s) /\ role'[s] = "L" => commitIndex'[s] = commitIndex[s]]_vars
 RepliesDurable ==
@@ -548,6 +880,25 @@ RepliesDurable ==
     /\ r.idx <= Len(clog)
     /\ Keyed(clog[r.idx]) /\ clog[r.idx].ik = r.ik
     /\ (r.res = "failed") = (clog[r.idx].kind = "fail")
+
+(* With atomic validate+append the void rule never fires: every entry in  *)
+(* every log, committed or not, carries the term it was validated in.      *)
+VoidNeverFires ==
+  Split \/ \A s \in Servers : \A i \in 1..Len(log[s]) : log[s][i].vterm = log[s][i].term
+
+(* Weaker than RepliesDurable: no outcome a client was told is contradicted *)
+(* by the committed log (it may still be pending).                         *)
+RepliesNotContradicted ==
+  \A r \in replies : 0 < r.idx /\ r.idx <= Len(clog) =>
+    /\ Keyed(clog[r.idx]) /\ clog[r.idx].ik = r.ik
+    /\ (r.res = "failed") = (clog[r.idx].kind = "fail")
+
+(* Refusal: a slot becomes NotAppended only if its entry was never        *)
+(* appended to any log (entries reach other logs only as copies of the     *)
+(* one Receipt appends).                                                   *)
+(* Checked when the slot is resolved: nothing with its proposal and term  *)
+(* is in any log then, and this submission can no longer be appended.      *)
+NASound == \A n \in naIds : ~ n.bad
 
 (* 6. Writes to one key are causally ordered.                              *)
 KeyCausal ==
@@ -594,6 +945,14 @@ ProgSmall  == [q1 |-> [kind |-> "toggle", key |-> "a", max |-> 1],
                q2 |-> [kind |-> "guard", key |-> "b", max |-> 1]]
 ProgTerms  == [q1 |-> [kind |-> "toggle", key |-> "a", max |-> 2],
                q2 |-> [kind |-> "guard", key |-> "b", max |-> 1]]
+ProgRetry  == [q1 |-> [kind |-> "toggle", key |-> "a", max |-> 2],
+               q2 |-> [kind |-> "toggle", key |-> "a", max |-> 1]]
+ProgDiscard == [q1 |-> [kind |-> "toggle", key |-> "b", max |-> 1],
+                q2 |-> [kind |-> "toggle", key |-> "a", max |-> 1],
+                q3 |-> [kind |-> "toggle", key |-> "a", max |-> 1]]
+ProgOne    == [q1 |-> [kind |-> "toggle", key |-> "a", max |-> 1]]
+ProgToggles == [q1 |-> [kind |-> "toggle", key |-> "a", max |-> 1],
+                q2 |-> [kind |-> "toggle", key |-> "a", max |-> 1]]
 ProgGuard1 == [q1 |-> [kind |-> "guard", key |-> "b"],
                q2 |-> [kind |-> "toggle", key |-> "a"]]
 \* two separate toggles of a, so a retry can read at a version older than
@@ -636,4 +995,21 @@ NeverLeaseLost ==               \* a completion fenced out (lease_lost or conten
   ~ \E q \in Reqs : Prog[q].kind = "complete" /\ nexec[q] >= 1
       /\ \E r \in ClaimOf(q) : ClaimedBy(r) # {} /\
            \E t \in ClaimedBy(r) : \E i \in Txns : ClaimGen(i, t) > clog[r.idx].w[LK(t)][2][1]
+
+(* Follow-up: shep-raft (atomic validate+append, void rule, flushed commit) *)
+\* an entry appended by an already-deposed leader is committed (by a later
+\* leader of a higher term whose log holds it)
+NeverDeposedEntryCommitted == ~ \E i \in 1..Len(clog) : clog[i].dep
+\* the same, for a mutation (not a no-op or sweep)
+NeverDeposedTxnCommitted ==
+  ~ \E i \in 1..Len(clog) : clog[i].dep /\ clog[i].kind = "mut"
+\* an entry validated in one term sits in the committed log at another
+NeverStaleValidated == ~ \E i \in 1..Len(clog) : clog[i].vterm # clog[i].term
+\* a leader has committed an index it has not flushed itself
+NeverLeaderUnflushedCommit ==
+  ~ \E l \in Servers : role[l] = "L" /\ commitIndex[l] > flushed[l]
+\* a crash lost a committed entry from a replica's log
+NeverCrashLostCommitted ==
+  ~ \E s \in Servers : ncrash > 0 /\ Len(log[s]) < Len(clog) /\ flushed[s] = Len(log[s])
+                       /\ \E t \in Servers : Len(log[t]) >= Len(clog)
 =============================================================================

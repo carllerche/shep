@@ -22,7 +22,20 @@
 (*   viewer_apponly: delete u1, where the read policy also has an app-only *)
 (*     allow (`allow if app == slack`); it is the viewer partition, so     *)
 (*     HorizonParts names it "viewer";                                     *)
-(*   chan: remove u1 from the channel.                                     *)
+(*   chan: remove u1 from the channel;                                     *)
+(*   token: the external auth service stops issuing tokens to the request  *)
+(*     (§6.3: Shep keeps no revocation list). Shep never sees it: a token  *)
+(*     issued at iat = 0 is honored until its `exp` (TokLife), judged by a *)
+(*     clock with an ExpSkew allowance; a client refreshes its token       *)
+(*     (Refresh, any time before the revocation, exp = now + TokLife), a   *)
+(*     link carries its minting token's exp and a mutation its read's.     *)
+(*     The bound is then TokLife + ExpSkew + Eps, not B.                   *)
+(*   split: delete u1, after u1's partition p split and its group moved to *)
+(*     a child c. p's leader stays alive and keeps stamping heartbeats     *)
+(*     whose index includes the split entry; the deletion commits at c.    *)
+(*   restart: delete u1 on an RF = 1 WAL node (no external leader) that    *)
+(*     restarted at fo and, being the only node, skips the lease wait.     *)
+(*   sys: (superseded) revoke the Shep-issued act-for key K.               *)
 (* (The superseded configs call the viewer partition "map": the agent's    *)
 (* acts_for target under the mapping model.)                               *)
 (* A behaviour commits at most one revocation, in its focus partition      *)
@@ -73,18 +86,37 @@
 (*                without AgeDrift), and the leader appends it only while  *)
 (*                its clock is at or before that.                          *)
 (*  PresignMargin 2*Eps (fix): presigned expiry = clock + PL - margin.     *)
+(*  ExpCap        TRUE (fix): a proposal or decision is appended only     *)
+(*                while the leader's clock is at or before the token's     *)
+(*                exp + ExpSkew; FALSE (design text): only the horizon     *)
+(*                deadline applies.                                        *)
+(*  SplitFix      TRUE (fix): evidence from a partition whose committed    *)
+(*                log holds a split entry doesn't count for ranges past    *)
+(*                it; the tail switches to the child and fails closed      *)
+(*                until it has evidence there. FALSE: p's fresh evidence   *)
+(*                counts.                                                  *)
+(*  FollowerStamp "relay" (fix): a fetch from a follower carries the       *)
+(*                leader's (commit index, leader-lease stamp) unchanged,   *)
+(*                which is a delayed leader heartbeat; "own": the follower *)
+(*                stamps its own clock on the commit index it last heard.  *)
+(*  RestartZombie FALSE: after an RF = 1 restart the old incarnation is    *)
+(*                gone; TRUE: it lives on (a hung process) and keeps       *)
+(*                stamping its old index, with no lease to stop it.        *)
 (*  ViewerDeleteDenies TRUE (§6.3): a request whose viewer is deleted is   *)
-(*                `denied`, and an app-only rule never matches a request   *)
-(*                with a viewer. FALSE (the superseded semantics): the     *)
-(*                request has no viewer and the app-only allow admits it,  *)
-(*                so in viewer_apponly the deletion never denies.          *)
+(*                `denied` before any policy runs (and an app-only allow,  *)
+(*                written `... and not exists global viewer`, never holds  *)
+(*                for a request with a viewer). FALSE (the superseded      *)
+(*                semantics): the request has no viewer and the app-only   *)
+(*                allow admits it, so in viewer_apponly the deletion never *)
+(*                denies.                                                  *)
 (***************************************************************************)
 EXTENDS Integers, FiniteSets, TLC
 
 CONSTANTS Eps, B, PL, LeaseLen, MaxT, FocusSet, Failovers, Ops,
           HorizonParts, AgeDrift, HbLease, MatCheck, TopicGate,
           DecideCheck, InFlightDelay, Deadline, PresignMargin,
-          ViewerDeleteDenies
+          ViewerDeleteDenies, TokLife, ExpSkew, ExpCap, SplitFix, FollowerStamp,
+          RestartZombie
 
 NONE == -1
 NoEv == -100          \* "no evidence for phi" as a send time
@@ -101,23 +133,32 @@ VARIABLES
   mut,    \* the mutation: [ph, c (deadline stamp), r (evidence send time),
           \*   ct (commit time)]
   top,    \* the topic subscription: none, open, paused, closed
-  link,   \* a download link has been minted
+  link,   \* exp of the token that minted a download link, or NONE
   rdr,    \* check time of the latest redirect, or NONE
-  hzOK, rvOK, fcOK, mlOK, lkOK   \* history flags, one per invariant
+  hzOK, rvOK, fcOK, mlOK, lkOK,  \* history flags, one per invariant
+  tokExp, \* exp of the token the client currently holds (phi = "token")
+  splitT  \* real time p's split entry committed, or NONE (phi = "split")
 
-vars == <<now, phi, revT, fo, mat, fr, mut, top, link, rdr, hzOK, rvOK, fcOK, mlOK, lkOK>>
+vars == <<now, phi, revT, fo, mat, fr, mut, top, link, rdr, hzOK, rvOK, fcOK, mlOK, lkOK,
+          tokExp, splitT>>
 flags == <<hzOK, rvOK, fcOK, mlOK, lkOK>>
 
 \* phi's commit index at instant t, the start of tick t: commits in earlier
-\* ticks. A heartbeat sent at t carries CiAt(t).
-CiAt(t) == IF revT /= NONE /\ revT < t THEN 1 ELSE 0
+\* ticks. A heartbeat sent at t carries CiAt(t). A token revocation is the
+\* auth service's, in no Shep partition.
+CiAt(t) == IF phi /= "token" /\ revT /= NONE /\ revT < t THEN 1 ELSE 0
 \* phi's commit index now (including a commit earlier in this tick)
-Ci == IF revT /= NONE THEN 1 ELSE 0
+Ci == IF phi /= "token" /\ revT /= NONE THEN 1 ELSE 0
+\* a token with expiry e passes a check at real time t: some clock reading
+\* (within Eps of t) is at or before e + ExpSkew
+TokValid(t, e) == phi /= "token" \/ t - Eps <= e + ExpSkew
+\* how long after a revocation outputs can still appear
+RevBound == IF phi = "token" THEN TokLife + ExpSkew + Eps ELSE B
 \* the deposed leader's commit index: what it committed before it was cut off
 OldIdx == IF revT /= NONE /\ revT <= fo THEN 1 ELSE 0
 LE == fo + LeaseLen
 \* the partition phi's revocation is in
-Part == IF phi = "viewer_apponly" THEN "viewer" ELSE phi
+Part == IF phi \in {"viewer_apponly", "split", "restart"} THEN "viewer" ELSE phi
 \* the revocation doesn't deny: the superseded semantics, where deleting
 \* the viewer left an app-only allow to decide
 NoDeny == phi = "viewer_apponly" /\ ~ViewerDeleteDenies
@@ -128,15 +169,38 @@ NoDeny == phi = "viewer_apponly" /\ ~ViewerDeleteDenies
 \* commit index idx. The leader in charge reports the true commit index
 \* (heartbeats from the new leader before it is elected carry true information
 \* too, which only helps). A deposed leader reports its index at fo.
+\* An RF = 1 restart has no lease: the old incarnation is gone, or (zombie)
+\* stamps on unbounded. A follower stamping its own clock (FollowerStamp =
+\* "own") reports, at s, the index it last heard at r0 <= s.
 HB(t) ==
   {[r |-> r, c |-> r + Eps, idx |-> CiAt(r)] : r \in 0..t}
-  \cup (IF fo = NONE THEN {} ELSE
+  \cup (IF fo = NONE \/ (phi = "restart" /\ ~RestartZombie) THEN {}
+        ELSE IF phi = "restart" THEN
+          {[r |-> r, c |-> r + Eps, idx |-> OldIdx] : r \in fo..t}
+        ELSE
         {[r |-> r, c |-> IF HbLease THEN Min(r + Eps, LE - 1) ELSE r + Eps,
           idx |-> OldIdx] :
             r \in {x \in fo..t : HbLease => x - Eps < LE}})
+  \cup (IF FollowerStamp = "own"
+        THEN UNION {{[r |-> r0, c |-> s + Eps, idx |-> CiAt(r0)] : r0 \in 0..s} : s \in 0..t}
+        ELSE {})
 
 \* accepted by a node whose clock reads at least t - Eps
-Acc(t) == {h \in HB(t) : t - Eps - h.c <= Bacc}
+AccOf(H, t) == {h \in H : t - Eps - h.c <= Bacc}
+Acc(t) == AccOf(HB(t), t)
+
+\* split: p's heartbeats count the split entry (idx 1 once it committed);
+\* the child c exists after the split, and its index counts the deletion
+HBp(t) == {[r |-> r, c |-> r + Eps, idx |-> IF splitT /= NONE /\ splitT < r THEN 1 ELSE 0]
+           : r \in 0..t}
+HBc(t) == IF splitT = NONE THEN {}
+          ELSE {[r |-> r, c |-> r + Eps, idx |-> CiAt(r)] : r \in (splitT + 1)..t}
+\* the evidence that counts for the principal's range, as (r, c, idx of
+\* the deletion): with the fix, p's only before its split entry, then the
+\* child's; without, p's evidence counts and its state lacks the deletion
+EffEv(t) == AccOf(HBc(t), t) \cup
+            (IF SplitFix THEN {h \in AccOf(HBp(t), t) : h.idx = 0}
+             ELSE {[h EXCEPT !.idx = 0] : h \in AccOf(HBp(t), t)})
 GrantEv(t) == {h \in Acc(t) : h.idx = 0}
 
 \* fc: the evidence was sent within B in real time (ghost, for Inv_FailClosed)
@@ -145,9 +209,13 @@ NoOpt(t) == [fc |-> FALSE, c |-> t + Eps, r |-> NoEv]
 
 \* The ways an actor-sensitive check at t can grant (S[phi] = 0). A denial
 \* (S[phi] = 1) or `unavailable` changes no state, so it isn't an action.
-GrantOpts(t) ==
+GrantOptsE(t, e) ==
+  IF ~TokValid(t, e) THEN {}
   \* the deletion doesn't deny: a grant at any S the evidence allows
-  IF NoDeny THEN {Opt(h, t) : h \in Acc(t)}
+  ELSE IF NoDeny THEN {Opt(h, t) : h \in Acc(t)}
+  \* a token revocation leaves every partition's state granting
+  ELSE IF phi = "token" THEN {Opt(h, t) : h \in GrantEv(t)}
+  ELSE IF phi = "split" THEN {Opt(h, t) : h \in {h \in EffEv(t) : h.idx = 0}}
   ELSE IF phi = "chan" THEN
      \* served by the materializer at its applied index (a point read, §9.4)
      IF mat /= 0 THEN {}
@@ -156,13 +224,14 @@ GrantOpts(t) ==
   ELSE IF Part \in HorizonParts THEN {Opt(h, t) : h \in GrantEv(t)}
   \* a partition outside the horizon: whatever the learner has, maybe 0
   ELSE {NoOpt(t)}
+GrantOpts(t) == GrantOptsE(t, tokExp)
 
 (************************* produced outputs **********************************)
 
 \* An actor-sensitive output at real time t, granted at S with S[phi] = 0.
 Produce(t, fc) ==
   /\ hzOK' = (hzOK /\ CiAt(t - B) = 0)            \* S[phi] >= ci(t - B)
-  /\ rvOK' = (rvOK /\ ~(revT /= NONE /\ revT + B < t))
+  /\ rvOK' = (rvOK /\ ~(revT /= NONE /\ revT + RevBound < t))
   /\ fcOK' = (fcOK /\ fc)
 
 \* the chan materializer serves an actor-sensitive read at t
@@ -172,8 +241,10 @@ Init ==
   /\ now = 0
   /\ phi \in FocusSet
   /\ revT = NONE /\ fo = NONE /\ mat = 0 /\ fr = 0
-  /\ mut = [ph |-> "none", c |-> 0, r |-> 0, ct |-> 0]
-  /\ top = "none" /\ link = FALSE /\ rdr = NONE
+  /\ mut = [ph |-> "none", c |-> 0, r |-> 0, ct |-> 0, e |-> 0]
+  /\ top = "none" /\ link = NONE /\ rdr = NONE
+  /\ tokExp = TokLife
+  /\ splitT = NONE
   /\ hzOK = TRUE /\ rvOK = TRUE /\ fcOK = TRUE /\ mlOK = TRUE /\ lkOK = TRUE
 
 (************************* environment ***************************************)
@@ -183,10 +254,14 @@ Tick == now < MaxT /\ now' = now + 1
 
 \* phi's revocation commits; after a failover, only once the new leader's
 \* clock reads >= LE
-Revoke == revT = NONE /\ (fo /= NONE => now + Eps >= LE) /\ revT' = now
+\* (split: the deletion commits at the child, after the split; restart: an
+\* RF = 1 node skips the lease wait)
+Revoke == revT = NONE /\ ((fo /= NONE /\ phi /= "restart") => now + Eps >= LE)
+          /\ (phi = "split" => splitT /= NONE /\ splitT < now)
+          /\ revT' = now
           /\ UNCHANGED <<now, phi, fo, mat, fr, mut, top, link, rdr, flags>>
 
-Failover == Failovers > 0 /\ fo = NONE /\ fo' = now
+Failover == Failovers > 0 /\ phi \notin {"split", "token"} /\ fo = NONE /\ fo' = now
             /\ UNCHANGED <<now, phi, revT, mat, fr, mut, top, link, rdr, flags>>
 
 MatApply == phi = "chan" /\ mat < Ci /\ mat' = Ci
@@ -201,11 +276,11 @@ FrontierAdvance == fr < (IF phi = "chan" THEN mat ELSE Ci) /\ fr' = fr + 1
 
 Read == "read" \in Ops /\ \E o \in GrantOpts(now) :
           /\ Produce(now, o.fc) /\ MatServe(now)
-          /\ link' = ("link" \in Ops)
+          /\ link' = IF "link" \in Ops THEN tokExp ELSE NONE
           /\ UNCHANGED <<now, phi, revT, fo, mat, fr, mut, top, rdr, lkOK>>
 
 \* §16.4: verify, check the minting key, the actor and can_op at S, redirect
-LinkCheck == link /\ \E o \in GrantOpts(now) :
+LinkCheck == link /= NONE /\ \E o \in GrantOptsE(now, link) :
           /\ Produce(now, o.fc) /\ MatServe(now)
           /\ lkOK' = (lkOK /\ ~(phi = "sys" /\ revT /= NONE /\ revT + B < now))
           /\ rdr' = now
@@ -214,14 +289,14 @@ LinkCheck == link /\ \E o \in GrantOpts(now) :
 \* the object store accepts the presigned GET while its clock reading is at
 \* or before the expiry the front end stamped (its clock + PL - margin)
 Download == rdr /= NONE /\ now - Eps <= rdr + Eps + PL - PresignMargin
-          /\ rvOK' = (rvOK /\ ((revT /= NONE /\ revT + B < now) => now - rdr <= PL))
+          /\ rvOK' = (rvOK /\ ((revT /= NONE /\ revT + RevBound < now) => now - rdr <= PL))
           /\ UNCHANGED <<now, phi, revT, fo, mat, fr, mut, top, link, rdr,
                          hzOK, fcOK, mlOK, lkOK>>
 
 (************************* mutations *****************************************)
 
 MutRead == "mut" \in Ops /\ mut.ph = "none" /\ \E o \in GrantOpts(now) :
-          /\ mut' = [ph |-> "read", c |-> o.c, r |-> o.r, ct |-> 0]
+          /\ mut' = [ph |-> "read", c |-> o.c, r |-> o.r, ct |-> 0, e |-> tokExp]
           /\ MatServe(now)
           /\ UNCHANGED <<now, phi, revT, fo, mat, fr, top, link, rdr,
                          hzOK, rvOK, fcOK, lkOK>>
@@ -231,17 +306,19 @@ MutRead == "mut" \in Ops /\ mut.ph = "none" /\ \E o \in GrantOpts(now) :
 \* the current one.
 Append(c, r) ==
   /\ Deadline => now - Eps <= c + Bacc
+  /\ ExpCap => TokValid(now, mut.e)
   /\ phi = "chan" => Ci = 0
   /\ Produce(now, phi = "chan" \/ r >= now - B)
-  /\ mut' = [ph |-> "committed", c |-> c, r |-> r, ct |-> now]
+  /\ mut' = [ph |-> "committed", c |-> c, r |-> r, ct |-> now, e |-> mut.e]
   /\ mlOK' = mlOK /\ lkOK' = lkOK
 
 \* send the proposal (single partition) or the decision (2PC)
 Decide == mut.ph = "read" /\
   /\ IF DecideCheck = "fresh"
-     THEN \E o \in GrantOpts(now) :
+     THEN \E o \in GrantOptsE(now, mut.e) :
             IF InFlightDelay
-            THEN mut' = [ph |-> "sent", c |-> o.c, r |-> o.r, ct |-> 0] /\ UNCHANGED flags
+            THEN mut' = [ph |-> "sent", c |-> o.c, r |-> o.r, ct |-> 0, e |-> mut.e]
+                 /\ UNCHANGED flags
             ELSE Append(o.c, o.r)
      ELSE IF InFlightDelay
           THEN mut' = [mut EXCEPT !.ph = "sent"] /\ UNCHANGED flags
@@ -261,7 +338,10 @@ Subscribe == "topic" \in Ops /\ top = "none" /\ top' = "open"
 
 \* fc values of the gate checks that let a step at S = the frontier proceed
 TopicGateOpts(t) ==
-  IF phi = "chan" THEN
+  IF ~TokValid(t, tokExp) THEN {}
+  ELSE IF phi = "token" THEN {h.r >= t - B : h \in {h \in Acc(t) : h.idx <= fr}}
+  ELSE IF phi = "split" THEN {h.r >= t - B : h \in {h \in EffEv(t) : h.idx <= fr}}
+  ELSE IF phi = "chan" THEN
      CASE MatCheck = "none"    -> {FALSE}
        [] MatCheck = "applied" -> {h.r >= t - B : h \in {h \in Acc(t) : h.idx <= mat}}
        [] MatCheck = "version" -> {h.r >= t - B : h \in {h \in Acc(t) : h.idx <= fr}}
@@ -282,11 +362,24 @@ TopicPause == top = "open" /\ top' = "paused"
 TopicClose == top = "paused" /\ top' = "closed"
            /\ UNCHANGED <<now, phi, revT, fo, mat, fr, mut, link, rdr, flags>>
 
+\* the client gets a fresh token (for a stream, its answer to `reauth`);
+\* the auth service issues one only before the revocation
+Refresh == phi = "token" /\ revT = NONE /\ tokExp < now + TokLife
+           /\ tokExp' = now + TokLife
+           /\ UNCHANGED <<now, phi, revT, fo, mat, fr, mut, top, link, rdr, flags>>
+
+\* p's split entry commits (phi = "split")
+Split == phi = "split" /\ splitT = NONE /\ splitT' = now
+         /\ UNCHANGED <<now, phi, revT, fo, mat, fr, mut, top, link, rdr, flags>>
+
 Next ==
-  \/ Tick \/ Revoke \/ Failover \/ MatApply \/ FrontierAdvance
-  \/ Read \/ LinkCheck \/ Download
-  \/ MutRead \/ Decide \/ Deliver \/ MutAbort
-  \/ Subscribe \/ TopicStep \/ TopicPause \/ TopicClose
+  \/ /\ \/ Tick \/ Revoke \/ Failover \/ MatApply \/ FrontierAdvance
+        \/ Read \/ LinkCheck \/ Download
+        \/ MutRead \/ Decide \/ Deliver \/ MutAbort
+        \/ Subscribe \/ TopicStep \/ TopicPause \/ TopicClose
+     /\ UNCHANGED <<tokExp, splitT>>
+  \/ Refresh /\ UNCHANGED splitT
+  \/ Split /\ UNCHANGED tokExp
 
 Spec == Init /\ [][Next]_vars
 
@@ -298,6 +391,8 @@ Spec == Init /\ [][Next]_vars
 Inv_Horizon == hzOK
 \* 2. A revocation committed at tr affects every output after tr + B; the
 \*    only residual is a download through a redirect within PL of its check.
+\*    For a token revocation (outside Shep) the bound is TokLife + ExpSkew
+\*    + Eps instead of B.
 Inv_Revoke == rvOK
 \* 3. Data is produced only with evidence for each relevant partition (the
 \*    horizon partitions, and chan through its materializer) sent within B
@@ -315,12 +410,12 @@ Inv_LinkRevoked == lkOK
 \* stuttering step that [][A]_vars wouldn't see.
 \*  - a residual download is possible after tr + B
 Sanity_NoResidual == ~(rdr /= NONE /\ now - Eps <= rdr + Eps + PL - PresignMargin
-                       /\ revT /= NONE /\ revT + B < now)
+                       /\ revT /= NONE /\ revT + RevBound < now)
 \*  - a mutation commits exactly at tr + B
-Sanity_NoBoundaryCommit == ~(mut.ph = "committed" /\ revT /= NONE /\ mut.ct = revT + B)
+Sanity_NoBoundaryCommit == ~(mut.ph = "committed" /\ revT /= NONE /\ mut.ct = revT + RevBound)
 \*  - a topic can push exactly at tr + B
 Sanity_NoBoundaryPush == ~(top \in {"open", "paused"} /\ fr = 0 /\ revT /= NONE
-                           /\ now = revT + B /\ TopicGateOpts(now) /= {})
+                           /\ now = revT + RevBound /\ TopicGateOpts(now) /= {})
 \*  - after a failover, a check can grant after the new leader's commit
 Sanity_NoGrantAfterFailover == ~(fo /= NONE /\ revT /= NONE /\ revT > fo
                                  /\ now > revT /\ GrantOpts(now) /= {})

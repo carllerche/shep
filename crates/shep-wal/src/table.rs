@@ -28,7 +28,6 @@ pub(crate) struct Table {
     points: BTreeMap<Bytes, VecDeque<u64>>,
     /// Sequence numbers of entries that wrote ranges wider than one key.
     ranged: BTreeSet<u64>,
-    last_commit_time_us: u64,
 }
 
 struct Slot {
@@ -45,6 +44,8 @@ pub(crate) enum SlotIndex {
     Known(u64),
     /// Appended at this index, but void: it wrote nothing.
     Void(u64),
+    /// Refused before it was appended: it wrote nothing and holds no index.
+    NotAppended,
 }
 
 impl Table {
@@ -58,7 +59,6 @@ impl Table {
             slots: VecDeque::new(),
             points: BTreeMap::new(),
             ranged: BTreeSet::new(),
-            last_commit_time_us: 0,
         }
     }
 
@@ -68,17 +68,6 @@ impl Table {
 
     pub(crate) fn floor(&self) -> u64 {
         self.floor
-    }
-
-    /// A commit time for the next entry: the clock, but never earlier than an
-    /// entry already in the log.
-    pub(crate) fn next_commit_time(&mut self, now_us: u64) -> u64 {
-        self.last_commit_time_us = self.last_commit_time_us.max(now_us);
-        self.last_commit_time_us
-    }
-
-    pub(crate) fn observe_commit_time(&mut self, t: u64) {
-        self.last_commit_time_us = self.last_commit_time_us.max(t);
     }
 
     /// Adds an entry's write set, returning its sequence number.
@@ -130,7 +119,7 @@ impl Table {
         match self.slot(seq).index {
             SlotIndex::Pending => true,
             SlotIndex::Known(i) => !read_version.contains(Dot::new(self.partition, i)),
-            SlotIndex::Void(_) => false,
+            SlotIndex::Void(_) | SlotIndex::NotAppended => false,
         }
     }
 
@@ -169,7 +158,9 @@ impl Table {
     pub(crate) fn evict(&mut self, cutoff_us: u64, max_slots: usize) {
         while let Some(front) = self.slots.front() {
             let index = match front.index {
-                SlotIndex::Known(i) | SlotIndex::Void(i) => i,
+                SlotIndex::Known(i) | SlotIndex::Void(i) => Some(i),
+                // Holds no index, so it moves no floor.
+                SlotIndex::NotAppended => None,
                 SlotIndex::Pending => break,
             };
             if front.commit_time_us >= cutoff_us && self.slots.len() <= max_slots {
@@ -178,7 +169,9 @@ impl Table {
             let slot = self.slots.pop_front().unwrap();
             let seq = self.front_seq;
             self.front_seq += 1;
-            self.floor = self.floor.max(index);
+            if let Some(index) = index {
+                self.floor = self.floor.max(index);
+            }
             for k in slot.points {
                 if let Some(seqs) = self.points.get_mut(&k) {
                     if seqs.front() == Some(&seq) {

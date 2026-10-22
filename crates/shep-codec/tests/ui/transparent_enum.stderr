@@ -1,0 +1,5 @@
+error: `transparent` applies only to structs
+ --> tests/ui/transparent_enum.rs:2:9
+  |
+2 | #[codec(transparent)]
+  |         ^^^^^^^^^^^

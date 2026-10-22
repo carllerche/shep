@@ -1,0 +1,129 @@
+//! Client-side adapter: converts `RaftNetwork` (v1) to `RaftNetworkV2`.
+//!
+//! This module provides [`Adapter`], a wrapper that allows any type implementing
+//! `RaftNetwork` to be used where `RaftNetworkV2` is required. The key difference is
+//! that `full_snapshot()` is implemented using chunked transmission via
+//! `Chunked::send_snapshot()`.
+
+use std::future::Future;
+use std::marker::PhantomData;
+
+use openraft::OptionalSend;
+use openraft::RaftTypeConfig;
+use openraft::errors::RPCError;
+use openraft::errors::ReplicationClosed;
+use openraft::errors::StreamingError;
+use openraft::errors::decompose::DecomposeResult;
+use openraft::network::Backoff;
+use openraft::network::RPCOption;
+use openraft::network::v2::RaftNetworkV2;
+use openraft::raft::AppendEntriesRequest;
+use openraft::raft::AppendEntriesResponse;
+use openraft::raft::SnapshotResponse;
+use openraft::raft::TransferLeaderRequest;
+use openraft::raft::TransferLeaderResponse;
+use openraft::raft::VoteRequest;
+use openraft::raft::VoteResponse;
+use openraft::type_config::alias::SnapshotOf;
+use openraft::type_config::alias::VoteOf;
+use openraft_macros::since;
+
+use crate::network_v1::RaftNetwork;
+use crate::network_v1::sender::Sender;
+
+/// Wrapper that adapts `RaftNetwork` (v1) to `RaftNetworkV2`.
+///
+/// This wrapper allows existing `RaftNetwork` implementations to be used where
+/// `RaftNetworkV2` is required. The `full_snapshot()` method is implemented using
+/// chunked transmission via `Chunked::send_snapshot()`, which calls `install_snapshot()`
+/// for each chunk.
+///
+/// # Usage
+///
+/// ```ignore
+/// use openraft_legacy::prelude::*;
+///
+/// // Your existing RaftNetwork implementation
+/// let network: MyNetwork = /* ... */;
+///
+/// // Wrap it to use as RaftNetworkV2
+/// let adapter = network.into_v2::<MySnapshotData>();
+/// ```
+#[since(version = "0.10.0")]
+pub struct Adapter<C, N, SD> {
+    network: N,
+    _phantom: PhantomData<(C, fn() -> SD)>,
+}
+
+impl<C, N, SD> Adapter<C, N, SD>
+where
+    C: RaftTypeConfig,
+    N: RaftNetwork<C>,
+    SD: OptionalSend + 'static,
+{
+    /// Create a new adapter wrapping the given `RaftNetwork` implementation.
+    pub fn new(network: N) -> Self {
+        Self {
+            network,
+            _phantom: PhantomData,
+        }
+    }
+
+    /// Get a reference to the underlying network.
+    pub fn inner(&self) -> &N {
+        &self.network
+    }
+
+    /// Get a mutable reference to the underlying network.
+    pub fn inner_mut(&mut self) -> &mut N {
+        &mut self.network
+    }
+
+    /// Consume the adapter and return the underlying network.
+    pub fn into_inner(self) -> N {
+        self.network
+    }
+}
+
+impl<C, N, SD> RaftNetworkV2<C> for Adapter<C, N, SD>
+where
+    C: RaftTypeConfig,
+    N: RaftNetwork<C>,
+    SD: tokio::io::AsyncRead + tokio::io::AsyncWrite + tokio::io::AsyncSeek + Unpin + OptionalSend + 'static,
+{
+    type SnapshotData = SD;
+
+    async fn append_entries(
+        &mut self,
+        rpc: AppendEntriesRequest<C>,
+        option: RPCOption,
+    ) -> Result<AppendEntriesResponse<C>, RPCError<C>> {
+        RaftNetwork::<C>::append_entries(&mut self.network, rpc, option).await.decompose_infallible()
+    }
+
+    async fn vote(&mut self, rpc: VoteRequest<C>, option: RPCOption) -> Result<VoteResponse<C>, RPCError<C>> {
+        RaftNetwork::<C>::vote(&mut self.network, rpc, option).await.decompose_infallible()
+    }
+
+    async fn full_snapshot(
+        &mut self,
+        vote: VoteOf<C>,
+        snapshot: SnapshotOf<C, Self::SnapshotData>,
+        cancel: impl Future<Output = ReplicationClosed> + OptionalSend + 'static,
+        option: RPCOption,
+    ) -> Result<SnapshotResponse<C>, StreamingError<C>> {
+        Sender::<C, SD>::send_snapshot(&mut self.network, vote, snapshot, cancel, option).await
+    }
+
+    async fn transfer_leader(
+        &mut self,
+        rpc: TransferLeaderRequest<C>,
+        option: RPCOption,
+    ) -> Result<TransferLeaderResponse<C>, RPCError<C>> {
+        RaftNetwork::<C>::transfer_leader(&mut self.network, rpc, option).await
+    }
+
+    fn backoff(&self) -> Option<Backoff> {
+        Some(RaftNetwork::<C>::backoff(&self.network))
+    }
+}

@@ -4,12 +4,11 @@ use bytes::Bytes;
 use shep_wal_client::api::{PartitionId, Proposal, ProposalKind};
 use shep_wal_client::{ClientConfig, ProposeError, WalClient};
 
-/// A peer that accepts connections and never answers can't hold `propose`
-/// past its deadline.
-#[tokio::test]
-async fn propose_stops_at_its_deadline() {
+/// A client of one peer that accepts connections and never answers, with a
+/// deadline far shorter than its RPC timeout and backoff.
+fn silent_peer() -> (std::net::TcpListener, WalClient) {
     // Bound and listening, so connections complete, but never served.
-    let silent = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = silent.local_addr().unwrap().to_string();
     let client = WalClient::with_config(
         [addr],
@@ -21,6 +20,13 @@ async fn propose_stops_at_its_deadline() {
         },
     )
     .unwrap();
+    (silent, client)
+}
+
+/// A silent peer can't hold `propose` past its deadline.
+#[tokio::test]
+async fn propose_stops_at_its_deadline() {
+    let (silent, client) = silent_peer();
     let proposal = Proposal {
         idempotency_key: Bytes::from_static(b"k"),
         kind: ProposalKind::Failure {
@@ -36,4 +42,26 @@ async fn propose_stops_at_its_deadline() {
         start.elapsed()
     );
     drop(silent);
+}
+
+/// Nor `create_universe`, which has the same deadline.
+#[tokio::test]
+async fn create_universe_stops_at_its_deadline() {
+    let (silent, client) = silent_peer();
+    let start = Instant::now();
+    let r = client.create_universe("prod", 1, 1).await;
+    assert!(r.is_err(), "{r:?}");
+    assert!(
+        start.elapsed() < Duration::from_millis(200),
+        "took {:?}",
+        start.elapsed()
+    );
+    drop(silent);
+}
+
+/// A client with no nodes fails rather than panicking.
+#[tokio::test]
+async fn create_universe_without_nodes_fails() {
+    let client = WalClient::with_config(Vec::<String>::new(), ClientConfig::default()).unwrap();
+    assert!(client.create_universe("prod", 1, 1).await.is_err());
 }

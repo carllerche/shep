@@ -186,3 +186,34 @@ the topic's version. This is the built-in counterpart of F4's fix.
   - Files: 2 actors, 2 hashes, 2 nodes, and at most 3 uploads. 3 uploads with
     3 files didn't finish in 10 minutes.
   - LiveRevocation: 3 actors and at most 5 log entries.
+
+## Token model
+
+| # | Severity | Finding | Evidence |
+|---|---|---|---|
+| FL8 | confirms | With external tokens, a stream pauses at exp: it pushes nothing and keeps its state until a reauth or the end of the grace period. Links die with their token. | `LiveRevocation_token_gracepush` fails; `LiveRevocation_token` passes (7,128,898 states, 3m56s) |
+| FL9 | confirms | Deleting the viewer must close the stream, which resolves FL4. Link use must check the viewer. | `_token_viewernoclose` and `_token_linknocheck` both fail |
+
+FL3, FL4 and FL7's `_noactsfor` are superseded by the token model, and their configs are marked `SUPERSEDED`.
+
+## Downloads (§16.4)
+
+The model:
+- **Handles** are front-end soft state.
+- **Use:** the files host forwards a request to the front end that minted the handle. After that front end restarts, the request gets a 404, then re-mints with a fresh read.
+- **Expiry:** reauth extends a handle; token `exp` is checked with `ExpSkew`.
+- **Presigned GET** has a 2ε margin.
+- **Revocation:** one access revocation is modelled, under the horizon rule.
+
+| # | Severity | Finding | Config |
+|---|---|---|---|
+| FD1 | low (wording) | With reauth extension, a live subscription's links outlive both the minting token and the hour. Fix: cap the extension at min(new exp, mint time + 1 h), or reword the text to say "never outlive the token that minted or last extended them". | `_dl_bearer` fails; `_dl_capped` passes |
+| FD2 | confirms | A download after access loss happens at most B + one minute later. That needs the check at use and the presign margin. | `_dl_nousecheck`, `_dl_nomargin` fail |
+| FD3 | confirms | A handle's exp is capped at the token's exp at mint, and reauth extends it to the token's exp, not to now + 1 h. | `_dl_nocap`, `_dl_reauthhl` fail |
+| FD4 | medium | A re-mint must always be a fresh read. Downloads stay bounded either way, because each use checks again, but a handle restored from cached claims exists unchecked. | `_dl_restore` fails; `_dl_restore_dl` passes |
+| FD5 | confirms | Both the 404-then-re-mint path and reauth extension are reachable. | witnesses fire |
+
+Results:
+- `Files_dl` passes with 45,103,444 distinct states, and `_dl_capped` with 31,437,292.
+- The upload regression (`Files`) passes with 5,788,960.
+- The disk filled before `_direct`, `_live`, `_noreadcheck`, `_nostoredcheck`, `_push` and `_revoke` ran; these need re-running.

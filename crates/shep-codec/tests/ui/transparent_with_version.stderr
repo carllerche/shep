@@ -1,0 +1,5 @@
+error: a transparent struct has no envelope, so it can't have a version
+ --> tests/ui/transparent_with_version.rs:2:9
+  |
+2 | #[codec(transparent, version = 1)]
+  |         ^^^^^^^^^^^
