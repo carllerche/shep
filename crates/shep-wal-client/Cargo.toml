@@ -1,0 +1,19 @@
+[package]
+name = "shep-wal-client"
+description = "Client for the WAL: proposals routed to leaders, and log tailing"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+futures.workspace = true
+shep-wal-api.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+tonic.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+bytes = { workspace = true }

@@ -1,0 +1,150 @@
+// The protocol between WAL replicas: openraft's RPCs, and the WAL's log and
+// snapshot formats. Every RPC names the partition whose group it's for.
+syntax = "proto3";
+
+package shep.wal.raft.v1;
+
+import "shep/wal/v1/wal.proto";
+
+service Raft {
+  rpc AppendEntries(AppendEntriesRequest) returns (AppendEntriesResponse);
+  rpc Vote(VoteRequest) returns (VoteResponse);
+  rpc InstallSnapshot(InstallSnapshotRequest) returns (InstallSnapshotResponse);
+}
+
+message LeaderId {
+  uint64 term = 1;
+  uint64 node_id = 2;
+}
+
+message Vote {
+  LeaderId leader_id = 1;
+  bool committed = 2;
+}
+
+message LogId {
+  LeaderId leader_id = 1;
+  uint64 index = 2;
+}
+
+message NodeSet {
+  repeated uint64 ids = 1;
+}
+
+message Membership {
+  repeated NodeSet configs = 1;
+  repeated shep.wal.v1.Member nodes = 2;
+}
+
+message StoredMembership {
+  optional LogId log_id = 1;
+  Membership membership = 2;
+}
+
+// One Raft log entry, as replicated and as stored in log segments.
+message Entry {
+  LogId log_id = 1;
+  oneof payload {
+    Blank blank = 2;
+    Command normal = 3;
+    Membership membership = 4;
+  }
+}
+
+message Blank {}
+
+// The WAL's application entry.
+message Command {
+  // The term of the leader that validated it. An entry appended under any
+  // other term is void.
+  uint64 validated_term = 1;
+  uint64 commit_time_us = 2;
+  // Idempotency keys decided before this time are forgotten.
+  uint64 idempotency_floor_us = 3;
+  bytes idempotency_key = 4;
+  oneof kind {
+    MutationCommand mutation = 5;
+    FailureCommand failure = 6;
+  }
+}
+
+message MutationCommand {
+  shep.wal.v1.Dvv context = 1;
+  repeated shep.wal.v1.KeyRange write_set = 2;
+  bytes payload = 3;
+  bytes reply = 4;
+}
+
+message FailureCommand {
+  bytes reply = 1;
+}
+
+message AppendEntriesRequest {
+  uint64 partition = 1;
+  Vote vote = 2;
+  optional LogId prev_log_id = 3;
+  repeated Entry entries = 4;
+  optional LogId leader_commit = 5;
+}
+
+message AppendEntriesResponse {
+  oneof result {
+    Blank success = 1;
+    PartialSuccess partial_success = 2;
+    Blank conflict = 3;
+    Vote higher_vote = 4;
+  }
+}
+
+message PartialSuccess {
+  optional LogId matching = 1;
+}
+
+message VoteRequest {
+  uint64 partition = 1;
+  Vote vote = 2;
+  optional LogId last_log_id = 3;
+}
+
+message VoteResponse {
+  Vote vote = 1;
+  bool vote_granted = 2;
+  optional LogId last_log_id = 3;
+}
+
+message SnapshotMeta {
+  optional LogId last_log_id = 1;
+  StoredMembership last_membership = 2;
+  string snapshot_id = 3;
+}
+
+message InstallSnapshotRequest {
+  uint64 partition = 1;
+  Vote vote = 2;
+  SnapshotMeta meta = 3;
+  bytes data = 4;
+}
+
+message InstallSnapshotResponse {
+  Vote vote = 1;
+}
+
+// ---- state machine snapshots ----
+
+message StateMachineSnapshot {
+  repeated DecidedKey keys = 1;
+}
+
+message DecidedKey {
+  bytes idempotency_key = 1;
+  uint64 index = 2;
+  uint64 commit_time_us = 3;
+  bool failed = 4;
+  bytes reply = 5;
+}
+
+// A snapshot as stored on disk.
+message StoredSnapshot {
+  SnapshotMeta meta = 1;
+  bytes data = 2;
+}

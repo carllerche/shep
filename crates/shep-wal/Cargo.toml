@@ -1,0 +1,33 @@
+[package]
+name = "shep-wal"
+description = "The write-ahead log: a Raft group per partition, with leader validation"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+bytes.workspace = true
+crc32fast.workspace = true
+futures.workspace = true
+openraft.workspace = true
+prost.workspace = true
+shep-version.workspace = true
+shep-wal-api.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+tonic.workspace = true
+tonic-prost.workspace = true
+tracing.workspace = true
+
+[build-dependencies]
+protox.workspace = true
+tonic-prost-build.workspace = true
+
+[dev-dependencies]
+futures.workspace = true
+rand.workspace = true
+shep-wal-client.workspace = true
+tempfile.workspace = true
+tracing-subscriber.workspace = true
