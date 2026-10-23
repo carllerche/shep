@@ -1,3 +1,0 @@
-# Vendored from openraft, which formats with nightly-only options; keep
-# upstream formatting so the fork diffs stay readable.
-disable_all_formatting = true

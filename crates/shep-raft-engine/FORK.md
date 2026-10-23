@@ -17,8 +17,16 @@ Changes from upstream are listed below.
 
 - `tests/` holds openraft's integration tests (`tests/tests` upstream), with
   one line added to each test target's root: `extern crate shep_raft_engine
-  as openraft;`. Their support crates, `memstore` and `legacy`, are vendored
-  as `shep-raft-memstore` and `shep-raft-legacy`, unchanged.
+  as openraft;`. Their support crate `memstore` is vendored as
+  `shep-raft-memstore`.
+- openraft's `legacy` crate (the v1 network API, which sends snapshots in
+  chunks) is not vendored: Shep installs snapshots with the full-snapshot
+  API. Removed with it: memstore's `SnapshotReceiverFactory` impl, the
+  `InstallSnapshot` variants of the test fixtures' `RpcRequest` and
+  `RpcResponse`, the `legacy` exports in `tests/public_api_test.rs`, the
+  tests `snapshot_streaming/t10_api_install_snapshot.rs` and
+  `t10_api_install_snapshot_with_lower_vote.rs`, and the v1 request case of
+  `snapshot_streaming/t10_wire_compat_09.rs`.
 - `tests/replication/t52_reset_backoff.rs`: `transfer_leader_resets_target_backoff_by_default`
   waits for node-2's applied index to reach `log_index`, not to equal it.
   Under the `single-threaded` feature, which Shep uses, the new leader's own

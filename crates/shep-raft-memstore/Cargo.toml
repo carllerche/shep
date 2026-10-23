@@ -11,7 +11,6 @@ doctest = false
 
 [dependencies]
 openraft = { package = "shep-raft-engine", path = "../shep-raft-engine", features = ["serde", "type-alias"] }
-openraft-legacy = { package = "shep-raft-legacy", path = "../shep-raft-legacy" }
 openraft-rt-tokio = "=0.10.0-alpha.37"
 
 derive_more = { version = "2.1.1", features = ["std", "from", "try_into", "display"] }

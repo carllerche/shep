@@ -37,7 +37,6 @@ serde = { version = "1.0.114", features = ["derive", "rc"], optional = true }
 # openraft's integration tests (`tests/`) name the support crates by their
 # upstream names; the memstore dependency also turns on `serde` and
 # `type-alias` here.
-openraft-legacy = { package = "shep-raft-legacy", path = "../shep-raft-legacy", features = ["serde"] }
 openraft-memstore = { package = "shep-raft-memstore", path = "../shep-raft-memstore" }
 openraft-rt-tokio = "=0.10.0-alpha.37"
 

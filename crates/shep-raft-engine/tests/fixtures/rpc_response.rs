@@ -8,7 +8,6 @@ use openraft::raft::AppendEntriesResponse;
 use openraft::raft::SnapshotResponse;
 use openraft::raft::TransferLeaderResponse;
 use openraft::raft::VoteResponse;
-use openraft_legacy::network_v1::InstallSnapshotResponse;
 
 /// Unified enum for all RPC response types in the test framework.
 #[derive(Debug)]
@@ -17,7 +16,6 @@ pub enum RpcResponse<C>
 where C: RaftTypeConfig
 {
     AppendEntries(AppendEntriesResponse<C>),
-    InstallSnapshot(InstallSnapshotResponse<C>),
     InstallFullSnapshot(SnapshotResponse<C>),
     Vote(VoteResponse<C>),
     TransferLeader(TransferLeaderResponse<C>),
@@ -29,7 +27,6 @@ where C: RaftTypeConfig
     pub fn get_type(&self) -> RPCTypes {
         match self {
             RpcResponse::AppendEntries(_) => RPCTypes::AppendEntries,
-            RpcResponse::InstallSnapshot(_) => RPCTypes::InstallSnapshot,
             RpcResponse::InstallFullSnapshot(_) => RPCTypes::InstallSnapshot,
             RpcResponse::Vote(_) => RPCTypes::Vote,
             RpcResponse::TransferLeader(_) => RPCTypes::TransferLeader,
@@ -43,7 +40,6 @@ where C: RaftTypeConfig
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             RpcResponse::AppendEntries(resp) => write!(f, "AppendEntries({})", resp),
-            RpcResponse::InstallSnapshot(req) => write!(f, "InstallSnapshot({})", req),
             RpcResponse::InstallFullSnapshot(resp) => write!(f, "InstallFullSnapshot({})", resp),
             RpcResponse::Vote(resp) => write!(f, "Vote({})", resp),
             RpcResponse::TransferLeader(resp) => write!(f, "TransferLeader({:?})", resp),

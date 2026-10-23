@@ -1,10 +1,10 @@
 //! Positional-format compatibility with the 0.9 serialized layouts.
 //!
 //! A positional format such as bincode encodes a struct as a bare sequence: no field names,
-//! only the count and order. The exact-JSON unit tests in `openraft` and `openraft-legacy` pin
+//! only the count and order. The exact-JSON unit tests in `openraft` pin
 //! that count by proxy; these tests exercise it directly, in both directions, for each type
-//! that crosses a 0.9/0.10 boundary: stored `SnapshotMeta`, `SnapshotSignature` inside errors,
-//! and the v1 chunked `InstallSnapshotRequest`.
+//! that crosses a 0.9/0.10 boundary: stored `SnapshotMeta` and `SnapshotSignature` inside
+//! errors.
 //!
 //! The 0.9 replicas below reuse the current inner types (`LogId`, `Vote`, `StoredMembership`),
 //! whose layouts are unchanged since 0.9; the field under test is `snapshot_id`.
@@ -12,14 +12,10 @@
 use anyhow::Result;
 use maplit::btreeset;
 use openraft::Membership;
-use openraft::Vote;
 use openraft::alias::LogIdOf;
 use openraft::alias::SnapshotMetaOf;
 use openraft::alias::SnapshotSignatureOf;
 use openraft::alias::StoredMembershipOf;
-use openraft::alias::VoteOf;
-use openraft_legacy::network_v1::InstallSnapshotRequest;
-use openraft_legacy::network_v1::SnapshotMeta as SnapshotMetaV1;
 use openraft_memstore::TypeConfig;
 use serde::Deserialize;
 use serde::Serialize;
@@ -40,16 +36,6 @@ struct SnapshotSignature09 {
     last_log_id: Option<LogIdOf<TypeConfig>>,
     last_membership_log_id: Option<Box<LogIdOf<TypeConfig>>>,
     snapshot_id: String,
-}
-
-/// The 0.9 `InstallSnapshotRequest` layout: five fields, the id inside `meta`.
-#[derive(Debug, PartialEq, Serialize, Deserialize)]
-struct InstallSnapshotRequest09 {
-    vote: VoteOf<TypeConfig>,
-    meta: SnapshotMeta09,
-    offset: u64,
-    data: Vec<u8>,
-    done: bool,
 }
 
 fn membership() -> StoredMembershipOf<TypeConfig> {
@@ -140,44 +126,5 @@ fn test_snapshot_signature_bincode_to_09() -> Result<()> {
         },
         old
     );
-    Ok(())
-}
-
-/// The v1 RPC round-trips between the 0.9 and 0.10 layouts with the transfer id preserved:
-/// unlike the storage types above, the id inside the request `meta` is meaningful.
-#[test]
-fn test_install_snapshot_request_bincode_roundtrip_09() -> Result<()> {
-    let old = InstallSnapshotRequest09 {
-        vote: Vote::new_committed(2, 1),
-        meta: SnapshotMeta09 {
-            last_log_id: Some(log_id(1, 2, 3)),
-            last_membership: membership(),
-            snapshot_id: "ss-1".to_string(),
-        },
-        offset: 7,
-        data: vec![1, 2, 3],
-        done: true,
-    };
-
-    let new: InstallSnapshotRequest<TypeConfig> = bincode::deserialize(&bincode::serialize(&old)?)?;
-
-    assert_eq!(
-        InstallSnapshotRequest::<TypeConfig> {
-            vote: Vote::new_committed(2, 1),
-            meta: SnapshotMetaV1 {
-                last_log_id: Some(log_id(1, 2, 3)),
-                last_membership: membership(),
-                snapshot_id: "ss-1".to_string(),
-            },
-            offset: 7,
-            data: vec![1, 2, 3],
-            done: true,
-        },
-        new
-    );
-
-    let back: InstallSnapshotRequest09 = bincode::deserialize(&bincode::serialize(&new)?)?;
-    assert_eq!(old, back);
-
     Ok(())
 }

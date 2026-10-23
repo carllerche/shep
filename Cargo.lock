@@ -1089,7 +1089,6 @@ dependencies = [
  "rand 0.10.3",
  "serde",
  "serde_json",
- "shep-raft-legacy",
  "shep-raft-memstore",
  "smallvec",
  "test-harness",
@@ -1098,23 +1097,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "validit",
-]
-
-[[package]]
-name = "shep-raft-legacy"
-version = "0.1.0"
-dependencies = [
- "anyerror",
- "derive_more",
- "display-more",
- "futures",
- "openraft-macros",
- "serde",
- "serde_json",
- "shep-raft-engine",
- "thiserror",
- "tokio",
- "tracing",
 ]
 
 [[package]]
@@ -1127,7 +1109,6 @@ dependencies = [
  "serde",
  "serde_json",
  "shep-raft-engine",
- "shep-raft-legacy",
  "tokio",
  "tracing",
 ]

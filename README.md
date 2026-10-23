@@ -20,7 +20,7 @@ replicates.
 | `crates/shep-smp` | Thread-per-core: a `current_thread` runtime per core, bounded mailboxes, sharded services |
 | `crates/shep-storage` | Per-core storage, after Redpanda's: segmented logs with coalesced fsync and crash recovery, and a key-value store |
 | `crates/shep-raft-engine` | openraft 0.10.0-alpha.37, forked (see its `FORK.md`), with its test suite |
-| `crates/shep-raft-memstore`, `crates/shep-raft-legacy` | openraft's test-support crates, vendored |
+| `crates/shep-raft-memstore` | openraft's test-support store, vendored |
 | `crates/shep-raft` | Embeddable multi-raft per core. Each group runs the embedder's `Machine`, which admits proposals on the leader and applies them everywhere. The crate handles void entries, rebuilding leader-side state, idempotency keys, commit times and tailing. Also: pipelined appends, heartbeats batched per node pair, logs on `shep-storage`, node-local core placement |
 | `crates/shep-wal-api` | The WAL's client protocol |
 | `crates/shep-wal` | The WAL, as an embedder of `shep-raft`: a group per partition whose machine validates proposals (§10.3), and the node's side of the controller |

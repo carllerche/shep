@@ -5,8 +5,6 @@ extern crate shep_raft_engine as openraft;
 #[path = "../fixtures/mod.rs"]
 mod fixtures;
 
-mod t10_api_install_snapshot;
-mod t10_api_install_snapshot_with_lower_vote;
 mod t10_wire_compat_09;
 mod t20_startup_snapshot;
 mod t30_purge_in_snapshot_logs;
