@@ -3,8 +3,8 @@
 // Portions Copyright (c) 2021 Tokio Contributors. Licensed under MIT.
 
 use crate::{
-    driver::{TimerHandle, TimerShared},
     error::InsertError,
+    timer::{TimerHandle, TimerShared},
 };
 
 mod level;
@@ -146,11 +146,6 @@ impl Wheel {
                 self.levels.get_unchecked_mut(level).remove_entry(item);
             }
         }
-    }
-
-    /// Instant at which to poll
-    pub(crate) fn poll_at(&self) -> Option<u64> {
-        self.next_expiration().map(|expiration| expiration.deadline)
     }
 
     /// Advances the timer up to the instant represented by `now`.

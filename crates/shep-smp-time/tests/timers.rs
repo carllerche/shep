@@ -3,183 +3,132 @@ use std::future::{Future, pending};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::pin::Pin;
 use std::rc::Rc;
-use std::task::{Context, Poll, Waker};
+use std::sync::Arc;
+use std::task::{Context, Poll, Wake, Waker};
 
 use shep_futures::future::block_on;
 use shep_smp_exec::{Executor, JoinHandle};
 use shep_smp_time::{
-    Driver, Duration, Instant, MissedTickBehavior, TimeDriver, interval_at, sleep, sleep_until,
-    timeout, timeout_at,
+    Duration, Instant, MissedTickBehavior, Timer, interval_at, sleep, sleep_until, timeout_at,
 };
-
-#[derive(Clone, Debug, PartialEq)]
-enum Call {
-    Submit,
-    Park,
-    Timeout(Duration),
-}
-
-/// Test-only waiting driver. Production waiting will come from io_uring.
-struct Wait {
-    calls: Rc<RefCell<Vec<Call>>>,
-    wait: bool,
-}
-
-impl Driver for Wait {
-    fn with<R>(&self, f: impl FnOnce() -> R) -> R {
-        f()
-    }
-    fn submit(&self) -> std::io::Result<()> {
-        self.calls.borrow_mut().push(Call::Submit);
-        Ok(())
-    }
-    fn park(&self) -> std::io::Result<()> {
-        self.calls.borrow_mut().push(Call::Park);
-        Ok(())
-    }
-    fn park_timeout(&self, duration: Duration) -> std::io::Result<()> {
-        self.calls.borrow_mut().push(Call::Timeout(duration));
-        if self.wait {
-            std::thread::sleep(duration);
-        }
-        Ok(())
-    }
-}
-
-fn driver(wait: bool) -> (TimeDriver<Wait>, Rc<RefCell<Vec<Call>>>) {
-    let calls = Rc::new(RefCell::new(Vec::new()));
-    (
-        TimeDriver::new(Wait {
-            calls: calls.clone(),
-            wait,
-        }),
-        calls,
-    )
-}
 
 fn poll<F: Future>(future: Pin<&mut F>) -> Poll<F::Output> {
     future.poll(&mut Context::from_waker(Waker::noop()))
 }
 
-fn drive<T>(timer: &TimeDriver<Wait>, exec: &mut Executor, join: JoinHandle<T>) -> T {
-    let end = std::time::Instant::now() + Duration::from_secs(2);
-    while !join.is_finished() {
-        assert!(std::time::Instant::now() < end, "timer failed to complete");
+// The reactor will own these steps. Tests advance directly to the next wheel
+// processing time, with no driver abstraction, clock trait, or wall-clock wait.
+fn drive<T>(timer: &Timer, exec: &mut Executor, join: JoinHandle<T>) -> T {
+    for _ in 0..256 {
         timer.with(|| exec.run_ready(64));
-        if !join.is_finished() && !exec.has_ready() {
-            timer.park().unwrap();
+        if join.is_finished() {
+            return block_on(join).unwrap();
+        }
+        if !exec.has_ready() {
+            timer.advance(timer.next_wake().expect("pending task has no wake source"));
         }
     }
-    block_on(join).unwrap()
+    panic!("timer task did not finish");
 }
 
 #[test]
-fn sleep_wakes_local_executor_tasks_without_tokio() {
-    let (timer, _) = driver(true);
+fn advancing_timers_wakes_local_executor_tasks_without_waiting() {
+    let now = Instant::now();
+    let timer = Timer::new(now);
     let mut exec = Executor::new(Waker::noop().clone());
     let local = Rc::new(42);
-    let deadline = Instant::now() + Duration::from_millis(3);
     let join = exec.spawn(async move {
-        sleep_until(deadline).await;
-        assert!(Instant::now() >= deadline);
+        sleep_until(now + Duration::from_secs(1)).await;
         local
     });
     assert_eq!(*drive(&timer, &mut exec, join), 42);
     assert!(exec.is_empty());
+    assert_eq!(timer.next_wake(), None);
 }
 
 #[test]
-fn a_sleep_remains_bound_to_its_creation_driver() {
-    let (owner, owner_calls) = driver(false);
-    let (other, other_calls) = driver(false);
-    let mut sleep = Box::pin(owner.with(|| sleep(Duration::from_secs(30))));
+fn a_sleep_remains_bound_to_its_creation_timer() {
+    let now = Instant::now();
+    let owner = Timer::new(now);
+    let other = Timer::new(now);
+    let deadline = now + Duration::from_millis(10);
+    let mut sleep = Box::pin(owner.with(|| sleep_until(deadline)));
     other.with(|| assert!(poll(sleep.as_mut()).is_pending()));
-    owner.park_timeout(Duration::ZERO).unwrap();
-    other.park().unwrap();
-    assert_eq!(*owner_calls.borrow(), [Call::Timeout(Duration::ZERO)]);
-    assert_eq!(*other_calls.borrow(), [Call::Park]);
-    drop(sleep);
-    owner.park().unwrap();
-    assert_eq!(owner_calls.borrow().last(), Some(&Call::Park));
+    assert_eq!(owner.next_wake(), Some(deadline));
+    assert_eq!(other.next_wake(), None);
+    other.advance(deadline);
+    assert!(poll(sleep.as_mut()).is_pending());
+    owner.advance(deadline);
+    assert!(poll(sleep.as_mut()).is_ready());
+    assert_eq!(owner.next_wake(), None);
 }
 
 #[test]
 fn construction_is_lazy_and_dropping_a_registered_sleep_unlinks_it() {
-    let (timer, calls) = driver(false);
-    let mut sleep = Box::pin(timer.with(|| sleep(Duration::from_secs(30))));
-    timer.park().unwrap();
-    assert_eq!(*calls.borrow(), [Call::Park]);
+    let now = Instant::now();
+    let timer = Timer::new(now);
+    let mut sleep = Box::pin(timer.with(|| sleep_until(now + Duration::from_secs(30))));
+    assert_eq!(timer.next_wake(), None);
     timer.with(|| assert!(poll(sleep.as_mut()).is_pending()));
-    timer.park_timeout(Duration::ZERO).unwrap();
-    assert_eq!(calls.borrow().last(), Some(&Call::Timeout(Duration::ZERO)));
+    assert!(timer.next_wake().is_some());
     drop(sleep);
-    timer.park().unwrap();
-    assert_eq!(calls.borrow().last(), Some(&Call::Park));
+    assert_eq!(timer.next_wake(), None);
 }
 
 #[test]
 fn resetting_later_preserves_the_extended_deadline() {
-    let (timer, _) = driver(true);
-    let mut exec = Executor::new(Waker::noop().clone());
-    let join = exec.spawn(async {
-        let mut sleep = Box::pin(sleep(Duration::from_millis(2)));
-        std::future::poll_fn(|cx| {
-            assert!(sleep.as_mut().poll(cx).is_pending());
-            Poll::Ready(())
-        })
-        .await;
-        let extended = Instant::now() + Duration::from_millis(8);
-        sleep.as_mut().reset(extended);
-        sleep.await;
-        assert!(Instant::now() >= extended);
-    });
-    drive(&timer, &mut exec, join);
+    let now = Instant::now();
+    let timer = Timer::new(now);
+    let mut sleep = Box::pin(timer.with(|| sleep_until(now + Duration::from_millis(2))));
+    assert!(poll(sleep.as_mut()).is_pending());
+    let extended = now + Duration::from_millis(8);
+    sleep.as_mut().reset(extended);
+    timer.advance(now + Duration::from_millis(2));
+    assert!(poll(sleep.as_mut()).is_pending());
+    assert_eq!(timer.next_wake(), Some(extended));
+    timer.advance(extended);
+    assert!(poll(sleep.as_mut()).is_ready());
+    assert_eq!(timer.next_wake(), None);
 }
 
 #[test]
 fn reset_can_shorten_a_registered_timer_and_reuse_an_elapsed_one() {
-    let (timer, _) = driver(true);
-    let mut exec = Executor::new(Waker::noop().clone());
-    let join = exec.spawn(async {
-        let mut sleep = Box::pin(sleep(Duration::from_secs(30)));
-        std::future::poll_fn(|cx| {
-            assert!(sleep.as_mut().poll(cx).is_pending());
-            Poll::Ready(())
-        })
-        .await;
-        let earlier = Instant::now() + Duration::from_millis(2);
-        sleep.as_mut().reset(earlier);
-        sleep.as_mut().await;
-        assert!(Instant::now() >= earlier);
-        assert!(sleep.is_elapsed());
-        let again = Instant::now() + Duration::from_millis(2);
-        sleep.as_mut().reset(again);
-        sleep.await;
-        assert!(Instant::now() >= again);
-    });
-    drive(&timer, &mut exec, join);
+    let now = Instant::now();
+    let timer = Timer::new(now);
+    let mut sleep = Box::pin(timer.with(|| sleep_until(now + Duration::from_secs(30))));
+    assert!(poll(sleep.as_mut()).is_pending());
+    let earlier = now + Duration::from_millis(2);
+    sleep.as_mut().reset(earlier);
+    assert_eq!(timer.next_wake(), Some(earlier));
+    timer.advance(earlier);
+    assert!(poll(sleep.as_mut()).is_ready());
+    assert!(sleep.is_elapsed());
+    let again = now + Duration::from_millis(4);
+    sleep.as_mut().reset(again);
+    timer.advance(now + Duration::from_millis(3));
+    assert!(poll(sleep.as_mut()).is_pending());
+    timer.advance(again);
+    assert!(poll(sleep.as_mut()).is_ready());
 }
 
 #[test]
 fn timeout_expires_and_a_ready_value_wins_even_with_a_past_deadline() {
-    let (timer, _) = driver(true);
-    let mut exec = Executor::new(Waker::noop().clone());
-    let join = exec.spawn(async {
-        assert!(
-            timeout(Duration::from_millis(2), pending::<()>())
-                .await
-                .is_err()
-        );
-        let past = Instant::now() - Duration::from_secs(1);
-        assert_eq!(timeout_at(past, async { 42 }).await, Ok(42));
-    });
-    drive(&timer, &mut exec, join);
+    let now = Instant::now();
+    let timer = Timer::new(now);
+    let deadline = now + Duration::from_millis(5);
+    let mut timeout = Box::pin(timer.with(|| timeout_at(deadline, pending::<()>())));
+    assert!(poll(timeout.as_mut()).is_pending());
+    timer.advance(deadline);
+    assert!(matches!(poll(timeout.as_mut()), Poll::Ready(Err(_))));
+    let mut ready = Box::pin(timer.with(|| timeout_at(now, async { 42 })));
+    assert_eq!(poll(ready.as_mut()), Poll::Ready(Ok(42)));
 }
 
 #[test]
 fn interval_preserves_burst_catchup_and_missed_tick_configuration() {
-    let (timer, _) = driver(false);
-    let start = Instant::now() - Duration::from_secs(10);
+    let now = Instant::now();
+    let timer = Timer::new(now);
+    let start = now - Duration::from_secs(10);
     let mut interval = timer.with(|| interval_at(start, Duration::from_secs(1)));
     assert_eq!(interval.missed_tick_behavior(), MissedTickBehavior::Burst);
     assert_eq!(timer.with(|| block_on(interval.tick())), start);
@@ -194,38 +143,99 @@ fn interval_preserves_burst_catchup_and_missed_tick_configuration() {
 }
 
 #[test]
-fn driver_submit_and_wait_limits_are_forwarded() {
-    let (timer, calls) = driver(false);
-    timer.submit().unwrap();
-    timer.park().unwrap();
-    timer.park_timeout(Duration::from_secs(1)).unwrap();
-    assert_eq!(
-        *calls.borrow(),
-        [
-            Call::Submit,
-            Call::Park,
-            Call::Timeout(Duration::from_secs(1))
-        ]
+fn next_wake_includes_coarse_bucket_processing_before_the_deadline() {
+    let now = Instant::now();
+    let timer = Timer::new(now);
+    let deadline = now + Duration::from_millis(100);
+    let mut sleep = Box::pin(timer.with(|| sleep_until(deadline)));
+    assert!(poll(sleep.as_mut()).is_pending());
+    assert_eq!(timer.next_wake(), Some(now + Duration::from_millis(64)));
+    timer.advance(now + Duration::from_millis(64));
+    assert!(poll(sleep.as_mut()).is_pending());
+    assert_eq!(timer.next_wake(), Some(deadline));
+    timer.advance(now + Duration::from_millis(99));
+    assert!(poll(sleep.as_mut()).is_pending());
+    timer.advance(deadline);
+    assert!(poll(sleep.as_mut()).is_ready());
+    assert_eq!(timer.next_wake(), None);
+}
+
+#[test]
+fn fractional_millisecond_deadlines_round_up_without_firing_early() {
+    let now = Instant::now();
+    let timer = Timer::new(now);
+    let mut sleep = Box::pin(timer.with(|| sleep_until(now + Duration::from_micros(100))));
+    assert!(poll(sleep.as_mut()).is_pending());
+    let tick = now + Duration::from_millis(1);
+    assert_eq!(timer.next_wake(), Some(tick));
+    timer.advance(now + Duration::from_nanos(999_999));
+    assert!(poll(sleep.as_mut()).is_pending());
+    timer.advance(tick);
+    assert!(poll(sleep.as_mut()).is_ready());
+}
+
+#[test]
+fn advancing_backwards_is_clamped_and_cannot_fire_a_future_timer() {
+    let now = Instant::now();
+    let timer = Timer::new(now);
+    timer.advance(now + Duration::from_secs(1));
+    let deadline = now + Duration::from_millis(1001);
+    let mut sleep = Box::pin(timer.with(|| sleep_until(deadline)));
+    assert!(poll(sleep.as_mut()).is_pending());
+    timer.advance(now + Duration::from_millis(500));
+    assert!(poll(sleep.as_mut()).is_pending());
+    assert_eq!(timer.next_wake(), Some(deadline));
+    timer.advance(deadline);
+    assert!(poll(sleep.as_mut()).is_ready());
+}
+
+#[test]
+fn waking_a_timer_can_drop_another_timer_without_borrow_conflicts() {
+    // Wakers are Send + Sync; callbacks are taken only from the calling
+    // thread's TLS. Waking from another thread finds no callback there.
+    thread_local! {
+        static ON_WAKE: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    }
+    struct WakeLocal;
+    impl Wake for WakeLocal {
+        fn wake(self: Arc<Self>) {
+            if let Some(callback) = ON_WAKE.with(|slot| slot.take()) {
+                callback();
+            }
+        }
+    }
+    let now = Instant::now();
+    let timer = Timer::new(now);
+    let deadline = now + Duration::from_millis(1);
+    let mut first = Box::pin(timer.with(|| sleep_until(deadline)));
+    let waker = Waker::from(Arc::new(WakeLocal));
+    assert!(
+        first
+            .as_mut()
+            .poll(&mut Context::from_waker(&waker))
+            .is_pending()
     );
-    let mut sleep = Box::pin(timer.with(|| sleep(Duration::from_secs(30))));
-    timer.with(|| assert!(poll(sleep.as_mut()).is_pending()));
-    timer.park_timeout(Duration::from_millis(1)).unwrap();
-    assert_eq!(
-        calls.borrow().last(),
-        Some(&Call::Timeout(Duration::from_millis(1)))
-    );
+    let mut sibling = Box::pin(timer.with(|| sleep_until(deadline)));
+    assert!(poll(sibling.as_mut()).is_pending());
+    ON_WAKE.with(|slot| *slot.borrow_mut() = Some(Box::new(move || drop(sibling))));
+    timer.advance(deadline);
+    assert!(poll(first.as_mut()).is_ready());
+    assert_eq!(timer.next_wake(), None);
+    assert!(ON_WAKE.with(|slot| slot.borrow().is_none()));
 }
 
 #[test]
 fn timer_context_is_restored_after_nested_scopes_and_unwind() {
-    let (outer, calls) = driver(false);
-    let (inner, _) = driver(false);
+    let now = Instant::now();
+    let outer = Timer::new(now);
+    let inner = Timer::new(now);
     outer.with(|| {
         assert!(catch_unwind(AssertUnwindSafe(|| inner.with(|| panic!("unwind")))).is_err());
         let mut sleep = Box::pin(sleep(Duration::from_secs(30)));
         assert!(poll(sleep.as_mut()).is_pending());
-        outer.park_timeout(Duration::ZERO).unwrap();
+        assert!(outer.next_wake().is_some());
+        assert_eq!(inner.next_wake(), None);
     });
-    assert_eq!(*calls.borrow(), [Call::Timeout(Duration::ZERO)]);
+    assert_eq!(outer.next_wake(), None);
     assert!(catch_unwind(|| sleep(Duration::ZERO)).is_err());
 }

@@ -12,8 +12,8 @@ use pin_project_lite::pin_project;
 
 use crate::{
     Duration, Instant,
-    driver::{Handle, TimerEntry},
     error::Error,
+    timer::{Handle, TimerEntry},
 };
 
 /// Waits until `deadline` is reached.

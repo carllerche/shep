@@ -4,7 +4,7 @@
 
 use std::{fmt, ptr::NonNull};
 
-use crate::driver::{EntryList, TimerHandle, TimerShared};
+use crate::timer::{EntryList, TimerHandle, TimerShared};
 
 /// Wheel for a single level in the timer. This wheel contains 64 slots.
 pub(crate) struct Level {

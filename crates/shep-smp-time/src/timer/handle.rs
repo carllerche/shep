@@ -4,13 +4,13 @@
 
 use std::{cell::RefCell, fmt, rc::Rc};
 
-use crate::driver::ClockTime;
+use crate::timer::ClockTime;
 
 thread_local! {
     static CURRENT: RefCell<Option<Handle>> = const { RefCell::new(None) };
 }
 
-/// Handle to time driver instance.
+/// Local handle to a reactor-owned timer wheel.
 #[derive(Clone)]
 pub(crate) struct Handle {
     time_source: ClockTime,
@@ -19,8 +19,7 @@ pub(crate) struct Handle {
 
 impl Handle {
     /// Creates a new timer `Handle` from a shared `Inner` timer state.
-    pub(super) fn new(inner: Rc<super::Inner>) -> Self {
-        let time_source = inner.state.borrow_mut().time_source.clone();
+    pub(super) fn new(inner: Rc<super::Inner>, time_source: ClockTime) -> Self {
         Handle { time_source, inner }
     }
 
@@ -54,13 +53,9 @@ impl Handle {
     ///
     /// This function panics if there is no current timer set.
     ///
-    /// Timers must be constructed inside `TimeDriver::with`.
+    /// Timers must be constructed inside `Timer::with`.
     pub(crate) fn current() -> Self {
-        CURRENT.with(|slot| {
-            slot.borrow()
-                .clone()
-                .expect("timer requires TimeDriver::with")
-        })
+        CURRENT.with(|slot| slot.borrow().clone().expect("timer requires Timer::with"))
     }
 }
 

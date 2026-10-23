@@ -21,7 +21,7 @@ replicates.
 | `crates/shep-smp` | Thread-per-core: a `LocalRuntime` per core, each with its own state, reached with `submit_to` |
 | `crates/shep-smp-task` | Local task ownership and execution, adapted from Monoio; the first component of the future SMP runtime |
 | `crates/shep-smp-exec` | Local FIFO executor with scoped `spawn`, bounded task turns, and driver wakeups |
-| `crates/shep-smp-time` | Monoio's local timer driver, hierarchical timing wheel, sleeps, timeouts, and intervals |
+| `crates/shep-smp-time` | Reactor-owned hierarchical timing wheel, sleeps, timeouts, and intervals, adapted from Monoio |
 | `crates/shep-smp-io` | Core-local io_uring files, owned aligned buffers, and explicit I/O lifetime management |
 | `crates/shep-smp-io-scheduler` | Weighted admission with shared physical-device capacity and per-class metrics |
 | `crates/shep-append` | Format-independent buffered append files with explicit written and durable positions |

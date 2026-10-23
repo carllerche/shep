@@ -1,15 +1,41 @@
 //! Local timers extracted from Monoio's `time` module.
 //!
-//! [`TimeDriver`] wraps a waiting [`Driver`] with Monoio's six-level hashed
-//! timing wheel. [`sleep`], [`sleep_until`], [`timeout`], [`timeout_at`], and
-//! [`interval`] use the timer selected by [`Driver::with`]. Create and poll
-//! timer futures inside that scope. Timers and their driver are `!Send`.
+//! [`Timer`] owns Monoio's six-level hashed timing wheel. The reactor selects
+//! it with [`Timer::with`], advances it with [`Timer::advance`], and uses
+//! [`Timer::next_wake`] to bound its own I/O wait. [`sleep`], [`sleep_until`],
+//! [`timeout`], [`timeout_at`], and [`interval`] use the selected timer.
+//! Timers and their owner are `!Send`.
 //!
 //! This extraction preserves upstream's millisecond resolution, intrusive
-//! pinned entries, lazy registration and reset, and processing after park.
-//! The future io_uring reactor will implement the small [`Driver`] interface;
-//! this crate supplies no I/O backend or runtime loop. See `FORK.md` for the
-//! exact source revision and extraction changes.
+//! pinned entries, and lazy registration and reset. The reactor owns execution,
+//! waiting, and timer advancement; this crate supplies the timer functions.
+//! See `FORK.md` for the exact source revision and adaptation details.
+//!
+//! ```
+//! use shep_smp_time::{Duration, Instant, Timer, sleep_until};
+//! use std::task::{Context, Waker};
+//! use std::future::Future;
+//!
+//! let now = Instant::now();
+//! let timer = Timer::new(now);
+//! let deadline = now + Duration::from_millis(10);
+//! let mut sleep = Box::pin(timer.with(|| sleep_until(deadline)));
+//! let mut cx = Context::from_waker(Waker::noop());
+//! assert!(sleep.as_mut().poll(&mut cx).is_pending());
+//! assert_eq!(timer.next_wake(), Some(deadline));
+//! timer.advance(deadline);
+//! assert!(sleep.as_mut().poll(&mut cx).is_ready());
+//! ```
+//!
+//! ```compile_fail
+//! fn send<T: Send>() {}
+//! send::<shep_smp_time::Timer>();
+//! ```
+//!
+//! ```compile_fail
+//! fn sync<T: Sync>() {}
+//! sync::<shep_smp_time::Timer>();
+//! ```
 //!
 //! ```compile_fail
 //! fn send<T: Send>() {}
@@ -30,12 +56,9 @@
 // Retain the upstream wheel's formatting and control flow.
 #![allow(clippy::collapsible_if)]
 
-mod clock;
-pub(crate) use clock::Clock;
-
-pub mod driver;
-pub use driver::{
-    Driver, TimeDriver,
+mod timer;
+pub use timer::{
+    Timer,
     sleep::{Sleep, sleep, sleep_until},
 };
 
