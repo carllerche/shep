@@ -126,13 +126,15 @@ impl Node {
         &self.wal
     }
 
-    /// Stops serving, closes every log cleanly, and stops the cores.
-    pub async fn shutdown(mut self) {
+    /// Stops serving and closes every log cleanly, then hands back the
+    /// cores, for the caller to stop off any runtime with
+    /// [`Smp::shutdown`].
+    pub async fn shutdown(mut self) -> Smp {
         self.shutdown.send_replace(true);
         if let Some(server) = self.server.take() {
             let _ = server.await;
         }
         self.wal.shutdown().await;
-        self.smp.shutdown().await;
+        self.smp
     }
 }

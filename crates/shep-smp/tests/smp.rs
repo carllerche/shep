@@ -2,8 +2,8 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
+use futures::future::join_all;
 use shep_smp::{CoreId, Sharded, Smp, SmpConfig, SmpError, current_core};
 
 fn smp(cores: usize) -> Smp {
@@ -12,6 +12,18 @@ fn smp(cores: usize) -> Smp {
         ..SmpConfig::with_cores(cores)
     })
     .unwrap()
+}
+
+/// Stops `smp`'s cores from a thread of its own: `shutdown` blocks, so it
+/// must not run on the test's runtime.
+async fn stop(smp: &Smp) {
+    let smp = smp.clone();
+    let (done, finished) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        smp.shutdown();
+        let _ = done.send(());
+    });
+    let _ = finished.await;
 }
 
 #[tokio::test(flavor = "local")]
@@ -34,7 +46,7 @@ async fn work_runs_on_the_core_it_was_sent_to() {
             Some(format!("shep-core-{}", core.0).as_str())
         );
     }
-    smp.shutdown().await;
+    stop(&smp).await;
 }
 
 #[tokio::test(flavor = "local")]
@@ -52,7 +64,7 @@ async fn a_cores_futures_need_not_be_send() {
         .await
         .unwrap();
     assert_eq!(n, 3);
-    smp.shutdown().await;
+    stop(&smp).await;
 }
 
 #[tokio::test(flavor = "local")]
@@ -64,22 +76,26 @@ async fn zero_cores_means_one() {
         smp.submit_to(CoreId(1), || async {}).await,
         Err(SmpError::NoSuchCore(CoreId(1)))
     );
-    smp.shutdown().await;
+    stop(&smp).await;
 }
 
 #[tokio::test(flavor = "local")]
-async fn submit_to_all_answers_in_core_order() {
+async fn calls_to_every_core_answer_in_core_order() {
     let smp = smp(5);
-    let cores = smp
-        .submit_to_all(|core| async move { (core, current_core()) })
-        .await
-        .unwrap();
+    let cores = join_all(
+        smp.core_ids()
+            .map(|core| smp.submit_to(core, move || async move { (core, current_core()) })),
+    )
+    .await
+    .into_iter()
+    .collect::<Result<Vec<_>, _>>()
+    .unwrap();
     assert_eq!(cores.len(), 5);
     for (i, (asked, ran)) in cores.into_iter().enumerate() {
         assert_eq!(asked, CoreId(i));
         assert_eq!(ran, Some(CoreId(i)));
     }
-    smp.shutdown().await;
+    stop(&smp).await;
 }
 
 /// One sender's messages to one core start in the order they were sent.
@@ -87,19 +103,26 @@ async fn submit_to_all_answers_in_core_order() {
 async fn messages_from_one_sender_start_in_order() {
     let smp = smp(2);
     let seen = Arc::new(Mutex::new(Vec::new()));
+    // A call is queued on its first poll, so polling each once, in turn,
+    // queues them in order.
+    let mut calls = Vec::new();
     for i in 0..500 {
         let seen = seen.clone();
-        smp.spawn_on(
-            CoreId(1),
-            move || async move { seen.lock().unwrap().push(i) },
-        )
-        .await
-        .unwrap();
+        let mut call =
+            Box::pin(smp.submit_to(
+                CoreId(1),
+                move || async move { seen.lock().unwrap().push(i) },
+            ));
+        let _ = futures::poll!(call.as_mut());
+        calls.push(call);
     }
-    // A round trip through the same mailbox runs after everything before it.
+    for r in join_all(calls).await {
+        r.unwrap();
+    }
+    // A call queued after all of them starts after them.
     smp.submit_to(CoreId(1), || async {}).await.unwrap();
     assert_eq!(*seen.lock().unwrap(), (0..500).collect::<Vec<_>>());
-    smp.shutdown().await;
+    stop(&smp).await;
 }
 
 #[tokio::test(flavor = "local")]
@@ -125,26 +148,25 @@ async fn cores_call_each_other() {
         .await
         .unwrap();
     assert_eq!(path, (CoreId(0), (CoreId(1), CoreId(2))));
-    smp.shutdown().await;
+    stop(&smp).await;
 }
 
-/// Many concurrent calls across all pairs of cores, through small mailboxes,
-/// all complete: a core waiting to send never stops draining its own mailbox.
+/// Many concurrent calls across all pairs of cores, each core both calling
+/// and serving, all complete.
 #[tokio::test(flavor = "local")]
 async fn concurrent_calls_between_all_cores_complete() {
     let smp = Smp::start(SmpConfig {
         pin: false,
-        mailbox_capacity: 4,
         ..SmpConfig::with_cores(4)
     })
     .unwrap();
     let total = Arc::new(AtomicUsize::new(0));
     let inner = smp.clone();
     let t = total.clone();
-    smp.submit_to_all(move |from| {
+    let calls = smp.core_ids().map(|from| {
         let smp = inner.clone();
         let total = t.clone();
-        async move {
+        inner.submit_to(from, move || async move {
             let mut calls = Vec::new();
             for i in 0..500 {
                 let to = CoreId((from.0 + i) % smp.cores());
@@ -162,48 +184,13 @@ async fn concurrent_calls_between_all_cores_complete() {
             for c in calls {
                 c.await.unwrap();
             }
-        }
-    })
-    .await
-    .unwrap();
+        })
+    });
+    for r in join_all(calls).await {
+        r.unwrap();
+    }
     assert_eq!(total.load(Ordering::SeqCst), 4 * 500);
-    smp.shutdown().await;
-}
-
-/// A full mailbox makes senders wait instead of queueing without bound.
-#[tokio::test(flavor = "local")]
-async fn a_full_mailbox_pushes_back() {
-    let smp = Smp::start(SmpConfig {
-        pin: false,
-        mailbox_capacity: 1,
-        ..SmpConfig::with_cores(2)
-    })
-    .unwrap();
-    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
-    let release_rx = Arc::new(Mutex::new(release_rx));
-    // Block core 1's thread, so it stops draining its mailbox.
-    let r = release_rx.clone();
-    smp.spawn_on(CoreId(1), move || async move {
-        r.lock().unwrap().recv().unwrap();
-    })
-    .await
-    .unwrap();
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    // One message fits.
-    smp.spawn_on(CoreId(1), || async {}).await.unwrap();
-    // The next waits.
-    let blocked = tokio::time::timeout(
-        Duration::from_millis(100),
-        smp.spawn_on(CoreId(1), || async {}),
-    )
-    .await;
-    assert!(blocked.is_err(), "the send should have waited for room");
-    release_tx.send(()).unwrap();
-    tokio::time::timeout(Duration::from_secs(5), smp.spawn_on(CoreId(1), || async {}))
-        .await
-        .expect("room after the core resumed")
-        .unwrap();
-    smp.shutdown().await;
+    stop(&smp).await;
 }
 
 #[tokio::test(flavor = "local")]
@@ -212,7 +199,7 @@ async fn a_panic_fails_that_call_and_the_core_survives() {
     let r = smp.submit_to(CoreId(1), || async { panic!("boom") }).await;
     assert_eq!(r, Err::<(), _>(SmpError::Panicked));
     assert_eq!(smp.submit_to(CoreId(1), || async { 1 }).await, Ok(1));
-    smp.shutdown().await;
+    stop(&smp).await;
 }
 
 #[tokio::test(flavor = "local")]
@@ -231,14 +218,14 @@ async fn shutdown_fails_pending_and_later_work() {
         }
     });
     started.notified().await;
-    smp.shutdown().await;
+    stop(&smp).await;
     assert_eq!(pending.await.unwrap(), Err(SmpError::Shutdown));
     assert_eq!(
         smp.submit_to(CoreId(0), || async {}).await,
         Err(SmpError::Shutdown)
     );
     // Idempotent.
-    smp.shutdown().await;
+    stop(&smp).await;
 }
 
 /// Each core has its own instance; `local` reaches it without a hop.
@@ -272,7 +259,7 @@ async fn sharded_services_have_one_instance_per_core() {
     assert_eq!(v, 101);
     // Off the cores there's no instance.
     assert!(counters.try_local().is_none());
-    smp.shutdown().await;
+    stop(&smp).await;
 }
 
 #[tokio::test(flavor = "local")]
@@ -292,7 +279,7 @@ async fn independent_services_dont_collide() {
         .await
         .unwrap();
     assert_eq!(got, ("a", 2));
-    smp.shutdown().await;
+    stop(&smp).await;
 }
 
 /// Instances are built and dropped on their own cores.
@@ -341,7 +328,7 @@ async fn sharded_instances_live_and_die_on_their_cores() {
         .submit_to(CoreId(0), move || async move { p.try_local().is_none() })
         .await;
     assert_eq!(r, Ok(true));
-    smp.shutdown().await;
+    stop(&smp).await;
 }
 
 /// Shutting down drops every service's instances, on their cores.
@@ -363,6 +350,15 @@ async fn shutdown_drops_services() {
     })
     .await
     .unwrap();
-    smp.shutdown().await;
+    stop(&smp).await;
     assert_eq!(dropped.load(Ordering::SeqCst), 4);
+}
+
+/// `shutdown` blocks until the cores' threads exit, so it refuses to run on
+/// a runtime, where it would block every task on that thread.
+#[tokio::test(flavor = "local")]
+#[should_panic(expected = "Smp::shutdown blocks")]
+async fn shutdown_refuses_to_block_a_runtime() {
+    let smp = smp(1);
+    smp.shutdown();
 }

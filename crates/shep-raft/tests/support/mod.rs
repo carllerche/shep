@@ -266,7 +266,13 @@ impl Cluster {
     pub async fn stop(&mut self, i: usize) {
         let n = self.nodes[i].take().expect("already stopped");
         n.node.shutdown().await;
-        n.smp.shutdown().await;
+        let smp = n.smp.clone();
+        let (done, finished) = tokio::sync::oneshot::channel();
+        std::thread::spawn(move || {
+            smp.shutdown();
+            let _ = done.send(());
+        });
+        let _ = finished.await;
     }
 
     pub async fn restart(&mut self, i: usize) {

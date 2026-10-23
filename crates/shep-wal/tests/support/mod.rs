@@ -282,7 +282,13 @@ impl Cluster {
     pub async fn stop(&mut self, i: usize) {
         let (node, smp) = self.nodes[i].take().expect("already stopped");
         node.shutdown().await;
-        smp.shutdown().await;
+        let smp = smp.clone();
+        let (done, finished) = tokio::sync::oneshot::channel();
+        std::thread::spawn(move || {
+            smp.shutdown();
+            let _ = done.send(());
+        });
+        let _ = finished.await;
     }
 
     /// Restarts node `i` from its data directory, at its address.

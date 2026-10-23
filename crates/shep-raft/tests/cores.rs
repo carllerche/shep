@@ -21,7 +21,13 @@ async fn start(dir: &Path, cores: usize) -> Result<(RaftNode<Recorder>, Smp), Ra
     match RaftNode::start(test_config(1, dir), smp.clone(), |_| Recorder::default()).await {
         Ok(node) => Ok((node, smp)),
         Err(e) => {
-            smp.shutdown().await;
+            let smp = smp.clone();
+            let (done, finished) = tokio::sync::oneshot::channel();
+            std::thread::spawn(move || {
+                smp.shutdown();
+                let _ = done.send(());
+            });
+            let _ = finished.await;
             Err(e)
         }
     }
@@ -29,7 +35,13 @@ async fn start(dir: &Path, cores: usize) -> Result<(RaftNode<Recorder>, Smp), Ra
 
 async fn stop((node, smp): (RaftNode<Recorder>, Smp)) {
     node.shutdown().await;
-    smp.shutdown().await;
+    let smp = smp.clone();
+    let (done, finished) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        smp.shutdown();
+        let _ = done.send(());
+    });
+    let _ = finished.await;
 }
 
 async fn write(node: &RaftNode<Recorder>, payload: &'static str) {

@@ -30,11 +30,29 @@ async fn a_data_directory_has_one_node() {
         Err(e) => panic!("{e}"),
         Ok(_) => panic!("two nodes on one directory"),
     }
-    smp2.shutdown().await;
+    let smp = smp2.clone();
+    let (done, finished) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        smp.shutdown();
+        let _ = done.send(());
+    });
+    let _ = finished.await;
 
     first.shutdown().await;
-    smp1.shutdown().await;
+    let smp = smp1.clone();
+    let (done, finished) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        smp.shutdown();
+        let _ = done.send(());
+    });
+    let _ = finished.await;
     let (again, smp) = start(dir.path()).await;
     again.unwrap().shutdown().await;
-    smp.shutdown().await;
+    let smp = smp.clone();
+    let (done, finished) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        smp.shutdown();
+        let _ = done.send(());
+    });
+    let _ = finished.await;
 }

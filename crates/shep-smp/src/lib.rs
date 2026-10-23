@@ -4,9 +4,8 @@
 //! [`LocalRuntime`](tokio::runtime::LocalRuntime), which runs `!Send` tasks
 //! spawned with `spawn_local` directly. Work on a core is ordinary async code with no
 //! locks: state a core owns is `Rc`/`RefCell`, and futures needn't be `Send`.
-//! Cores talk only by message: [`Smp::submit_to`] runs a closure on another
-//! core and returns its result, through a bounded mailbox per core, so a slow
-//! core pushes back on its senders instead of queueing without bound.
+//! Cores talk only through [`Smp::submit_to`], which runs a closure on another
+//! core and returns its result.
 //!
 //! [`Sharded`] is Seastar's `sharded<T>`: one instance of a service per core,
 //! reached locally with [`Sharded::local`] or on another core with
@@ -26,8 +25,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
-use tokio::runtime::LocalOptions;
-use tokio::sync::{mpsc, oneshot};
+use tokio::runtime::{Handle, LocalOptions};
+use tokio::sync::oneshot;
 
 /// A core of an [`Smp`], numbered from 0.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -43,8 +42,6 @@ impl fmt::Display for CoreId {
 pub struct SmpConfig {
     /// How many cores, at least 1.
     pub cores: usize,
-    /// Messages a core's mailbox holds before senders wait.
-    pub mailbox_capacity: usize,
     /// Pin core `i`'s thread to the machine's `i`th CPU, where the platform
     /// allows it. Best effort: unsupported platforms run unpinned.
     pub pin: bool,
@@ -62,7 +59,6 @@ impl SmpConfig {
     pub fn with_cores(cores: usize) -> SmpConfig {
         SmpConfig {
             cores: cores.max(1),
-            mailbox_capacity: 1024,
             pin: true,
             name: "shep-core".into(),
         }
@@ -94,16 +90,17 @@ pub struct Smp {
 }
 
 struct Shared {
-    cores: Vec<mpsc::Sender<Message>>,
+    cores: Vec<Core>,
     threads: Mutex<Vec<JoinHandle<()>>>,
     shut_down: AtomicBool,
 }
 
-enum Message {
-    /// Spawn this on the core's runtime.
-    Run(Box<dyn FnOnce() + Send>),
-    /// Stop the core: its pending tasks are dropped.
-    Shutdown,
+/// How other threads reach a core.
+struct Core {
+    /// Spawns onto the core's runtime, from any thread.
+    handle: Handle,
+    /// Ends the core's runtime.
+    stop: Mutex<Option<oneshot::Sender<()>>>,
 }
 
 thread_local! {
@@ -125,20 +122,27 @@ impl Smp {
         } else {
             Vec::new()
         };
-        let mut senders = Vec::new();
+        let mut cores = Vec::new();
         let mut threads = Vec::new();
         for i in 0..config.cores.max(1) {
-            let (tx, rx) = mpsc::channel(config.mailbox_capacity.max(1));
+            let (stop, stopped) = oneshot::channel();
+            let (handle_tx, handle_rx) = std::sync::mpsc::channel();
             let cpu = cpus.get(i).copied();
             let thread = std::thread::Builder::new()
                 .name(format!("{}-{i}", config.name))
-                .spawn(move || run_core(CoreId(i), cpu, rx))?;
-            senders.push(tx);
+                .spawn(move || run_core(CoreId(i), cpu, handle_tx, stopped))?;
+            let handle = handle_rx
+                .recv()
+                .map_err(|_| std::io::Error::other("a core failed to start"))?;
+            cores.push(Core {
+                handle,
+                stop: Mutex::new(Some(stop)),
+            });
             threads.push(thread);
         }
         Ok(Smp {
             shared: Arc::new(Shared {
-                cores: senders,
+                cores,
                 threads: Mutex::new(threads),
                 shut_down: AtomicBool::new(false),
             }),
@@ -157,52 +161,47 @@ impl Smp {
     /// runs on that core's thread and needn't be `Send`; `f` itself, and the
     /// result, cross threads.
     ///
-    /// Waits for room in the core's mailbox. Work submitted from one thread
+    /// The call is queued on the core when the returned future is first
+    /// polled, and runs regardless after that. Work submitted from one thread
     /// to one core starts in submission order.
-    pub async fn submit_to<F, Fut, T>(&self, core: CoreId, f: F) -> Result<T, SmpError>
+    ///
+    /// The returned future holds its own handle, so not to wait for the
+    /// result, spawn it. [`Sharded::invoke_on_all`] reaches every core with
+    /// its service.
+    pub fn submit_to<F, Fut, T>(
+        &self,
+        core: CoreId,
+        f: F,
+    ) -> impl Future<Output = Result<T, SmpError>> + use<F, Fut, T>
     where
         F: FnOnce() -> Fut + Send + 'static,
         Fut: Future<Output = T> + 'static,
         T: Send + 'static,
     {
-        let (tx, rx) = oneshot::channel();
-        self.send(
-            core,
-            Box::new(move || {
-                tokio::task::spawn_local(async move {
-                    let _ = tx.send(f().await);
-                });
-            }),
-        )
-        .await?;
-        // A dropped sender means the task was dropped unfinished: a panic,
-        // or the core stopped.
-        rx.await.map_err(|_| {
-            if self.shared.shut_down.load(Ordering::SeqCst) {
-                SmpError::Shutdown
-            } else {
-                SmpError::Panicked
+        // Owns a handle, so the call can be spawned.
+        let smp = self.clone();
+        async move {
+            let shared = &smp.shared;
+            if shared.shut_down.load(Ordering::SeqCst) {
+                return Err(SmpError::Shutdown);
             }
-        })
-    }
-
-    /// Runs `f` on `core` without waiting for it.
-    pub async fn spawn_on<F, Fut>(&self, core: CoreId, f: F) -> Result<(), SmpError>
-    where
-        F: FnOnce() -> Fut + Send + 'static,
-        Fut: Future<Output = ()> + 'static,
-    {
-        self.send(
-            core,
-            Box::new(move || {
-                tokio::task::spawn_local(f());
-            }),
-        )
-        .await
+            let target = shared.cores.get(core.0).ok_or(SmpError::NoSuchCore(core))?;
+            // A `Send` task carries `f` to the core; there it builds the
+            // future, which needn't be `Send`, and runs it as a local task.
+            let call = target
+                .handle
+                .spawn(async move { tokio::task::spawn_local(f()).await });
+            match call.await {
+                Ok(Ok(value)) => Ok(value),
+                Ok(Err(e)) | Err(e) if e.is_panic() => Err(SmpError::Panicked),
+                // Cancelled: the core's runtime stopped first.
+                _ => Err(SmpError::Shutdown),
+            }
+        }
     }
 
     /// Runs `f` on every core and collects the results, in core order.
-    pub async fn submit_to_all<F, Fut, T>(&self, f: F) -> Result<Vec<T>, SmpError>
+    async fn on_every_core<F, Fut, T>(&self, f: F) -> Result<Vec<T>, SmpError>
     where
         F: Fn(CoreId) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = T> + 'static,
@@ -220,43 +219,41 @@ impl Smp {
         Ok(out)
     }
 
-    async fn send(&self, core: CoreId, task: Box<dyn FnOnce() + Send>) -> Result<(), SmpError> {
-        if self.shared.shut_down.load(Ordering::SeqCst) {
-            return Err(SmpError::Shutdown);
-        }
-        let mailbox = self
-            .shared
-            .cores
-            .get(core.0)
-            .ok_or(SmpError::NoSuchCore(core))?;
-        mailbox
-            .send(Message::Run(task))
-            .await
-            .map_err(|_| SmpError::Shutdown)
-    }
-
-    /// Stops every core, dropping the work still on them, and waits for
-    /// their threads. Must not be called from a core, which would wait for
-    /// itself.
-    pub async fn shutdown(&self) {
-        assert!(current_core().is_none(), "Smp::shutdown called from a core");
+    /// Stops every core, dropping the work still on them, and blocks the
+    /// calling thread until their threads have exited.
+    ///
+    /// # Panics
+    ///
+    /// If called from a thread with a tokio runtime context: a runtime's own
+    /// thread (a core's included), which it would block, but also tokio's
+    /// blocking pool, which tokio gives no way to tell apart. From async code,
+    /// call it on a plain thread of its own and await that.
+    pub fn shutdown(&self) {
+        assert!(
+            tokio::runtime::Handle::try_current().is_err(),
+            "Smp::shutdown blocks; call it from a thread with no tokio runtime"
+        );
         if self.shared.shut_down.swap(true, Ordering::SeqCst) {
             return;
         }
-        for mailbox in &self.shared.cores {
-            let _ = mailbox.send(Message::Shutdown).await;
+        for core in &self.shared.cores {
+            if let Some(stop) = core.stop.lock().unwrap().take() {
+                let _ = stop.send(());
+            }
         }
         let threads = std::mem::take(&mut *self.shared.threads.lock().unwrap());
-        let _ = tokio::task::spawn_blocking(move || {
-            for t in threads {
-                let _ = t.join();
-            }
-        })
-        .await;
+        for t in threads {
+            let _ = t.join();
+        }
     }
 }
 
-fn run_core(core: CoreId, cpu: Option<core_affinity::CoreId>, mut rx: mpsc::Receiver<Message>) {
+fn run_core(
+    core: CoreId,
+    cpu: Option<core_affinity::CoreId>,
+    handle: std::sync::mpsc::Sender<Handle>,
+    stopped: oneshot::Receiver<()>,
+) {
     if let Some(cpu) = cpu
         && !core_affinity::set_for_current(cpu)
     {
@@ -267,13 +264,11 @@ fn run_core(core: CoreId, cpu: Option<core_affinity::CoreId>, mut rx: mpsc::Rece
         .enable_all()
         .build_local(LocalOptions::default())
         .expect("building a core's runtime");
+    let _ = handle.send(rt.handle().clone());
+    // Work arrives as tasks spawned through the handle; the runtime runs
+    // them until told to stop.
     rt.block_on(async move {
-        while let Some(msg) = rx.recv().await {
-            match msg {
-                Message::Run(task) => task(),
-                Message::Shutdown => break,
-            }
-        }
+        let _ = stopped.await;
     });
     // Dropping the runtime drops the tasks still on it; then the services.
     drop(rt);
@@ -309,7 +304,7 @@ impl<T: 'static> Sharded<T> {
     {
         let id = NEXT_SERVICE.fetch_add(1, Ordering::Relaxed);
         let make = Arc::new(make);
-        smp.submit_to_all(move |core| {
+        smp.on_every_core(move |core| {
             let make = make.clone();
             async move {
                 let instance: Rc<dyn Any> = Rc::new(make(core).await);
@@ -362,14 +357,14 @@ impl<T: 'static> Sharded<T> {
         R: Send + 'static,
     {
         let this = self.clone();
-        self.smp.submit_to_all(move |_| f(this.local())).await
+        self.smp.on_every_core(move |_| f(this.local())).await
     }
 
     /// Drops every core's instance, on its core.
     pub async fn stop(&self) -> Result<(), SmpError> {
         let id = self.id;
         self.smp
-            .submit_to_all(move |_| async move {
+            .on_every_core(move |_| async move {
                 let instance = LOCALS.with(|l| l.borrow_mut().remove(&id));
                 drop(instance);
             })
