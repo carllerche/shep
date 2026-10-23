@@ -20,7 +20,6 @@
 //! - **Commit times** never go backwards in a log, across terms too: a new
 //!   leader's start above every entry it has applied or replayed.
 
-use bytes::Bytes;
 use shep_codec::{Decode, Encode};
 
 use crate::types::{GroupId, NodeId};
@@ -79,10 +78,10 @@ pub trait Machine: 'static {
     fn apply(&mut self, entry: &Entry<Self::Command>) -> Self::Response;
 
     /// The machine's whole replicated state, for a snapshot.
-    fn snapshot(&self) -> Bytes;
+    fn snapshot(&self) -> Vec<u8>;
 
     /// Replaces the replicated state with a snapshot's.
-    fn restore(&mut self, snapshot: Bytes);
+    fn restore(&mut self, snapshot: Vec<u8>);
 }
 
 /// What [`Machine::admit`] knows about the entry it would become.
@@ -108,7 +107,7 @@ pub struct Entry<C> {
     pub index: u64,
     pub term: u64,
     pub commit_time_us: u64,
-    pub key: Option<Bytes>,
+    pub key: Option<Vec<u8>>,
     pub command: C,
 }
 
@@ -196,7 +195,7 @@ pub(crate) struct Envelope<C> {
     /// Keys decided before this time are forgotten.
     pub idempotency_floor_us: u64,
     /// Empty for none.
-    pub key: Bytes,
+    pub key: Vec<u8>,
     pub command: C,
 }
 

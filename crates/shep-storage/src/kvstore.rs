@@ -38,7 +38,6 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
-use bytes::{BufMut, Bytes};
 use futures::FutureExt;
 use futures::future::{LocalBoxFuture, Shared};
 use tokio::time::Instant;
@@ -123,8 +122,8 @@ struct Inner {
 }
 
 struct State {
-    map: BTreeMap<Vec<u8>, Bytes>,
-    pending: Vec<(Vec<u8>, Option<Bytes>)>,
+    map: Map,
+    pending: Vec<(Vec<u8>, Option<Vec<u8>>)>,
     /// When the pending ops get committed.
     deadline: Option<Instant>,
     /// Ops queued and committed so far; an op's ticket is its position.
@@ -149,7 +148,7 @@ struct Inflight {
 
 enum Job {
     Batch {
-        ops: Vec<(Vec<u8>, Option<Bytes>)>,
+        ops: Vec<(Vec<u8>, Option<Vec<u8>>)>,
         len: u64,
     },
     Snapshot,
@@ -178,10 +177,10 @@ impl KvStore {
                     .create(true)
                     .truncate(false)
                     .open(&path)?;
-                let bytes = Bytes::from(fs::read(&path)?);
+                let bytes = fs::read(&path)?;
                 let mut pos = 0;
                 let mut batches = Vec::new();
-                while let Parsed::Record(r, n) = record::parse(&bytes.slice(pos..)) {
+                while let Parsed::Record(r, n) = record::parse(&bytes[pos..]) {
                     batches.push(r);
                     pos += n;
                 }
@@ -252,25 +251,25 @@ impl KvStore {
     }
 
     /// The committed value of `key`.
-    pub fn get(&self, ks: KeySpace, key: &[u8]) -> Option<Bytes> {
+    pub fn get(&self, ks: KeySpace, key: &[u8]) -> Option<Vec<u8>> {
         self.inner.state.borrow().map.get(&ks.key(key)).cloned()
     }
 
     /// Every committed key in `ks`, without the key-space prefix, in order.
-    pub fn scan(&self, ks: KeySpace) -> Vec<(Bytes, Bytes)> {
+    pub fn scan(&self, ks: KeySpace) -> Vec<(Vec<u8>, Vec<u8>)> {
         let st = self.inner.state.borrow();
         let prefix = ks.key(&[]);
         st.map
             .range(prefix.clone()..)
             .take_while(|(k, _)| k.starts_with(&prefix))
-            .map(|(k, v)| (Bytes::copy_from_slice(&k[2..]), v.clone()))
+            .map(|(k, v)| (k[2..].to_vec(), v.clone()))
             .collect()
     }
 
     /// Sets `key`. The op is queued when this is called, in call order; the
     /// future resolves once it is durable. Dropping the future doesn't
     /// cancel the op.
-    pub fn put<V: Into<Bytes>>(
+    pub fn put<V: Into<Vec<u8>>>(
         &self,
         ks: KeySpace,
         key: &[u8],
@@ -303,7 +302,7 @@ impl KvStore {
     fn write(
         &self,
         key: Vec<u8>,
-        value: Option<Bytes>,
+        value: Option<Vec<u8>>,
     ) -> impl Future<Output = Result<()>> + use<> {
         let ticket = {
             let mut st = self.inner.state.borrow_mut();
@@ -360,9 +359,9 @@ impl KvStore {
         let ops = std::mem::take(&mut st.pending);
         st.deadline = None;
         let mut payload = Vec::new();
-        payload.put_u32_le(ops.len() as u32);
+        payload.extend_from_slice(&(ops.len() as u32).to_le_bytes());
         for (k, v) in &ops {
-            payload.put_u8(v.is_some() as u8);
+            payload.push(v.is_some() as u8);
             put_bytes(&mut payload, k);
             if let Some(v) = v {
                 put_bytes(&mut payload, v);
@@ -384,15 +383,15 @@ impl KvStore {
     fn start_snapshot(&self, st: &mut State) {
         let mut b = Vec::new();
         b.extend_from_slice(SNAPSHOT_MAGIC);
-        b.put_u32_le(SNAPSHOT_VERSION);
-        b.put_u64_le(st.next_seq);
-        b.put_u64_le(st.map.len() as u64);
+        b.extend_from_slice(&(SNAPSHOT_VERSION).to_le_bytes());
+        b.extend_from_slice(&(st.next_seq).to_le_bytes());
+        b.extend_from_slice(&(st.map.len() as u64).to_le_bytes());
         for (k, v) in &st.map {
             put_bytes(&mut b, k);
             put_bytes(&mut b, v);
         }
         let crc = crc32c::crc32c(&b);
-        b.put_u32_le(crc);
+        b.extend_from_slice(&(crc).to_le_bytes());
         let dir = self.inner.dir.clone();
         let log = self.inner.log.clone();
         let counters = self.inner.disk.counters();
@@ -458,7 +457,7 @@ impl KvStore {
     }
 }
 
-fn apply(map: &mut BTreeMap<Vec<u8>, Bytes>, key: Vec<u8>, value: Option<Bytes>) {
+fn apply(map: &mut Map, key: Vec<u8>, value: Option<Vec<u8>>) {
     match value {
         Some(v) => {
             map.insert(key, v);
@@ -470,16 +469,19 @@ fn apply(map: &mut BTreeMap<Vec<u8>, Bytes>, key: Vec<u8>, value: Option<Bytes>)
 }
 
 fn put_bytes(b: &mut Vec<u8>, v: &[u8]) {
-    b.put_u32_le(v.len() as u32);
+    b.extend_from_slice(&(v.len() as u32).to_le_bytes());
     b.extend_from_slice(v);
 }
 
-fn get_bytes(r: &mut Reader<'_>) -> Option<Bytes> {
+fn get_bytes(r: &mut Reader<'_>) -> Option<Vec<u8>> {
     let n = r.u32()? as usize;
-    Some(Bytes::copy_from_slice(r.take(n)?))
+    Some(r.take(n)?.to_vec())
 }
 
-type Ops = Vec<(Vec<u8>, Option<Bytes>)>;
+/// Every key's value.
+type Map = BTreeMap<Vec<u8>, Vec<u8>>;
+
+type Ops = Vec<(Vec<u8>, Option<Vec<u8>>)>;
 
 fn decode_ops(b: &[u8]) -> Option<Ops> {
     let mut r = Reader(b);
@@ -494,7 +496,7 @@ fn decode_ops(b: &[u8]) -> Option<Ops> {
     r.0.is_empty().then_some(ops)
 }
 
-fn decode_snapshot(b: &[u8]) -> Option<(u64, BTreeMap<Vec<u8>, Bytes>)> {
+fn decode_snapshot(b: &[u8]) -> Option<(u64, Map)> {
     let (body, crc) = b.split_at_checked(b.len().checked_sub(4)?)?;
     if crc32c::crc32c(body) != u32::from_le_bytes(crc.try_into().ok()?) {
         return None;

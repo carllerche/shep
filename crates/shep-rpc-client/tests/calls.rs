@@ -6,7 +6,6 @@ mod support;
 
 use std::time::Duration;
 
-use bytes::Bytes;
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
 use rand::seq::SliceRandom;
@@ -22,13 +21,13 @@ use support::*;
 async fn echo_round_trip() {
     let (_server, addr, _) = start(ServerConfig::default()).await;
     let t = Transport::connect(addr).await.unwrap();
-    let body: Bytes = (0..100u8).collect::<Vec<_>>().into();
+    let body: Vec<u8> = (0..100u8).collect::<Vec<_>>();
     let reply = t.call(ECHO, body.clone(), LONG).await.unwrap();
     assert_eq!(reply, body);
     // Empty bodies are fine too.
     assert_eq!(
-        t.call(ECHO, Bytes::new(), LONG).await.unwrap(),
-        Bytes::new()
+        t.call(ECHO, Vec::<u8>::new(), LONG).await.unwrap(),
+        Vec::<u8>::new()
     );
 }
 
@@ -36,10 +35,7 @@ async fn echo_round_trip() {
 async fn large_bodies_round_trip() {
     let (_server, addr, _) = start(ServerConfig::default()).await;
     let t = Transport::connect(addr).await.unwrap();
-    let body: Bytes = (0..4 << 20)
-        .map(|i| (i % 251) as u8)
-        .collect::<Vec<_>>()
-        .into();
+    let body: Vec<u8> = (0..4 << 20).map(|i| (i % 251) as u8).collect::<Vec<_>>();
     let calls: Vec<_> = (0..4).map(|_| t.call(ECHO, body.clone(), LONG)).collect();
     for reply in futures::future::join_all(calls).await {
         assert_eq!(reply.unwrap(), body);
@@ -51,14 +47,11 @@ async fn many_pipelined_calls() {
     let (_server, addr, state) = start(ServerConfig::default()).await;
     let t = Transport::connect(addr).await.unwrap();
     let calls: Vec<_> = (0..2000u32)
-        .map(|i| t.call(ECHO, Bytes::from(i.to_le_bytes().to_vec()), LONG))
+        .map(|i| t.call(ECHO, i.to_le_bytes().to_vec(), LONG))
         .collect();
     let replies = futures::future::join_all(calls).await;
     for (i, reply) in replies.into_iter().enumerate() {
-        assert_eq!(
-            reply.unwrap(),
-            Bytes::from((i as u32).to_le_bytes().to_vec())
-        );
+        assert_eq!(reply.unwrap(), (i as u32).to_le_bytes().to_vec());
     }
     assert_eq!(state.started(), 2000);
 }
@@ -73,7 +66,7 @@ async fn concurrent_calls_from_many_tasks() {
             let t = t.clone();
             tokio::task::spawn_local(async move {
                 for i in 0..200u32 {
-                    let body = Bytes::from(format!("{task}/{i}"));
+                    let body = Vec::<u8>::from(format!("{task}/{i}"));
                     assert_eq!(t.call(ECHO, body.clone(), LONG).await.unwrap(), body);
                 }
             })
@@ -111,15 +104,13 @@ async fn requests_are_written_in_call_order() {
     let (_server, addr, state) = start(ServerConfig::default()).await;
     let t = Transport::connect(addr).await.unwrap();
     let mut calls: Vec<_> = (0..500u32)
-        .map(|i| t.call(RECORD, Bytes::from(i.to_le_bytes().to_vec()), LONG))
+        .map(|i| t.call(RECORD, i.to_le_bytes().to_vec(), LONG))
         .collect();
     calls.shuffle(&mut rand::rng());
     for reply in futures::future::join_all(calls).await {
         reply.unwrap();
     }
-    let expected: Vec<Bytes> = (0..500u32)
-        .map(|i| Bytes::from(i.to_le_bytes().to_vec()))
-        .collect();
+    let expected: Vec<Vec<u8>> = (0..500u32).map(|i| i.to_le_bytes().to_vec()).collect();
     assert_eq!(state.log(), expected);
 }
 
@@ -146,10 +137,10 @@ async fn late_response_is_skipped() {
         .await;
     assert!(matches!(reply, Err(RpcError::Timeout)), "{reply:?}");
     // Calls go through while the late one is still running...
-    assert_eq!(t.call(ECHO, "a".into(), LONG).await.unwrap(), "a");
+    assert_eq!(t.call(ECHO, "a".into(), LONG).await.unwrap(), b"a");
     // ...and after its response has come and been skipped.
     tokio::time::sleep(Duration::from_millis(400)).await;
-    assert_eq!(t.call(ECHO, "b".into(), LONG).await.unwrap(), "b");
+    assert_eq!(t.call(ECHO, "b".into(), LONG).await.unwrap(), b"b");
     assert!(!t.is_closed());
     assert_eq!(state.started(), 3);
 }
@@ -168,7 +159,7 @@ async fn zero_timeouts_leave_connection_healthy() {
         assert!(matches!(reply, Err(RpcError::Timeout)), "{reply:?}");
     }
     for _ in 0..10 {
-        assert_eq!(t.call(ECHO, "x".into(), LONG).await.unwrap(), "x");
+        assert_eq!(t.call(ECHO, "x".into(), LONG).await.unwrap(), b"x");
     }
 }
 
@@ -182,7 +173,7 @@ async fn dropped_call_is_abandoned() {
     let started = t.call(SLEEP, sleep_body(50), LONG);
     let _ = tokio::time::timeout(Duration::from_millis(10), started).await;
     tokio::time::sleep(Duration::from_millis(100)).await;
-    assert_eq!(t.call(ECHO, "x".into(), LONG).await.unwrap(), "x");
+    assert_eq!(t.call(ECHO, "x".into(), LONG).await.unwrap(), b"x");
 }
 
 /// Adapted from Redpanda src/v/rpc/test/rpc_gen_cycling_test.cc
@@ -211,7 +202,7 @@ async fn unknown_method() {
             let status = reply.unwrap_err().service_status();
             assert_eq!(status, Some(UNKNOWN_METHOD));
         } else {
-            assert_eq!(reply.unwrap(), "testing...");
+            assert_eq!(reply.unwrap(), b"testing...");
         }
     }
     assert!(!t.is_closed());
@@ -223,11 +214,11 @@ async fn unknown_method() {
 async fn handler_error() {
     let (_server, addr, _) = start(ServerConfig::default()).await;
     let t = Transport::connect(addr).await.unwrap();
-    let reply = t.call(FAIL, Bytes::new(), LONG).await;
+    let reply = t.call(FAIL, Vec::<u8>::new(), LONG).await;
     assert_eq!(reply.unwrap_err().service_status(), Some(FAILED));
-    let reply = t.call(PANIC, Bytes::new(), LONG).await;
+    let reply = t.call(PANIC, Vec::<u8>::new(), LONG).await;
     assert!(matches!(reply, Err(RpcError::ServerError)), "{reply:?}");
-    assert_eq!(t.call(ECHO, "ok".into(), LONG).await.unwrap(), "ok");
+    assert_eq!(t.call(ECHO, "ok".into(), LONG).await.unwrap(), b"ok");
 }
 
 /// Error responses have empty bodies, whatever the handler returned.
@@ -267,11 +258,11 @@ async fn statuses_map_to_errors() {
     let t = Transport::connect(addr).await.unwrap();
     let mut errors = Vec::new();
     for _ in codes {
-        errors.push(t.call(ECHO, Bytes::new(), LONG).await.unwrap_err());
+        errors.push(t.call(ECHO, Vec::<u8>::new(), LONG).await.unwrap_err());
     }
     match &errors[..] {
         [
-            RpcError::BadRequest,
+            RpcError::UnknownStatus(400),
             RpcError::Abandoned,
             RpcError::PayloadTooLarge,
             RpcError::UnsupportedCompression,
@@ -299,10 +290,10 @@ async fn version_and_metadata_pass_through() {
         let metadata = MetadataBuilder::new()
             .insert_u64(2, 5_000_000)
             .insert(1, &b"route"[..])
-            .insert(0xffff, Bytes::new())
+            .insert(0xffff, Vec::<u8>::new())
             .build()
             .unwrap();
-        let call = Call::new(METADATA, Bytes::new())
+        let call = Call::new(METADATA, Vec::<u8>::new())
             .with_version(version)
             .with_metadata(metadata.clone());
         let reply = t.call_with(call, LONG).await.unwrap();
@@ -315,10 +306,10 @@ async fn version_and_metadata_pass_through() {
     }
 }
 
-/// A response whose metadata is malformed fails its call; the connection
-/// carries on, since the checksum vouched for the sizes.
+/// A response whose metadata is malformed breaks the protocol: the client
+/// closes the connection, failing every call on it.
 #[tokio::test(flavor = "local")]
-async fn malformed_response_metadata_fails_the_call() {
+async fn malformed_response_metadata_closes_the_connection() {
     let addr = fake_server(|mut stream| async move {
         let (first, _, _) = read_frame(&mut stream).await.unwrap();
         // A key whose value runs past the section.
@@ -332,22 +323,13 @@ async fn malformed_response_metadata_fails_the_call() {
             payload_checksum(b"hi"),
         );
         write_frame(&mut stream, &h, &bad, b"hi").await;
-        let (second, _, _) = read_frame(&mut stream).await.unwrap();
-        write_frame(
-            &mut stream,
-            &header(200, second.correlation_id, b"ok"),
-            b"",
-            b"ok",
-        )
-        .await;
         let _ = read_frame(&mut stream).await;
     })
     .await;
     let t = Transport::connect(addr).await.unwrap();
     let reply = t.call(ECHO, "a".into(), LONG).await;
-    assert!(matches!(reply, Err(RpcError::BadResponse(_))), "{reply:?}");
-    assert_eq!(t.call(ECHO, "b".into(), LONG).await.unwrap(), "ok");
-    assert!(!t.is_closed());
+    assert!(matches!(reply, Err(RpcError::Disconnected)), "{reply:?}");
+    assert!(t.is_closed());
 }
 
 /// The server going away fails every pending call, and later calls fail
@@ -440,7 +422,7 @@ async fn response_for_unknown_id_is_skipped() {
     })
     .await;
     let t = Transport::connect(addr).await.unwrap();
-    assert_eq!(t.call(ECHO, "a".into(), LONG).await.unwrap(), "real");
+    assert_eq!(t.call(ECHO, "a".into(), LONG).await.unwrap(), b"real");
     assert!(!t.is_closed());
 }
 
@@ -460,7 +442,7 @@ async fn correlation_ids_are_monotonic() {
     let t = Transport::connect(addr).await.unwrap();
     // Two time out, without their ids being reused.
     for timeout in [LONG, Duration::ZERO, LONG, Duration::ZERO, LONG] {
-        let _ = t.call(ECHO, Bytes::new(), timeout).await;
+        let _ = t.call(ECHO, Vec::<u8>::new(), timeout).await;
     }
     let mut ids = Vec::new();
     while let Ok(id) = rx.try_recv() {

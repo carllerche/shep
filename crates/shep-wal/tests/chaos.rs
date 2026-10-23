@@ -14,7 +14,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use bytes::Bytes;
 use shep_wal_client::ProposeError;
 use shep_wal_client::api::{Decided, Dot, EntryKind, Mutation, Proposal, ProposalKind};
 use support::*;
@@ -37,7 +36,7 @@ async fn chaos_keeps_the_log_serializable() {
             let client = cluster.client.clone();
             let regs = regs.clone();
             tokio::task::spawn_local(async move {
-                let mut acked: Vec<(Bytes, Decided)> = Vec::new();
+                let mut acked: Vec<(Vec<u8>, Decided)> = Vec::new();
                 for _ in 0..INCREMENTS {
                     let key = unique_key();
                     let counter = format!("c{}", rand::random_range(0..COUNTERS));
@@ -110,7 +109,7 @@ async fn chaos_keeps_the_log_serializable() {
     });
 
     // RepliesDurable.
-    let by_dot: BTreeMap<Dot, Bytes> = log
+    let by_dot: BTreeMap<Dot, Vec<u8>> = log
         .iter()
         .filter_map(|e| match &e.kind {
             EntryKind::Mutation(m) => Some((e.dot, m.idempotency_key.clone())),
@@ -138,7 +137,7 @@ async fn chaos_keeps_the_log_serializable() {
 async fn increment(
     client: &shep_wal_client::WalClient,
     regs: &Registers,
-    key: Bytes,
+    key: Vec<u8>,
     counter: &str,
 ) -> Decided {
     loop {
@@ -151,8 +150,8 @@ async fn increment(
                 context: at(P1, applied),
                 read_set: vec![support::key(counter)],
                 write_set: vec![support::key(counter)],
-                payload: Bytes::from(format!("r {counter} {v}\nw {counter} {}", v + 1)),
-                reply: Bytes::from_static(b"ok"),
+                payload: Vec::<u8>::from(format!("r {counter} {v}\nw {counter} {}", v + 1)),
+                reply: b"ok".to_vec(),
             }),
         };
         match client.propose(P1, &p).await {

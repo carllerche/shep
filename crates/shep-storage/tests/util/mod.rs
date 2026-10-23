@@ -4,7 +4,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use bytes::Bytes;
 use shep_storage::{
     Disk, HEADER_LEN, KvConfig, KvStore, Log, LogConfig, Offsets, Record, SegmentInfo, WritePool,
 };
@@ -120,9 +119,9 @@ pub fn small() -> LogConfig {
     }
 }
 
-pub fn payload(index: u64, len: usize) -> Bytes {
+pub fn payload(index: u64, len: usize) -> Vec<u8> {
     let seed = format!("{index}:");
-    seed.bytes().cycle().take(len).collect::<Vec<u8>>().into()
+    seed.bytes().cycle().take(len).collect::<Vec<u8>>()
 }
 
 pub fn rec(index: u64, term: u64) -> Record {

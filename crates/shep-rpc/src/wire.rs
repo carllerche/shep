@@ -68,8 +68,6 @@ pub const fn service_of(method: u32) -> u16 {
 pub enum Status {
     /// The service handled the request; the body is its response.
     Success = 200,
-    /// The request's metadata was malformed.
-    BadRequest = 400,
     /// The server gave up on the request without running it to completion,
     /// typically because it is shutting down.
     Abandoned = 408,
@@ -85,7 +83,6 @@ impl Status {
     pub fn from_u32(code: u32) -> Option<Status> {
         Some(match code {
             200 => Status::Success,
-            400 => Status::BadRequest,
             408 => Status::Abandoned,
             413 => Status::PayloadTooLarge,
             415 => Status::UnsupportedCompression,

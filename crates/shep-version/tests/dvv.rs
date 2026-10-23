@@ -179,14 +179,14 @@ fn versions_round_trip_through_the_codec() {
         .with_dot(dot(P1, 9))
         .with_prefix(P2, 3);
     let bytes = shep_codec::to_bytes(&v);
-    assert_eq!(shep_codec::from_bytes::<Dvv>(bytes).unwrap(), v);
+    assert_eq!(shep_codec::from_bytes::<Dvv>(&bytes).unwrap(), v);
     assert_eq!(
-        shep_codec::from_bytes::<Dvv>(shep_codec::to_bytes(&Dvv::new())).unwrap(),
+        shep_codec::from_bytes::<Dvv>(&shep_codec::to_bytes(&Dvv::new())).unwrap(),
         Dvv::new()
     );
     let d = dot(P2, 4);
     assert_eq!(
-        shep_codec::from_bytes::<Dot>(shep_codec::to_bytes(&d)).unwrap(),
+        shep_codec::from_bytes::<Dot>(&shep_codec::to_bytes(&d)).unwrap(),
         d
     );
 }

@@ -14,8 +14,6 @@
 
 use std::collections::BTreeMap;
 
-use bytes::Bytes;
-
 use crate::wire::MAX_METADATA;
 
 /// Bytes of an entry before its value: key and length.
@@ -37,7 +35,7 @@ pub enum MetadataError {
 /// A well-formed metadata section.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Metadata {
-    bytes: Bytes,
+    bytes: Vec<u8>,
 }
 
 impl Metadata {
@@ -48,7 +46,7 @@ impl Metadata {
 
     /// Checks that `bytes` is a well-formed section: entries that fit, keys
     /// strictly increasing, at most [`MAX_METADATA`] bytes.
-    pub fn parse(bytes: Bytes) -> Result<Metadata, MetadataError> {
+    pub fn parse(bytes: Vec<u8>) -> Result<Metadata, MetadataError> {
         if bytes.len() > MAX_METADATA {
             return Err(MetadataError::TooLarge(bytes.len()));
         }
@@ -66,7 +64,7 @@ impl Metadata {
     }
 
     /// The section as it goes on the wire.
-    pub fn as_bytes(&self) -> &Bytes {
+    pub fn as_bytes(&self) -> &[u8] {
         &self.bytes
     }
 
@@ -106,7 +104,7 @@ fn entry(bytes: &[u8], at: usize) -> Option<(u16, std::ops::Range<usize>)> {
 /// Builds a metadata section from entries added in any order.
 #[derive(Clone, Debug, Default)]
 pub struct MetadataBuilder {
-    entries: BTreeMap<u16, Bytes>,
+    entries: BTreeMap<u16, Vec<u8>>,
 }
 
 impl MetadataBuilder {
@@ -115,7 +113,7 @@ impl MetadataBuilder {
     }
 
     /// Sets `key` to `value`, replacing any value it had.
-    pub fn insert(mut self, key: u16, value: impl Into<Bytes>) -> MetadataBuilder {
+    pub fn insert(mut self, key: u16, value: impl Into<Vec<u8>>) -> MetadataBuilder {
         self.entries.insert(key, value.into());
         self
     }
@@ -123,7 +121,7 @@ impl MetadataBuilder {
     /// Sets `key` to `value` as a little-endian `u64`, the conventional
     /// encoding of integers.
     pub fn insert_u64(self, key: u16, value: u64) -> MetadataBuilder {
-        self.insert(key, Bytes::copy_from_slice(&value.to_le_bytes()))
+        self.insert(key, value.to_le_bytes().to_vec())
     }
 
     pub fn build(self) -> Result<Metadata, MetadataError> {
@@ -143,8 +141,6 @@ impl MetadataBuilder {
             bytes.extend_from_slice(&(value.len() as u16).to_le_bytes());
             bytes.extend_from_slice(value);
         }
-        Ok(Metadata {
-            bytes: bytes.into(),
-        })
+        Ok(Metadata { bytes })
     }
 }

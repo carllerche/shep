@@ -2,7 +2,6 @@ mod support;
 
 use std::time::Duration;
 
-use bytes::Bytes;
 use shep_raft::{GroupId, ProposeError, RecordKind};
 use support::*;
 
@@ -17,7 +16,7 @@ async fn a_single_node_commits() {
         assert_eq!(w.response, i + 1);
     }
     let applied = cluster.applied(0, G1, 10).await;
-    assert_eq!(applied[9], Bytes::from_static(b"e9"));
+    assert_eq!(applied[9], b"e9".to_vec());
     let s = cluster.status(0, G1).await;
     assert!(s.is_leader);
     assert_eq!(s.voters.len(), 1);
@@ -31,7 +30,7 @@ async fn three_nodes_replicate() {
     for i in 0..20 {
         cluster.write(G1, format!("e{i}")).await;
     }
-    let expected: Vec<Bytes> = (0..20).map(|i| Bytes::from(format!("e{i}"))).collect();
+    let expected: Vec<Vec<u8>> = (0..20).map(|i| Vec::<u8>::from(format!("e{i}"))).collect();
     for n in 0..3 {
         assert_eq!(cluster.applied(n, G1, 20).await, expected, "node {n}");
     }
@@ -46,7 +45,7 @@ async fn followers_point_to_the_leader() {
     let follower = (leader + 1) % 3;
     let r = cluster
         .node(follower)
-        .propose(G1, None, Bytes::from_static(b"x"))
+        .propose(G1, None, b"x".to_vec())
         .await;
     let Err(ProposeError::NotLeader {
         leader: Some((id, _)),
@@ -58,7 +57,7 @@ async fn followers_point_to_the_leader() {
     assert_eq!(
         cluster
             .node(0)
-            .propose(GroupId(99), None, Bytes::new())
+            .propose(GroupId(99), None, Vec::<u8>::new())
             .await,
         Err(ProposeError::NoSuchGroup(GroupId(99)))
     );
@@ -79,7 +78,10 @@ async fn concurrent_writes_commit_in_one_order() {
             tokio::task::spawn_local(async move {
                 // A leader without a lease yet refuses writes for a moment.
                 loop {
-                    match node.propose(G1, None, Bytes::from(format!("w{i}"))).await {
+                    match node
+                        .propose(G1, None, Vec::<u8>::from(format!("w{i}")))
+                        .await
+                    {
                         Err(ProposeError::NotLeader { leader: None }) => {
                             tokio::time::sleep(Duration::from_millis(10)).await
                         }
@@ -149,7 +151,7 @@ async fn a_new_leader_takes_over() {
     assert_eq!(
         &applied[..5],
         &(0..5)
-            .map(|i| Bytes::from(format!("a{i}")))
+            .map(|i| Vec::<u8>::from(format!("a{i}")))
             .collect::<Vec<_>>()[..]
     );
     // The old leader catches up when it returns.
@@ -207,8 +209,8 @@ async fn a_full_restart_keeps_everything() {
         cluster.write(g, format!("{g}-after")).await;
         for n in 0..3 {
             let applied = cluster.applied(n, g, 6).await;
-            assert_eq!(applied[0], Bytes::from(format!("{g}-0")));
-            assert_eq!(applied[5], Bytes::from(format!("{g}-after")));
+            assert_eq!(applied[0], Vec::<u8>::from(format!("{g}-0")));
+            assert_eq!(applied[5], Vec::<u8>::from(format!("{g}-after")));
         }
     }
     cluster.shutdown().await;
@@ -250,7 +252,7 @@ async fn heartbeats_batch_and_appends_pipeline() {
         .map(|i| {
             let node = node.clone();
             tokio::task::spawn_local(async move {
-                node.propose(GroupId(1), None, Bytes::from(format!("p{i}")))
+                node.propose(GroupId(1), None, Vec::<u8>::from(format!("p{i}")))
                     .await
             })
         })
@@ -280,7 +282,7 @@ async fn group_handles_propose_read_and_watch() {
             assert!(g.leadership().is_leader);
             // Proposed together, appended in the order proposed.
             let out: Vec<_> = futures::future::join_all(
-                (0..20).map(|i| g.propose(None, Bytes::from(format!("h{i}")))),
+                (0..20).map(|i| g.propose(None, Vec::<u8>::from(format!("h{i}")))),
             )
             .await
             .into_iter()
@@ -295,7 +297,7 @@ async fn group_handles_propose_read_and_watch() {
             let RecordKind::Entry(e) = &records[3].kind else {
                 panic!("{:?}", records[3])
             };
-            assert_eq!(e.command, Bytes::from_static(b"h3"));
+            assert_eq!(e.command, b"h3".to_vec());
             assert!(g.applied_index().unwrap() >= last);
             assert!(g.log_range().end > last);
             out.len()
@@ -314,7 +316,10 @@ async fn group_handles_propose_read_and_watch() {
     assert_eq!(seen.leader.map(|(id, _)| id), Some(leader as u64 + 1));
     let r = cluster
         .node(follower)
-        .with_group(G1, |g| async move { g.propose(None, Bytes::new()).await })
+        .with_group(
+            G1,
+            |g| async move { g.propose(None, Vec::<u8>::new()).await },
+        )
         .await
         .unwrap();
     assert!(matches!(r, Err(ProposeError::NotLeader { .. })), "{r:?}");
@@ -345,7 +350,7 @@ async fn a_partitioned_leader_is_replaced() {
     let term = loop {
         match cluster
             .node(new)
-            .propose(G1, None, Bytes::from_static(b"during"))
+            .propose(G1, None, b"during".to_vec())
             .await
         {
             Ok(_) => break cluster.status(new, G1).await.term,
@@ -358,18 +363,13 @@ async fn a_partitioned_leader_is_replaced() {
     // The cut-off node can't commit anything.
     let r = tokio::time::timeout(
         Duration::from_millis(500),
-        cluster
-            .node(old)
-            .propose(G1, None, Bytes::from_static(b"lost")),
+        cluster.node(old).propose(G1, None, b"lost".to_vec()),
     )
     .await;
     assert!(!matches!(r, Ok(Ok(_))), "{r:?}");
     cluster.node(old).faults().set_partitioned(false);
     let applied = cluster.applied(old, G1, 2).await;
-    assert_eq!(
-        applied,
-        vec![Bytes::from_static(b"before"), Bytes::from_static(b"during")]
-    );
+    assert_eq!(applied, vec![b"before".to_vec(), b"during".to_vec()]);
     assert!(cluster.status(old, G1).await.term >= term);
     cluster.shutdown().await;
 }

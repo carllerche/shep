@@ -5,7 +5,6 @@ use std::io;
 use std::pin::Pin;
 use std::task::{Poll, ready};
 
-use bytes::Bytes;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::metadata::{Metadata, MetadataError};
@@ -19,7 +18,7 @@ pub const IO_BUFFER: usize = 64 * 1024;
 pub struct Frame {
     pub header: Header,
     pub metadata: Metadata,
-    pub body: Bytes,
+    pub body: Vec<u8>,
 }
 
 impl Frame {
@@ -29,7 +28,7 @@ impl Frame {
         method_or_status: u32,
         correlation_id: u32,
         metadata: Metadata,
-        body: Bytes,
+        body: Vec<u8>,
     ) -> Frame {
         let checksum = payload_checksum(&body);
         Frame::with_checksum(
@@ -49,7 +48,7 @@ impl Frame {
         method_or_status: u32,
         correlation_id: u32,
         metadata: Metadata,
-        body: Bytes,
+        body: Vec<u8>,
         payload_checksum: u64,
     ) -> Frame {
         let header = Header::new(
@@ -72,9 +71,42 @@ impl Frame {
 #[derive(Debug)]
 pub struct Head {
     pub header: Header,
-    /// Malformed metadata under a good checksum: the sizes can be trusted, so
-    /// the receiver can skip the body and carry on.
-    pub metadata: Result<Metadata, MetadataError>,
+    pub metadata: Metadata,
+}
+
+/// Why a connection failed. Every error but a misused call leaves the
+/// connection broken: the stream can't be trusted to be in step, and every
+/// later call in the same direction fails with [`Error::Broken`].
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error(transparent)]
+    Io(#[from] io::Error),
+    /// The stream ended partway through a frame.
+    #[error("the stream ended mid-frame")]
+    UnexpectedEof,
+    /// The stream took no bytes of a write.
+    #[error("the stream took no bytes")]
+    WriteZero,
+    #[error("header checksum mismatch")]
+    HeaderChecksum,
+    #[error("payload checksum mismatch")]
+    PayloadChecksum,
+    #[error("metadata of {0} bytes is larger than {MAX_METADATA}")]
+    MetadataTooLarge(usize),
+    #[error("malformed metadata: {0}")]
+    Metadata(#[from] MetadataError),
+    #[error("unknown flags {0:#x}")]
+    UnknownFlags(u32),
+    /// A body larger than the limit `read_body` was given.
+    #[error("body of {size} bytes is larger than the limit of {limit}")]
+    BodyTooLarge { size: usize, limit: usize },
+    /// An earlier call failed.
+    #[error("an earlier call failed; the stream is out of step")]
+    Broken,
+    /// `read_body` with no frame whose body is next. The connection is
+    /// unharmed.
+    #[error("no frame body to read")]
+    NoBody,
 }
 
 /// Bytes skipped per read, from a buffer on the stack.
@@ -92,7 +124,7 @@ const SKIP_CHUNK: usize = 8 * 1024;
 /// size only after checking it.
 ///
 /// **Writing:** [`queue`](Connection::queue) frames, then
-/// [`flush`](Connection::flush) them. Bodies are written from their `Bytes`
+/// [`flush`](Connection::flush) them. Bodies are written from their `Vec<u8>`
 /// without copying; put a `BufWriter` under the connection to batch small
 /// writes.
 ///
@@ -169,7 +201,7 @@ impl<T: AsyncRead + Unpin> Connection<T> {
     /// Fails, and the stream can't be read further, if the header claims more
     /// than [`MAX_METADATA`] bytes of metadata, its checksum doesn't match,
     /// its flags aren't zero, or the stream ends mid-frame.
-    pub async fn next_head(&mut self) -> io::Result<Option<Head>> {
+    pub async fn next_head(&mut self) -> Result<Option<Head>, Error> {
         let result = self.next_head_inner().await;
         self.break_on_error(result)
     }
@@ -177,58 +209,58 @@ impl<T: AsyncRead + Unpin> Connection<T> {
     /// Reads the current frame's body and checks it against its checksum.
     /// The caller decides whether the body is acceptable first; a body over
     /// `max` fails here, before anything is allocated for it.
-    pub async fn read_body(&mut self, max: usize) -> io::Result<Bytes> {
+    pub async fn read_body(&mut self, max: usize) -> Result<Vec<u8>, Error> {
         let result = self.read_body_inner(max).await;
         self.break_on_error(result)
     }
 
     /// Reads past the current frame's body without holding it. Does nothing
     /// if there's no body to skip: the last one was already read or skipped.
-    pub async fn skip_body(&mut self) -> io::Result<()> {
+    pub async fn skip_body(&mut self) -> Result<(), Error> {
         let result = self.skip_body_inner().await;
         self.break_on_error(result)
     }
 
-    fn break_on_error<U>(&mut self, result: io::Result<U>) -> io::Result<U> {
-        if result.is_err() {
+    fn break_on_error<U>(&mut self, result: Result<U, Error>) -> Result<U, Error> {
+        if matches!(result, Err(ref e) if !matches!(e, Error::NoBody)) {
             self.read = Read::Broken;
         }
         result
     }
 
-    async fn next_head_inner(&mut self) -> io::Result<Option<Head>> {
+    async fn next_head_inner(&mut self) -> Result<Option<Head>, Error> {
         if matches!(self.read, Read::Body { .. } | Read::Skipping { .. }) {
             self.skip_body_inner().await?;
         }
         let Read::Head { buf, filled } = &mut self.read else {
-            return Err(broken());
+            return Err(Error::Broken);
         };
         if buf.len() == HEADER_SIZE {
             if !fill(&mut self.io, buf, filled).await? {
                 if *filled == 0 {
                     return Ok(None);
                 }
-                return Err(io::ErrorKind::UnexpectedEof.into());
+                return Err(Error::UnexpectedEof);
             }
             let header = Header::decode(buf[..HEADER_SIZE].try_into().unwrap());
             if header.metadata_size as usize > MAX_METADATA {
-                return Err(invalid("metadata larger than MAX_METADATA"));
+                return Err(Error::MetadataTooLarge(header.metadata_size as usize));
             }
             buf.resize(HEADER_SIZE + header.metadata_size as usize, 0);
         }
         if !fill(&mut self.io, buf, filled).await? {
-            return Err(io::ErrorKind::UnexpectedEof.into());
+            return Err(Error::UnexpectedEof);
         }
         let header = Header::decode(buf[..HEADER_SIZE].try_into().unwrap());
         let metadata = &buf[HEADER_SIZE..];
         // Past a bad header the stream can't be trusted to be in step.
         if !header.checksum_ok(metadata) {
-            return Err(invalid("header checksum mismatch"));
+            return Err(Error::HeaderChecksum);
         }
         if header.flags != 0 {
-            return Err(invalid("unknown flags"));
+            return Err(Error::UnknownFlags(header.flags));
         }
-        let metadata = Metadata::parse(Bytes::copy_from_slice(metadata));
+        let metadata = Metadata::parse(metadata.to_vec())?;
         self.read = Read::Body {
             header,
             buf: Vec::new(),
@@ -237,37 +269,37 @@ impl<T: AsyncRead + Unpin> Connection<T> {
         Ok(Some(Head { header, metadata }))
     }
 
-    async fn read_body_inner(&mut self, max: usize) -> io::Result<Bytes> {
+    async fn read_body_inner(&mut self, max: usize) -> Result<Vec<u8>, Error> {
         let Read::Body {
             header,
             buf,
             filled,
         } = &mut self.read
         else {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "no frame body to read",
-            ));
+            return Err(match self.read {
+                Read::Broken => Error::Broken,
+                _ => Error::NoBody,
+            });
         };
         let size = header.payload_size as usize;
         if buf.len() < size {
             if size > max {
-                return Err(invalid("frame body larger than the limit"));
+                return Err(Error::BodyTooLarge { size, limit: max });
             }
             *buf = vec![0; size];
         }
         if !fill(&mut self.io, buf, filled).await? {
-            return Err(io::ErrorKind::UnexpectedEof.into());
+            return Err(Error::UnexpectedEof);
         }
         if payload_checksum(buf) != header.payload_checksum {
-            return Err(invalid("payload checksum mismatch"));
+            return Err(Error::PayloadChecksum);
         }
-        let body = Bytes::from(std::mem::take(buf));
+        let body = std::mem::take(buf);
         self.read = Read::next_head();
         Ok(body)
     }
 
-    async fn skip_body_inner(&mut self) -> io::Result<()> {
+    async fn skip_body_inner(&mut self) -> Result<(), Error> {
         if let Read::Body { header, filled, .. } = &self.read {
             // A read cancelled partway through may already hold some of it.
             let remaining = header.payload_size as usize - filled;
@@ -277,7 +309,7 @@ impl<T: AsyncRead + Unpin> Connection<T> {
             Read::Skipping { remaining } => remaining,
             Read::Head { .. } => return Ok(()),
             Read::Body { .. } => unreachable!("turned into Skipping above"),
-            Read::Broken => return Err(broken()),
+            Read::Broken => return Err(Error::Broken),
         };
         while *remaining > 0 {
             let want = (*remaining).min(SKIP_CHUNK);
@@ -289,7 +321,7 @@ impl<T: AsyncRead + Unpin> Connection<T> {
             })
             .await?;
             if n == 0 {
-                return Err(io::ErrorKind::UnexpectedEof.into());
+                return Err(Error::UnexpectedEof);
             }
             *remaining -= n;
         }
@@ -310,9 +342,9 @@ impl<T: AsyncWrite + Unpin> Connection<T> {
     }
 
     /// Writes every queued frame, then flushes the stream.
-    pub async fn flush(&mut self) -> io::Result<()> {
+    pub async fn flush(&mut self) -> Result<(), Error> {
         if self.write.broken {
-            return Err(broken());
+            return Err(Error::Broken);
         }
         let result = self.flush_inner().await;
         if result.is_err() {
@@ -322,12 +354,13 @@ impl<T: AsyncWrite + Unpin> Connection<T> {
     }
 
     /// Flushes, then shuts down the stream's write side.
-    pub async fn shutdown(&mut self) -> io::Result<()> {
+    pub async fn shutdown(&mut self) -> Result<(), Error> {
         self.flush().await?;
-        std::future::poll_fn(|cx| Pin::new(&mut self.io).poll_shutdown(cx)).await
+        std::future::poll_fn(|cx| Pin::new(&mut self.io).poll_shutdown(cx)).await?;
+        Ok(())
     }
 
-    async fn flush_inner(&mut self) -> io::Result<()> {
+    async fn flush_inner(&mut self) -> Result<(), Error> {
         let Connection { io, write, .. } = self;
         while let Some(frame) = write.queue.front() {
             let header = frame.header.encode();
@@ -343,14 +376,15 @@ impl<T: AsyncWrite + Unpin> Connection<T> {
                 let rest = &parts[part][at..];
                 let n = std::future::poll_fn(|cx| Pin::new(&mut *io).poll_write(cx, rest)).await?;
                 if n == 0 {
-                    return Err(io::ErrorKind::WriteZero.into());
+                    return Err(Error::WriteZero);
                 }
                 write.pos += n;
             }
             write.queue.pop_front();
             write.pos = 0;
         }
-        std::future::poll_fn(|cx| Pin::new(&mut *io).poll_flush(cx)).await
+        std::future::poll_fn(|cx| Pin::new(&mut *io).poll_flush(cx)).await?;
+        Ok(())
     }
 }
 
@@ -375,12 +409,4 @@ async fn fill<R: AsyncRead + Unpin>(
         *filled += n;
     }
     Ok(true)
-}
-
-fn broken() -> io::Error {
-    io::Error::other("an earlier call failed; the stream is out of step")
-}
-
-fn invalid(msg: &'static str) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, msg)
 }

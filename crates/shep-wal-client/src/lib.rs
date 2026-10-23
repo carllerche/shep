@@ -165,7 +165,7 @@ impl NodeClient {
             .cache
             .call(self.sock, method, shep_codec::to_bytes(req), timeout)
             .await?;
-        Ok(shep_codec::from_bytes(body)?)
+        Ok(shep_codec::from_bytes(&body)?)
     }
 
     /// Sends one proposal to this node, whatever its role.

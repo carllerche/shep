@@ -7,7 +7,6 @@ mod support;
 
 use std::collections::{BTreeMap, HashSet};
 
-use bytes::Bytes;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use shep_codec::{Decode, DecodeError, Decoder, Encode, MAX_DEPTH, from_bytes, to_bytes};
@@ -20,7 +19,7 @@ struct Record {
     flag: bool,
     delta: i32,
     name: String,
-    payload: Bytes,
+    payload: Vec<u8>,
     tags: BTreeMap<String, Vec<u16>>,
     set: HashSet<i64>,
     pair: (u8, Option<i16>),
@@ -34,7 +33,7 @@ struct Record {
 #[derive(Encode, Decode, Debug, Clone, PartialEq)]
 enum Event {
     Ping,
-    Data(Bytes),
+    Data(Vec<u8>),
     Move {
         from: (i8, i8),
         to: (i8, i8),
@@ -59,7 +58,7 @@ fn string(rng: &mut StdRng) -> String {
         .collect()
 }
 
-fn bytes(rng: &mut StdRng) -> Bytes {
+fn bytes(rng: &mut StdRng) -> Vec<u8> {
     (0..rng.random_range(0..8))
         .map(|_| rng.random::<u8>())
         .collect()
@@ -128,9 +127,9 @@ fn mutated_encodings_never_panic() {
                     _ => corrupt[at].wrapping_add(1),
                 };
             }
-            let corrupt = Bytes::from(corrupt);
-            let _ = from_bytes::<Record>(corrupt.clone());
-            let _ = from_bytes::<Vec<Event>>(corrupt);
+            let corrupt = corrupt;
+            let _ = from_bytes::<Record>(&corrupt.clone());
+            let _ = from_bytes::<Vec<Event>>(&corrupt);
         }
     }
 }
@@ -141,14 +140,14 @@ fn garbage_never_panics() {
     let mut rng = StdRng::seed_from_u64(7);
     for _ in 0..5_000 {
         let len = rng.random_range(0..64);
-        let garbage: Bytes = (0..len).map(|_| rng.random::<u8>()).collect();
-        let _ = from_bytes::<Record>(garbage.clone());
-        let _ = from_bytes::<Event>(garbage.clone());
-        let _ = from_bytes::<String>(garbage.clone());
-        let _ = from_bytes::<Vec<Option<bool>>>(garbage.clone());
-        let _ = from_bytes::<BTreeMap<u8, String>>(garbage.clone());
-        let _ = from_bytes::<HashSet<u16>>(garbage.clone());
-        let _ = from_bytes::<(u8, [i16; 4], Bytes)>(garbage);
+        let garbage: Vec<u8> = (0..len).map(|_| rng.random::<u8>()).collect();
+        let _ = from_bytes::<Record>(&garbage);
+        let _ = from_bytes::<Event>(&garbage);
+        let _ = from_bytes::<String>(&garbage);
+        let _ = from_bytes::<Vec<Option<bool>>>(&garbage);
+        let _ = from_bytes::<BTreeMap<u8, String>>(&garbage);
+        let _ = from_bytes::<HashSet<u16>>(&garbage);
+        let _ = from_bytes::<(u8, [i16; 4], Vec<u8>)>(&garbage);
     }
 }
 
@@ -157,27 +156,27 @@ fn garbage_never_panics() {
 #[codec(transparent)]
 struct Chain(Option<Box<Chain>>);
 
-fn chain_bytes(links: usize) -> Bytes {
+fn chain_bytes(links: usize) -> Vec<u8> {
     let mut bytes = vec![1u8; links];
     bytes.push(0);
-    Bytes::from(bytes)
+    bytes
 }
 
 #[test]
 fn nesting_is_limited() {
     // `links` ones nest `links + 1` Chains.
-    assert!(from_bytes::<Chain>(chain_bytes(MAX_DEPTH - 1)).is_ok());
+    assert!(from_bytes::<Chain>(&chain_bytes(MAX_DEPTH - 1)).is_ok());
     assert_eq!(
-        from_bytes::<Chain>(chain_bytes(MAX_DEPTH)),
+        from_bytes::<Chain>(&chain_bytes(MAX_DEPTH)),
         Err(DecodeError::TooDeep)
     );
     // Deep enough to overflow the stack without the limit.
     assert_eq!(
-        from_bytes::<Chain>(chain_bytes(1_000_000)),
+        from_bytes::<Chain>(&chain_bytes(1_000_000)),
         Err(DecodeError::TooDeep)
     );
     // Failing releases every level: a maximal value still decodes after.
-    assert!(from_bytes::<Chain>(chain_bytes(MAX_DEPTH - 1)).is_ok());
+    assert!(from_bytes::<Chain>(&chain_bytes(MAX_DEPTH - 1)).is_ok());
 
     // Enveloped types count too.
     let mut deep = Event::Ping;
@@ -185,21 +184,21 @@ fn nesting_is_limited() {
         deep = Event::Batch(vec![deep]);
     }
     assert_eq!(
-        from_bytes::<Event>(to_bytes(&deep)),
+        from_bytes::<Event>(&to_bytes(&deep)),
         Err(DecodeError::TooDeep)
     );
     let Event::Batch(mut inner) = deep else {
         unreachable!()
     };
     let shallower = inner.pop().unwrap();
-    assert_eq!(from_bytes::<Event>(to_bytes(&shallower)), Ok(shallower));
+    assert_eq!(from_bytes::<Event>(&to_bytes(&shallower)), Ok(shallower));
 }
 
 /// Siblings don't accumulate depth: only nesting does.
 #[test]
 fn breadth_is_not_depth() {
     let wide = Event::Batch(vec![Event::Ping; MAX_DEPTH * 4]);
-    assert_eq!(from_bytes::<Event>(to_bytes(&wide)), Ok(wide));
+    assert_eq!(from_bytes::<Event>(&to_bytes(&wide)), Ok(wide));
 }
 
 #[test]
@@ -208,8 +207,8 @@ fn every_truncation_of_a_large_value_fails_cleanly() {
     let value = record(&mut rng, 4);
     let mut bytes = to_bytes(&value);
     while !bytes.is_empty() {
-        bytes = bytes.slice(..bytes.len() - 1);
-        assert!(Record::decode(&mut Decoder::new(bytes.clone())).is_err());
+        bytes.pop();
+        assert!(Record::decode(&mut Decoder::new(&bytes)).is_err());
     }
     assert_eq!(value.encoded_len(), to_bytes(&value).len());
 }

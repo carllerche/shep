@@ -7,7 +7,6 @@ use std::process::Stdio;
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use bytes::Bytes;
 use shep_wal_client::api::{Dvv, KeyRange, Mutation, PartitionId, Proposal, ProposalKind};
 use shep_wal_client::{ClientConfig, WalClient};
 use tokio::process::{Child, Command};
@@ -120,7 +119,7 @@ pub fn client(addrs: impl IntoIterator<Item = SocketAddr>) -> WalClient {
 }
 
 /// Waits until some node reports the cluster founded.
-pub async fn founded(client: &WalClient) -> Bytes {
+pub async fn founded(client: &WalClient) -> Vec<u8> {
     for _ in 0..600 {
         if let Ok(s) = client.controller_state().await
             && let Some(id) = s.cluster_id
@@ -132,14 +131,14 @@ pub async fn founded(client: &WalClient) -> Bytes {
     panic!("never founded");
 }
 
-pub fn unique_key() -> Bytes {
-    Bytes::from(format!("{:032x}", rand::random::<u128>()))
+pub fn unique_key() -> Vec<u8> {
+    Vec::<u8>::from(format!("{:032x}", rand::random::<u128>()))
 }
 
 /// A blind write of `key` to `p`, read at `read_version`.
 pub fn write(p: PartitionId, read_version: u64, key: &str, payload: &str) -> Proposal {
     let read_version = Dvv::new().with_prefix(p, read_version);
-    let k = KeyRange::point(Bytes::copy_from_slice(key.as_bytes()));
+    let k = KeyRange::point(key.as_bytes().to_vec());
     Proposal {
         idempotency_key: unique_key(),
         kind: ProposalKind::Mutation(Mutation {
@@ -147,8 +146,8 @@ pub fn write(p: PartitionId, read_version: u64, key: &str, payload: &str) -> Pro
             read_version,
             read_set: vec![k.clone()],
             write_set: vec![k],
-            payload: Bytes::copy_from_slice(payload.as_bytes()),
-            reply: Bytes::from_static(b"ok"),
+            payload: payload.as_bytes().to_vec(),
+            reply: b"ok".to_vec(),
         }),
     }
 }

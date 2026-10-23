@@ -1,6 +1,5 @@
 use std::time::{Duration, Instant};
 
-use bytes::Bytes;
 use shep_wal_client::api::{PartitionId, Proposal, ProposalKind};
 use shep_wal_client::{ClientConfig, ProposeError, WalClient};
 
@@ -28,9 +27,9 @@ fn silent_peer() -> (std::net::TcpListener, WalClient) {
 async fn propose_stops_at_its_deadline() {
     let (silent, client) = silent_peer();
     let proposal = Proposal {
-        idempotency_key: Bytes::from_static(b"k"),
+        idempotency_key: b"k".to_vec(),
         kind: ProposalKind::Failure {
-            reply: Bytes::new(),
+            reply: Vec::<u8>::new(),
         },
     };
     let start = Instant::now();

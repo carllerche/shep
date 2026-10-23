@@ -5,7 +5,6 @@
 //! shep-codec, and the method ids. The WAL itself treats an entry's content
 //! as opaque bytes: it validates only keys and key ranges.
 
-use bytes::{BufMut, Bytes, BytesMut};
 use shep_codec::{Decode, Encode};
 
 pub use shep_version::{Dot, Dvv, PartitionId};
@@ -48,13 +47,13 @@ pub mod status {
 /// keys so that every range predicate a mutation reads is a key range (§10.3).
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Encode, Decode)]
 pub struct KeyRange {
-    start: Bytes,
-    end: Option<Bytes>,
+    start: Vec<u8>,
+    end: Option<Vec<u8>>,
 }
 
 impl KeyRange {
     /// `[start, end)`.
-    pub fn new(start: impl Into<Bytes>, end: impl Into<Bytes>) -> KeyRange {
+    pub fn new(start: impl Into<Vec<u8>>, end: impl Into<Vec<u8>>) -> KeyRange {
         KeyRange {
             start: start.into(),
             end: Some(end.into()),
@@ -62,7 +61,7 @@ impl KeyRange {
     }
 
     /// `[start, ∞)`.
-    pub fn starting_at(start: impl Into<Bytes>) -> KeyRange {
+    pub fn starting_at(start: impl Into<Vec<u8>>) -> KeyRange {
         KeyRange {
             start: start.into(),
             end: None,
@@ -70,23 +69,23 @@ impl KeyRange {
     }
 
     /// Exactly one key.
-    pub fn point(key: impl Into<Bytes>) -> KeyRange {
+    pub fn point(key: impl Into<Vec<u8>>) -> KeyRange {
         let start = key.into();
-        let mut end = BytesMut::with_capacity(start.len() + 1);
-        end.put_slice(&start);
-        end.put_u8(0);
+        let mut end = Vec::with_capacity(start.len() + 1);
+        end.extend_from_slice(&start);
+        end.push(0);
         KeyRange {
             start,
-            end: Some(end.freeze()),
+            end: Some(end),
         }
     }
 
     /// Every key that starts with `prefix`.
-    pub fn prefix(prefix: impl Into<Bytes>) -> KeyRange {
+    pub fn prefix(prefix: impl Into<Vec<u8>>) -> KeyRange {
         let start = prefix.into();
         // The successor of a prefix: drop trailing 0xff bytes, then increment
         // the last byte. A prefix of only 0xff bytes has no successor.
-        let mut end = start.to_vec();
+        let mut end = start.clone();
         while end.last() == Some(&0xff) {
             end.pop();
         }
@@ -95,29 +94,29 @@ impl KeyRange {
                 *last += 1;
                 KeyRange {
                     start,
-                    end: Some(end.into()),
+                    end: Some(end),
                 }
             }
             None => KeyRange { start, end: None },
         }
     }
 
-    pub fn start(&self) -> &Bytes {
+    pub fn start(&self) -> &[u8] {
         &self.start
     }
 
     /// The exclusive end, or `None` if the range is unbounded.
-    pub fn end(&self) -> Option<&Bytes> {
-        self.end.as_ref()
+    pub fn end(&self) -> Option<&[u8]> {
+        self.end.as_deref()
     }
 
     /// The key, if this range holds exactly one.
-    pub fn as_point(&self) -> Option<&Bytes> {
+    pub fn as_point(&self) -> Option<&[u8]> {
         let end = self.end.as_ref()?;
         let is_point = end.len() == self.start.len() + 1
             && end.starts_with(&self.start)
             && end.last() == Some(&0);
-        is_point.then_some(&self.start)
+        is_point.then_some(&self.start[..])
     }
 
     pub fn is_empty(&self) -> bool {
@@ -129,7 +128,8 @@ impl KeyRange {
     }
 
     pub fn intersects(&self, other: &KeyRange) -> bool {
-        let below = |end: &Option<Bytes>, start: &Bytes| end.as_ref().is_some_and(|e| e <= start);
+        let below =
+            |end: &Option<Vec<u8>>, start: &[u8]| end.as_deref().is_some_and(|e| e <= start);
         !self.is_empty()
             && !other.is_empty()
             && !below(&self.end, &other.start)
@@ -149,7 +149,7 @@ pub struct Member {
 pub struct Proposal {
     /// Every proposal has one, so re-sending a proposal is always safe. A
     /// key's first decided outcome is its only outcome.
-    pub idempotency_key: Bytes,
+    pub idempotency_key: Vec<u8>,
     pub kind: ProposalKind,
 }
 
@@ -161,7 +161,7 @@ pub enum ProposalKind {
     /// that one is returned. A front end never reports a failure for a key
     /// without this, since an earlier attempt may still commit.
     Failure {
-        reply: Bytes,
+        reply: Vec<u8>,
     },
 }
 
@@ -177,9 +177,9 @@ pub struct Mutation {
     /// Every key and range it writes in this partition.
     pub write_set: Vec<KeyRange>,
     /// The entry's content, opaque to the WAL.
-    pub payload: Bytes,
+    pub payload: Vec<u8>,
     /// What the front end returns to its client, returned again to retries.
-    pub reply: Bytes,
+    pub reply: Vec<u8>,
 }
 
 /// An idempotency key's outcome.
@@ -191,7 +191,7 @@ pub struct Decided {
     /// the Unix epoch. Non-decreasing in log order.
     pub commit_time_us: u64,
     pub status: DecidedStatus,
-    pub reply: Bytes,
+    pub reply: Vec<u8>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
@@ -246,7 +246,7 @@ pub enum EntryKind {
     /// A failure recorded under an idempotency key. It stamps nothing.
     Failure {
         commit_time_us: u64,
-        idempotency_key: Bytes,
+        idempotency_key: Vec<u8>,
     },
 }
 
@@ -254,8 +254,8 @@ pub enum EntryKind {
 pub struct MutationEntry {
     pub context: Dvv,
     pub commit_time_us: u64,
-    pub idempotency_key: Bytes,
-    pub payload: Bytes,
+    pub idempotency_key: Vec<u8>,
+    pub payload: Vec<u8>,
 }
 
 /// What one node knows about one partition's Raft group.

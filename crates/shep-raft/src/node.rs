@@ -14,7 +14,6 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
-use bytes::Bytes;
 use shep_raft_engine::async_runtime::WatchReceiver;
 use shep_raft_engine::errors::{ClientWriteError, InitializeError, RaftError};
 use shep_raft_engine::impls::BasicNode;
@@ -193,7 +192,7 @@ pub(crate) struct Written {
     pub term: u64,
     pub index: u64,
     /// What the state machine returned for it.
-    pub response: Bytes,
+    pub response: Vec<u8>,
 }
 
 /// What a node knows of one of its groups.
@@ -463,7 +462,7 @@ impl<M: Machine> RaftNode<M> {
     pub async fn propose(
         &self,
         group: GroupId,
-        key: Option<Bytes>,
+        key: Option<Vec<u8>>,
         proposal: M::Proposal,
     ) -> Result<Decided<M::Response>, ProposeError<M::Rejection>>
     where
@@ -601,7 +600,7 @@ impl<M: Machine> Shared<M> {
         }
         match req.method {
             wire::APPEND => {
-                let Ok(r) = shep_codec::from_bytes::<AppendRequest>(req.body) else {
+                let Ok(r) = shep_codec::from_bytes::<AppendRequest>(&req.body) else {
                     return Response::error(wire::status::MALFORMED);
                 };
                 let reply = self
@@ -612,13 +611,13 @@ impl<M: Machine> Shared<M> {
                 ))
             }
             wire::HEARTBEATS => {
-                let Ok(batch) = shep_codec::from_bytes::<wire::Heartbeats>(req.body) else {
+                let Ok(batch) = shep_codec::from_bytes::<wire::Heartbeats>(&req.body) else {
                     return Response::error(wire::status::MALFORMED);
                 };
                 Response::ok(shep_codec::to_bytes(&self.heartbeats(batch).await))
             }
             wire::VOTE | wire::PRE_VOTE => {
-                let Ok(r) = shep_codec::from_bytes::<wire::VoteRequest>(req.body) else {
+                let Ok(r) = shep_codec::from_bytes::<wire::VoteRequest>(&req.body) else {
                     return Response::error(wire::status::MALFORMED);
                 };
                 let pre = req.method == wire::PRE_VOTE;
@@ -630,7 +629,7 @@ impl<M: Machine> Shared<M> {
                 ))
             }
             wire::SNAPSHOT => {
-                let Ok(r) = shep_codec::from_bytes::<wire::SnapshotRequest>(req.body) else {
+                let Ok(r) = shep_codec::from_bytes::<wire::SnapshotRequest>(&req.body) else {
                     return Response::error(wire::status::MALFORMED);
                 };
                 let reply = self
@@ -641,7 +640,7 @@ impl<M: Machine> Shared<M> {
                 ))
             }
             wire::TRANSFER_LEADER => {
-                let Ok(r) = shep_codec::from_bytes::<wire::TransferLeaderRequest>(req.body) else {
+                let Ok(r) = shep_codec::from_bytes::<wire::TransferLeaderRequest>(&req.body) else {
                     return Response::error(wire::status::MALFORMED);
                 };
                 let reply = self
@@ -757,7 +756,7 @@ pub(crate) struct RawRecord {
 pub(crate) enum RawPayload {
     /// Raft's own entries.
     Internal,
-    Normal(Bytes),
+    Normal(Vec<u8>),
 }
 
 /// Follows a group's leadership as it changes.
@@ -812,7 +811,7 @@ impl<M: Machine> GroupHandle<M> {
     /// idempotency window gets that decision instead.
     pub async fn propose(
         &self,
-        key: Option<Bytes>,
+        key: Option<Vec<u8>>,
         proposal: M::Proposal,
     ) -> Result<Decided<M::Response>, ProposeError<M::Rejection>> {
         self.proposer().propose(key, proposal).await
@@ -840,7 +839,7 @@ impl<M: Machine> GroupHandle<M> {
     /// response, or with why it wasn't.
     pub(crate) async fn append(
         &self,
-        payload: Bytes,
+        payload: Vec<u8>,
     ) -> Result<impl std::future::Future<Output = Result<Written, WriteError>> + 'static, WriteError>
     {
         use shep_raft_engine::impls::ProgressResponder;
@@ -1040,7 +1039,7 @@ struct Group<M: Machine> {
 fn decode_record<M: Machine>(r: RawRecord) -> LogRecord<M::Command> {
     let kind = match r.payload {
         RawPayload::Internal => RecordKind::Internal,
-        RawPayload::Normal(b) => match shep_codec::from_bytes::<Envelope<M::Command>>(b) {
+        RawPayload::Normal(b) => match shep_codec::from_bytes::<Envelope<M::Command>>(&b) {
             Ok(env) if !env.is_void(r.term) => RecordKind::Entry(env.into_entry(r.index, r.term)),
             Ok(_) | Err(_) => RecordKind::Void,
         },
@@ -1170,7 +1169,7 @@ impl<M: Machine> Core<M> {
         let key = group.0.to_string();
         self.storage()
             .kvstore()
-            .put(KeySpace::SHARD_PLACEMENT, key.as_bytes(), Bytes::new())
+            .put(KeySpace::SHARD_PLACEMENT, key.as_bytes(), Vec::<u8>::new())
             .await?;
         self.open_group(group).await
     }

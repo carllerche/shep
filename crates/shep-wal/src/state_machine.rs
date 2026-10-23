@@ -3,7 +3,6 @@
 
 use std::collections::HashMap;
 
-use bytes::Bytes;
 use shep_codec::{Decode, Encode};
 use shep_raft::{Admit, Entry, GroupId, Machine, Resolution};
 use shep_wal_api::{PartitionId, ProposalKind, Rejection};
@@ -143,11 +142,11 @@ impl Machine for PartitionSm {
         entry.command.failed()
     }
 
-    fn snapshot(&self) -> Bytes {
-        Bytes::new()
+    fn snapshot(&self) -> Vec<u8> {
+        Vec::<u8>::new()
     }
 
-    fn restore(&mut self, _: Bytes) {}
+    fn restore(&mut self, _: Vec<u8>) {}
 }
 
 /// Every group a WAL node hosts is the controller or a partition (an enum,
@@ -262,14 +261,14 @@ impl Machine for GroupSm {
         }
     }
 
-    fn snapshot(&self) -> Bytes {
+    fn snapshot(&self) -> Vec<u8> {
         match self {
             GroupSm::Controller(c) => c.snapshot(),
             GroupSm::Partition(p) => p.snapshot(),
         }
     }
 
-    fn restore(&mut self, snapshot: Bytes) {
+    fn restore(&mut self, snapshot: Vec<u8>) {
         match self {
             GroupSm::Controller(c) => c.restore(snapshot),
             GroupSm::Partition(p) => p.restore(snapshot),

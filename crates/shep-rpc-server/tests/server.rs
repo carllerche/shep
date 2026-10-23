@@ -8,7 +8,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use bytes::Bytes;
 use shep_rpc::MetadataBuilder;
 use shep_rpc::wire::COMPRESSION_ZSTD;
 use shep_rpc_client::{Call, RpcError, Transport};
@@ -27,7 +26,7 @@ async fn raw_echo(stream: &mut TcpStream, id: u32) {
     write_frame(stream, &header(ECHO, id, b"ok"), b"", b"ok").await;
     let (header, _, body) = read_frame(stream).await.unwrap();
     assert_eq!((header.correlation_id, header.method_or_status), (id, 200));
-    assert_eq!(body, "ok");
+    assert_eq!(body, b"ok");
 }
 
 /// Adapted from Redpanda src/v/rpc/test/rpc_gen_cycling_test.cc
@@ -49,7 +48,7 @@ async fn corrupted_header_closes_connection() {
     for _ in 0..10 {
         assert_eq!(
             t.call(ECHO, "testing...".into(), LONG).await.unwrap(),
-            "testing..."
+            b"testing..."
         );
     }
 }
@@ -72,7 +71,7 @@ async fn corrupted_payload_closes_connection() {
     for _ in 0..10 {
         assert_eq!(
             t.call(ECHO, "testing...".into(), LONG).await.unwrap(),
-            "testing..."
+            b"testing..."
         );
     }
 }
@@ -109,10 +108,10 @@ async fn request_over_the_limit_is_refused() {
     raw_echo(&mut stream, 2).await;
 
     let t = Transport::connect(addr).await.unwrap();
-    let reply = t.call(ECHO, body.into(), LONG).await;
+    let reply = t.call(ECHO, body, LONG).await;
     assert!(matches!(reply, Err(RpcError::PayloadTooLarge)), "{reply:?}");
     // Exactly the limit is fine.
-    let body = Bytes::from(vec![7; 1024]);
+    let body = vec![7; 1024];
     assert_eq!(t.call(ECHO, body.clone(), LONG).await.unwrap(), body);
     assert_eq!(state.started(), 2);
 }
@@ -160,14 +159,14 @@ fn serve_handed_off_connection() {
     runtime().block_on(async {
         let t = Transport::connect(addr).await.unwrap();
         let calls: Vec<_> = (0..100u32)
-            .map(|i| t.call(ECHO, Bytes::from(i.to_string()), LONG))
+            .map(|i| t.call(ECHO, Vec::<u8>::from(i.to_string()), LONG))
             .collect();
         for (i, reply) in futures::future::join_all(calls)
             .await
             .into_iter()
             .enumerate()
         {
-            assert_eq!(reply.unwrap(), i.to_string());
+            assert_eq!(reply.unwrap(), i.to_string().into_bytes());
         }
     });
     // The transport is gone, so the connection closes and the worker ends.
@@ -196,7 +195,7 @@ async fn graceful_shutdown() {
     assert!(!shutdown.is_finished());
 
     state.release.add_permits(1);
-    assert_eq!(in_flight.await.unwrap(), "in flight");
+    assert_eq!(in_flight.await.unwrap(), b"in flight");
     assert!(matches!(late.await, Err(RpcError::Disconnected)));
     shutdown.await.unwrap();
     assert_eq!(state.started(), 1);
@@ -216,7 +215,7 @@ async fn forced_shutdown_answers_request_timeout() {
     wait_started(&state, 6).await;
 
     server.shutdown(Duration::from_millis(50)).await;
-    assert_eq!(quick.await.unwrap(), "quick");
+    assert_eq!(quick.await.unwrap(), b"quick");
     for reply in futures::future::join_all(calls).await {
         assert!(matches!(reply, Err(RpcError::Abandoned)), "{reply:?}");
     }
@@ -249,34 +248,32 @@ async fn truncated_frame_closes_only_its_connection() {
     write_frame(&mut stream, &header, b"", b"01234").await;
     drop(stream);
     tokio::time::sleep(Duration::from_millis(20)).await;
-    assert_eq!(t.call(ECHO, "still".into(), LONG).await.unwrap(), "still");
-    let reply = t.call(FAIL, Bytes::new(), LONG).await;
+    assert_eq!(t.call(ECHO, "still".into(), LONG).await.unwrap(), b"still");
+    let reply = t.call(FAIL, Vec::<u8>::new(), LONG).await;
     assert_eq!(reply.unwrap_err().service_status(), Some(FAILED));
 }
 
-/// Malformed metadata under a good checksum is answered with 400 and the
-/// body skipped; the sizes can be trusted, so the connection carries on.
+/// Malformed metadata breaks the protocol: the server closes the
+/// connection without serving the request, whatever the checksum says.
 #[tokio::test(flavor = "local")]
-async fn malformed_metadata_is_a_bad_request() {
+async fn malformed_metadata_closes_the_connection() {
     let (_server, addr, state) = start(ServerConfig::default()).await;
-    let mut stream = TcpStream::connect(addr).await.unwrap();
-    for (id, bad) in [
+    for bad in [
         // A value running past the section.
-        (1, &[1, 0, 9, 0, 0][..]),
+        &[1, 0, 9, 0, 0][..],
         // A truncated entry header.
-        (2, &[1, 0, 0][..]),
+        &[1, 0, 0][..],
         // Keys out of order, and repeated.
-        (3, &[2, 0, 0, 0, 1, 0, 0, 0][..]),
-        (4, &[1, 0, 0, 0, 1, 0, 0, 0][..]),
+        &[2, 0, 0, 0, 1, 0, 0, 0][..],
+        &[1, 0, 0, 0, 1, 0, 0, 0][..],
     ] {
-        let h = request(ECHO, id, bad, b"body");
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        raw_echo(&mut stream, 1).await;
+        let h = request(ECHO, 2, bad, b"body");
         write_frame(&mut stream, &h, bad, b"body").await;
-        let (reply, _, body) = read_frame(&mut stream).await.unwrap();
-        assert_eq!((reply.correlation_id, reply.method_or_status), (id, 400));
-        assert!(body.is_empty());
+        assert_closed(&mut stream).await;
     }
-    raw_echo(&mut stream, 5).await;
-    assert_eq!(state.started(), 1);
+    assert_eq!(state.started(), 4);
 }
 
 /// What can't be recovered from closes the connection: metadata over the

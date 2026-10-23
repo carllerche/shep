@@ -7,7 +7,6 @@ use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::rc::Rc;
 
-use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use shep_codec::{Decode, Encode};
 use shep_raft_engine::EntryPayload;
@@ -41,14 +40,14 @@ struct SmState<M: Machine> {
     applied: tokio::sync::watch::Sender<Option<u64>>,
     last_applied: Option<LogId>,
     membership: StoredMembership,
-    snapshot: Option<(SnapshotMeta, Bytes)>,
+    snapshot: Option<(SnapshotMeta, Vec<u8>)>,
 }
 
 /// Which entry decided each idempotency key, for the idempotency window.
 struct Keys<R> {
-    decided: HashMap<Bytes, KeyRecord<R>>,
+    decided: HashMap<Vec<u8>, KeyRecord<R>>,
     /// Keys in the order they were decided, for forgetting them.
-    order: VecDeque<(u64, Bytes)>,
+    order: VecDeque<(u64, Vec<u8>)>,
 }
 
 #[derive(Clone, Debug, Encode, Decode)]
@@ -60,8 +59,8 @@ struct KeyRecord<R> {
 
 #[derive(Encode, Decode)]
 struct SnapshotData<R> {
-    keys: Vec<(Bytes, KeyRecord<R>)>,
-    machine: Bytes,
+    keys: Vec<(Vec<u8>, KeyRecord<R>)>,
+    machine: Vec<u8>,
     max_commit_time_us: u64,
 }
 
@@ -88,7 +87,7 @@ impl<R: Clone> Keys<R> {
         }
     }
 
-    fn decide(&mut self, key: Bytes, rec: KeyRecord<R>) {
+    fn decide(&mut self, key: Vec<u8>, rec: KeyRecord<R>) {
         if let Some(prev) = self.decided.get(&key) {
             // The leader checks keys before appending, so this is a bug.
             tracing::error!(
@@ -146,8 +145,8 @@ impl<M: Machine> SmAdapter<M> {
 }
 
 impl<M: Machine> SmState<M> {
-    fn apply_normal(&mut self, index: u64, term: u64, bytes: Bytes) -> Applied<M::Response> {
-        let env = match shep_codec::from_bytes::<Envelope<M::Command>>(bytes) {
+    fn apply_normal(&mut self, index: u64, term: u64, bytes: Vec<u8>) -> Applied<M::Response> {
+        let env = match shep_codec::from_bytes::<Envelope<M::Command>>(&bytes) {
             Ok(env) => env,
             Err(e) => {
                 // Only the leader writes entries, after encoding them.
@@ -180,7 +179,7 @@ impl<M: Machine> SmState<M> {
 }
 
 impl<M: Machine> RaftStateMachine<TypeConfig> for SmAdapter<M> {
-    type SnapshotData = Bytes;
+    type SnapshotData = Vec<u8>;
     type SnapshotBuilder = SmAdapter<M>;
 
     async fn applied_state(&mut self) -> io::Result<(Option<LogId>, StoredMembership)> {
@@ -218,8 +217,8 @@ impl<M: Machine> RaftStateMachine<TypeConfig> for SmAdapter<M> {
         self.clone()
     }
 
-    async fn install_snapshot(&mut self, meta: &SnapshotMeta, snapshot: Bytes) -> io::Result<()> {
-        let data: SnapshotData<M::Response> = shep_codec::from_bytes(snapshot.clone())
+    async fn install_snapshot(&mut self, meta: &SnapshotMeta, snapshot: Vec<u8>) -> io::Result<()> {
+        let data: SnapshotData<M::Response> = shep_codec::from_bytes(&snapshot.clone())
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let mut st = self.state.borrow_mut();
         st.machine.restore(data.machine);
@@ -245,7 +244,7 @@ impl<M: Machine> RaftStateMachine<TypeConfig> for SmAdapter<M> {
 }
 
 impl<M: Machine> RaftSnapshotBuilder<TypeConfig> for SmAdapter<M> {
-    type SnapshotData = Bytes;
+    type SnapshotData = Vec<u8>;
 
     async fn build_snapshot(&mut self) -> io::Result<RaftSnapshot> {
         let mut st = self.state.borrow_mut();

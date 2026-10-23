@@ -6,8 +6,7 @@ mod support;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
-use bytes::Bytes;
-use shep_codec::{Decode, DecodeError, Decoder, from_bytes, to_bytes};
+use shep_codec::{Decode, DecodeError, Decoder, Limits, from_bytes, to_bytes};
 use support::{decode, reencode, round_trip};
 
 #[test]
@@ -93,27 +92,35 @@ fn string_rejects_invalid_utf8() {
 // Adapted from serde_bytes_test in redpanda/src/v/serde/test/serde_test.cc.
 #[test]
 fn bytes_is_length_then_raw() {
-    assert_eq!(round_trip(&Bytes::new())[..], [0, 0, 0, 0]);
+    assert_eq!(round_trip(&Vec::<u8>::new())[..], [0, 0, 0, 0]);
     assert_eq!(
-        round_trip(&Bytes::from_static(&[0, 1, 0xff]))[..],
+        round_trip(&vec![0u8, 1, 0xff])[..],
         [3, 0, 0, 0, 0, 1, 0xff]
     );
     // Same wire format as a Vec<u8>.
     let v = vec![9u8, 8, 7];
-    assert_eq!(to_bytes(&v), to_bytes(&Bytes::from(v.clone())));
-    let back: Vec<u8> = reencode(&Bytes::from(v.clone())).unwrap();
+    assert_eq!(to_bytes(&v), to_bytes(&v.clone()));
+    let back: Vec<u8> = reencode(&v.clone()).unwrap();
     assert_eq!(back, v);
 }
 
+/// Decoded bytes are copies the value owns: nothing decoded points into the
+/// input, so nothing can keep it alive. Copying them is charged to the
+/// decode's budget.
 #[test]
-fn bytes_decode_is_zero_copy() {
-    let input = to_bytes(&(7u8, Bytes::from_static(b"payload"), 9u8));
+fn bytes_decode_into_owned_copies() {
+    let input = to_bytes(&(7u8, b"payload".to_vec(), 9u8));
     let range = input.as_ptr() as usize..input.as_ptr() as usize + input.len();
-    let (a, payload, b): (u8, Bytes, u8) = from_bytes(input.clone()).unwrap();
+    let (a, payload, b): (u8, Vec<u8>, u8) = from_bytes(&input).unwrap();
     assert_eq!((a, &payload[..], b), (7, &b"payload"[..], 9));
-    // The decoded bytes point into the input's buffer.
-    assert!(range.contains(&(payload.as_ptr() as usize)));
-    assert_eq!(payload.as_ptr() as usize, range.start + 1 + 4);
+    assert!(!range.contains(&(payload.as_ptr() as usize)));
+
+    let mut d = Decoder::with_limits(&input, Limits { max_memory: 6 });
+    assert_eq!(u8::decode(&mut d), Ok(7));
+    assert_eq!(
+        Vec::<u8>::decode(&mut d),
+        Err(DecodeError::LimitExceeded { limit: 6 })
+    );
 }
 
 #[test]
@@ -270,7 +277,7 @@ fn truncation_reports_what_was_needed() {
         })
     );
     assert_eq!(
-        decode::<Bytes>(&[5, 0, 0, 0, 1]),
+        decode::<Vec<u8>>(&[5, 0, 0, 0, 1]),
         Err(DecodeError::UnexpectedEnd {
             needed: 5,
             remaining: 1
@@ -282,7 +289,7 @@ fn truncation_reports_what_was_needed() {
 fn from_bytes_rejects_trailing_bytes() {
     assert_eq!(decode::<u8>(&[1, 2, 3]), Err(DecodeError::TrailingBytes(2)));
     // `decode` itself stops after one value.
-    let mut d = Decoder::new(Bytes::from_static(&[1, 2, 3]));
+    let mut d = Decoder::new(&[1, 2, 3]);
     assert_eq!(u8::decode(&mut d), Ok(1));
-    assert_eq!(&d.rest()[..], [2, 3]);
+    assert_eq!(d.rest(), [2, 3]);
 }

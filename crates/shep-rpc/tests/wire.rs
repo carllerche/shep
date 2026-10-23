@@ -139,7 +139,6 @@ fn method_ids() {
 fn status_codes() {
     let all = [
         (Status::Success, 200),
-        (Status::BadRequest, 400),
         (Status::Abandoned, 408),
         (Status::PayloadTooLarge, 413),
         (Status::UnsupportedCompression, 415),
@@ -152,5 +151,6 @@ fn status_codes() {
     }
     assert_eq!(Status::from_u32(0), None);
     assert_eq!(Status::from_u32(201), None);
+    assert_eq!(Status::from_u32(400), None);
     assert_eq!(Status::from_u32(shep_rpc::SERVICE_STATUS_MIN), None);
 }

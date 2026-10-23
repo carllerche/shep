@@ -21,7 +21,6 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use bytes::Bytes;
 use shep_codec::{Decode, Encode};
 use shep_raft::{Admit, Entry, GroupId, Machine, NodeId};
 use shep_wal_api::PartitionId;
@@ -125,7 +124,7 @@ pub struct LogSetId(pub u64);
 pub enum Proposal {
     /// The first command: the cluster's identity and founding members.
     Found {
-        cluster_id: Bytes,
+        cluster_id: Vec<u8>,
         members: Vec<NodeInfo>,
     },
     AddNode(NodeInfo),
@@ -143,7 +142,7 @@ pub enum Proposal {
 pub enum Command {
     /// The first command: the cluster's identity and founding members.
     Found {
-        cluster_id: Bytes,
+        cluster_id: Vec<u8>,
         members: Vec<NodeInfo>,
     },
     AddNode(NodeInfo),
@@ -196,7 +195,7 @@ pub struct Partition {
 /// The controller's state: a fold of its log.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Encode, Decode)]
 pub struct ControllerState {
-    pub cluster_id: Option<Bytes>,
+    pub cluster_id: Option<Vec<u8>>,
     /// The index of the last command applied.
     pub revision: u64,
     pub members: BTreeMap<NodeId, Member>,
@@ -466,12 +465,12 @@ impl Machine for ControllerSm {
         outcome
     }
 
-    fn snapshot(&self) -> Bytes {
+    fn snapshot(&self) -> Vec<u8> {
         shep_codec::to_bytes(&self.state)
     }
 
-    fn restore(&mut self, snapshot: Bytes) {
-        match shep_codec::from_bytes(snapshot) {
+    fn restore(&mut self, snapshot: Vec<u8>) {
+        match shep_codec::from_bytes(&snapshot) {
             Ok(state) => {
                 self.state = state;
                 self.revision.send_replace(self.state.revision);
@@ -531,7 +530,7 @@ pub struct HelloRequest {}
 pub struct HelloReply {
     pub node_id: NodeId,
     /// The cluster this node belongs to, if any.
-    pub cluster_id: Option<Bytes>,
+    pub cluster_id: Option<Vec<u8>>,
     /// Whether this node has any controller state, even before founding.
     pub empty: bool,
     /// The node's configured seed list. Founding requires every seed to

@@ -233,7 +233,7 @@ struct WirePart {
 }
 
 impl Encode for Dvv {
-    fn encode(&self, buf: &mut bytes::BytesMut) {
+    fn encode(&self, buf: &mut Vec<u8>) {
         self.wire().encode(buf)
     }
 

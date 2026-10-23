@@ -1,0 +1,8 @@
+# `Bytes` and `BytesMut` share one allocation among every slice of it, behind
+# a hidden reference count, so a small value can keep a large buffer alive
+# without anything owning or accounting for it. Own bytes explicitly: copy
+# what you keep into a `Vec<u8>` or `Box<[u8]>`.
+disallowed-types = [
+    { path = "bytes::Bytes", reason = "hidden shared ownership; use Vec<u8> or Box<[u8]>" },
+    { path = "bytes::BytesMut", reason = "hidden shared ownership; use Vec<u8>" },
+]

@@ -261,7 +261,7 @@ impl<'a> Container<'a> {
         quote! {
             #[automatically_derived]
             impl #impl_generics ::shep_codec::Encode for #ident #ty_generics #where_clause {
-                fn encode(&self, buf: &mut ::shep_codec::__private::BytesMut) {
+                fn encode(&self, buf: &mut ::std::vec::Vec<u8>) {
                     #encode
                 }
 
@@ -334,7 +334,7 @@ impl<'a> Container<'a> {
             #[automatically_derived]
             impl #impl_generics ::shep_codec::Decode for #ident #ty_generics #where_clause {
                 fn decode(
-                    d: &mut #p::Decoder,
+                    d: &mut #p::Decoder<'_>,
                 ) -> #p::Result<Self, ::shep_codec::DecodeError> {
                     #decode
                 }

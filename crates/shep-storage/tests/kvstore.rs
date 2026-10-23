@@ -3,7 +3,6 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use bytes::Bytes;
 use futures::future::join_all;
 use shep_storage::{Disk, Error, KeySpace, KvConfig, KvStore};
 use tempfile::TempDir;
@@ -47,8 +46,8 @@ fn immediate() -> KvConfig {
     }
 }
 
-fn b(s: &str) -> Bytes {
-    Bytes::copy_from_slice(s.as_bytes())
+fn b(s: &str) -> Vec<u8> {
+    s.as_bytes().to_vec()
 }
 
 fn len(p: &Path) -> u64 {

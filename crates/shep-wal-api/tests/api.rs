@@ -1,14 +1,13 @@
-use bytes::Bytes;
 use shep_wal_api::*;
 
-fn b(s: &str) -> Bytes {
-    Bytes::copy_from_slice(s.as_bytes())
+fn b(s: &str) -> Vec<u8> {
+    s.as_bytes().to_vec()
 }
 
 #[test]
 fn point_ranges_hold_one_key() {
     let r = KeyRange::point(b("ab"));
-    assert_eq!(r.as_point(), Some(&b("ab")));
+    assert_eq!(r.as_point(), Some(&b"ab"[..]));
     assert!(r.contains(b"ab"));
     assert!(!r.contains(b"a"));
     assert!(!r.contains(b"ab\0"));
@@ -24,12 +23,12 @@ fn prefix_ranges() {
     assert!(!r.contains(b"user0"));
     assert!(!r.contains(b"user"));
     // Trailing 0xff bytes carry.
-    let r = KeyRange::prefix(Bytes::from_static(b"a\xff"));
+    let r = KeyRange::prefix(b"a\xff".to_vec());
     assert!(r.contains(b"a\xff\x00"));
     assert!(!r.contains(b"b"));
-    assert_eq!(r.end(), Some(&b("b")));
+    assert_eq!(r.end(), Some(&b"b"[..]));
     // Nothing follows a prefix of only 0xff bytes.
-    let r = KeyRange::prefix(Bytes::from_static(b"\xff\xff"));
+    let r = KeyRange::prefix(b"\xff\xff".to_vec());
     assert_eq!(r.end(), None);
     assert!(r.contains(b"\xff\xff\xff\xff"));
 }
@@ -49,7 +48,7 @@ fn intersection() {
 
 fn round_trip<T: shep_codec::Encode + shep_codec::Decode + PartialEq + std::fmt::Debug>(v: &T) {
     assert_eq!(
-        &shep_codec::from_bytes::<T>(shep_codec::to_bytes(v)).unwrap(),
+        &shep_codec::from_bytes::<T>(&shep_codec::to_bytes(v)).unwrap(),
         v
     );
 }

@@ -9,7 +9,6 @@ mod util;
 
 use std::time::Duration;
 
-use bytes::Bytes;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use shep_storage::{Error, LogConfig, Record};
@@ -107,7 +106,7 @@ async fn run(seed: u64, ops: usize) {
                             rng.random_range(0..200)
                         };
                         let payload: Vec<u8> = (0..len).map(|_| rng.random()).collect();
-                        Record::new(index, term, rng.random(), Bytes::from(payload))
+                        Record::new(index, term, rng.random(), payload)
                     })
                     .collect();
                 log.append(batch.clone()).await.unwrap();

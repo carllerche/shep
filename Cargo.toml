@@ -44,3 +44,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 trybuild = "1"
 xxhash-rust = { version = "0.8", features = ["xxh64"] }
+
+[workspace.lints.clippy]
+# The types `clippy.toml` forbids, and why.
+disallowed_types = "deny"

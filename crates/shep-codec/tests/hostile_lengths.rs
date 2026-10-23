@@ -8,7 +8,6 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use bytes::Bytes;
 use shep_codec::{Decode, DecodeError, from_bytes};
 
 /// Records the largest single allocation.
@@ -43,9 +42,9 @@ struct Holder {
 /// Decodes `input` as a `T`, expecting failure, and checks no allocation was
 /// anywhere near what the prefix claimed.
 fn check<T: Decode + std::fmt::Debug>(input: &[u8]) {
-    let input = Bytes::copy_from_slice(input);
+    let input = input.to_vec();
     LARGEST.store(0, Ordering::Relaxed);
-    let result = from_bytes::<T>(input);
+    let result = from_bytes::<T>(&input);
     let largest = LARGEST.load(Ordering::Relaxed);
     assert!(
         matches!(result, Err(DecodeError::UnexpectedEnd { .. })),
@@ -69,7 +68,7 @@ fn hostile_length_prefixes() {
 
     for input in [&max[..], &some[..]] {
         check::<String>(input);
-        check::<Bytes>(input);
+        check::<Vec<u8>>(input);
         check::<Vec<u8>>(input);
         check::<Vec<u64>>(input);
         check::<Vec<[u64; 64]>>(input);

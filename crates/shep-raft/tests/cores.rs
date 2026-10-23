@@ -80,7 +80,7 @@ async fn fewer_cores_than_host_groups_is_refused() {
         .with_state_machine(G1, |sm| sm.entries.clone())
         .await
         .unwrap();
-    assert_eq!(entries, vec!["kept", "more"]);
+    assert_eq!(entries, vec![b"kept".to_vec(), b"more".to_vec()]);
     stop(node).await;
 
     // Core 2 never hosted a group, so it can go again.

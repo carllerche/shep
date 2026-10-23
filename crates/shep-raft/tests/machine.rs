@@ -6,7 +6,6 @@ mod support;
 
 use std::time::Duration;
 
-use bytes::Bytes;
 use shep_raft::{Fetched, GroupId, ProposeError, RecordKind, Resolution};
 use support::*;
 
@@ -25,8 +24,8 @@ async fn propose(
             .node(leader)
             .propose(
                 G1,
-                key.map(|k| Bytes::from_static(k.as_bytes())),
-                Bytes::from_static(payload.as_bytes()),
+                key.map(|k| k.as_bytes().to_vec()),
+                payload.as_bytes().to_vec(),
             )
             .await;
         match r {
@@ -53,7 +52,10 @@ async fn refused_proposals_append_nothing() {
     let b = propose(&cluster, None, "b").await.unwrap();
     assert_eq!(b.index, a.index + 1);
     for n in 0..3 {
-        assert_eq!(cluster.applied(n, G1, 2).await, vec!["a", "b"]);
+        assert_eq!(
+            cluster.applied(n, G1, 2).await,
+            vec![b"a".to_vec(), b"b".to_vec()]
+        );
     }
     cluster.shutdown().await;
 }
@@ -100,7 +102,10 @@ async fn keys_are_decided_once() {
     let fresh = propose(&cluster, Some("j"), "five").await.unwrap();
     assert!(!fresh.replayed && fresh.index > first.index);
     for n in 0..3 {
-        assert_eq!(cluster.applied(n, G1, 2).await, vec!["one", "five"]);
+        assert_eq!(
+            cluster.applied(n, G1, 2).await,
+            vec![b"one".to_vec(), b"five".to_vec()]
+        );
     }
     cluster.shutdown().await;
 }
@@ -179,7 +184,7 @@ fn admitted(calls: &[Call], payload: &str) -> u64 {
         .iter()
         .rev()
         .find_map(|c| match c {
-            Call::Admit(s, p) if p == payload => Some(*s),
+            Call::Admit(s, p) if p == payload.as_bytes() => Some(*s),
             _ => None,
         })
         .unwrap()
@@ -215,7 +220,7 @@ async fn too_large_commands_are_not_appended() {
         "{calls:?}"
     );
     assert!(calls.contains(&Call::Resolve(1, Resolution::Appended(ok.index))));
-    assert_eq!(cluster.applied(0, G1, 1).await, vec!["small"]);
+    assert_eq!(cluster.applied(0, G1, 1).await, vec![b"small".to_vec()]);
     cluster.shutdown().await;
 }
 
@@ -260,11 +265,7 @@ async fn fetch_long_polls_for_committed_entries() {
     };
     assert_eq!(
         (e.command.clone(), e.key.clone(), e.commit_time_us),
-        (
-            Bytes::from_static(b"a"),
-            Some(Bytes::from_static(b"k")),
-            a.commit_time_us
-        )
+        (b"a".to_vec(), Some(b"k".to_vec()), a.commit_time_us)
     );
 
     // A fetch waiting for the next entry returns once it commits.

@@ -6,7 +6,6 @@ use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use bytes::Bytes;
 use shep_raft::{
     Admit, Decided, Entry, GroupId, GroupStatus, Machine, NodeId, ProposeError, RaftConfig,
     RaftNode, Resolution,
@@ -27,7 +26,7 @@ pub fn init_tracing() {
 /// payload with its position. It admits anything but `b"refuse"`.
 #[derive(Default)]
 pub struct Recorder {
-    pub entries: Vec<Bytes>,
+    pub entries: Vec<Vec<u8>>,
     pub calls: Vec<Call>,
 }
 
@@ -35,20 +34,20 @@ pub struct Recorder {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Call {
     Lead { term: u64, floor: u64 },
-    Replay(u64, Bytes),
-    Admit(u64, Bytes),
+    Replay(u64, Vec<u8>),
+    Admit(u64, Vec<u8>),
     Resolve(u64, Resolution),
 }
 
 impl Machine for Recorder {
-    type Proposal = Bytes;
-    type Command = Bytes;
+    type Proposal = Vec<u8>;
+    type Command = Vec<u8>;
     type Rejection = String;
     type Response = u64;
 
-    fn admit(&mut self, admit: &Admit, proposal: Bytes) -> Result<Bytes, String> {
+    fn admit(&mut self, admit: &Admit, proposal: Vec<u8>) -> Result<Vec<u8>, String> {
         self.calls.push(Call::Admit(admit.seq, proposal.clone()));
-        if proposal == "refuse" {
+        if proposal == b"refuse" {
             return Err("refused".into());
         }
         Ok(proposal)
@@ -58,7 +57,7 @@ impl Machine for Recorder {
         self.calls.push(Call::Lead { term, floor });
     }
 
-    fn replay(&mut self, entry: &Entry<Bytes>) {
+    fn replay(&mut self, entry: &Entry<Vec<u8>>) {
         self.calls
             .push(Call::Replay(entry.index, entry.command.clone()));
     }
@@ -67,26 +66,26 @@ impl Machine for Recorder {
         self.calls.push(Call::Resolve(seq, resolution));
     }
 
-    fn apply(&mut self, entry: &Entry<Bytes>) -> u64 {
+    fn apply(&mut self, entry: &Entry<Vec<u8>>) -> u64 {
         self.entries.push(entry.command.clone());
         self.entries.len() as u64
     }
 
-    fn snapshot(&self) -> Bytes {
+    fn snapshot(&self) -> Vec<u8> {
         let mut out = Vec::new();
         for e in &self.entries {
             out.extend_from_slice(&(e.len() as u32).to_le_bytes());
             out.extend_from_slice(e);
         }
-        out.into()
+        out
     }
 
-    fn restore(&mut self, snapshot: Bytes) {
+    fn restore(&mut self, snapshot: Vec<u8>) {
         self.entries.clear();
         let mut b = &snapshot[..];
         while b.len() >= 4 {
             let n = u32::from_le_bytes(b[..4].try_into().unwrap()) as usize;
-            self.entries.push(Bytes::copy_from_slice(&b[4..4 + n]));
+            self.entries.push(b[4..4 + n].to_vec());
             b = &b[4 + n..];
         }
     }
@@ -221,7 +220,7 @@ impl Cluster {
     }
 
     /// Writes through the current leader, following redirects.
-    pub async fn write(&self, group: GroupId, payload: impl Into<Bytes>) -> Decided<u64> {
+    pub async fn write(&self, group: GroupId, payload: impl Into<Vec<u8>>) -> Decided<u64> {
         let payload = payload.into();
         for _ in 0..200 {
             let leader = self.leader(group).await;
@@ -249,7 +248,7 @@ impl Cluster {
     }
 
     /// Node `i`'s applied entries of `group`, once it has applied `n`.
-    pub async fn applied(&self, i: usize, group: GroupId, n: usize) -> Vec<Bytes> {
+    pub async fn applied(&self, i: usize, group: GroupId, n: usize) -> Vec<Vec<u8>> {
         for _ in 0..1500 {
             let entries = self
                 .node(i)

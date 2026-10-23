@@ -1,6 +1,5 @@
 //! Raft's messages between nodes, on shep-rpc.
 
-use bytes::Bytes;
 use shep_codec::{Decode, Encode};
 use shep_rpc::method_id;
 
@@ -117,7 +116,7 @@ pub(crate) struct SnapshotRequest {
     pub group: GroupId,
     pub vote: WireVote,
     pub meta: WireSnapshotMeta,
-    pub data: Bytes,
+    pub data: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Encode, Decode)]

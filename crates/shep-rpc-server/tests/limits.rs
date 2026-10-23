@@ -3,7 +3,6 @@
 
 mod support;
 
-use bytes::Bytes;
 use shep_rpc::wire::{DEFAULT_MAX_PAYLOAD as MAX_PAYLOAD, Header};
 use shep_rpc_client::{RpcError, Transport};
 use shep_rpc_server::ServerConfig;
@@ -35,21 +34,21 @@ async fn request_claiming_more_than_the_limit_is_refused_unread() {
 async fn client_refuses_an_oversized_request() {
     let (_server, addr, _state) = start(ServerConfig::default()).await;
     let t = Transport::connect(addr).await.unwrap();
-    let body = Bytes::from(vec![0; MAX_PAYLOAD + 1]);
+    let body = vec![0; MAX_PAYLOAD + 1];
     let reply = t.call(ECHO, body, LONG).await;
     assert!(
         matches!(reply, Err(RpcError::RequestTooLarge(n)) if n == MAX_PAYLOAD + 1),
         "{reply:?}"
     );
     // Refused before sending, so the connection is fine.
-    assert_eq!(t.call(ECHO, "ok".into(), LONG).await.unwrap(), "ok");
+    assert_eq!(t.call(ECHO, "ok".into(), LONG).await.unwrap(), b"ok");
 }
 
 #[tokio::test(flavor = "local")]
 async fn a_request_of_exactly_the_limit_is_served() {
     let (_server, addr, _state) = start(ServerConfig::default()).await;
     let t = Transport::connect(addr).await.unwrap();
-    let body = Bytes::from(vec![7; MAX_PAYLOAD]);
+    let body = vec![7; MAX_PAYLOAD];
     assert_eq!(t.call(ECHO, body.clone(), LONG).await.unwrap(), body);
 }
 
@@ -59,9 +58,9 @@ async fn a_request_of_exactly_the_limit_is_served() {
 async fn an_oversized_response_is_a_server_error() {
     let (_server, addr, _state) = start(ServerConfig::default()).await;
     let t = Transport::connect(addr).await.unwrap();
-    let reply = t.call(OVERSIZED, Bytes::new(), LONG).await;
+    let reply = t.call(OVERSIZED, Vec::<u8>::new(), LONG).await;
     assert!(matches!(reply, Err(RpcError::ServerError)), "{reply:?}");
-    assert_eq!(t.call(ECHO, "ok".into(), LONG).await.unwrap(), "ok");
+    assert_eq!(t.call(ECHO, "ok".into(), LONG).await.unwrap(), b"ok");
 }
 
 /// A response whose header claims more than the limit fails its call at

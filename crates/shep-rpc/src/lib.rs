@@ -14,11 +14,11 @@
 //! keys and values, of statuses from [`SERVICE_STATUS_MIN`] up, and the
 //! encoding of bodies.
 //!
-//! Corruption the stream can't recover from (a bad header checksum, metadata
-//! over [`MAX_METADATA`], unknown flags, a bad body checksum) closes the
-//! connection on either end, failing everything in flight on it. Everything
-//! else (malformed metadata under a good checksum, a body over the limit,
-//! unsupported compression) fails one call and keeps the connection.
+//! A frame that breaks the protocol (a bad checksum, malformed metadata or
+//! more than [`MAX_METADATA`] of it, unknown flags) closes the connection on
+//! either end, failing everything in flight on it. A well-formed frame the
+//! receiver won't serve (a body over its limit, compression it doesn't
+//! support) fails just that call; the connection carries on.
 //!
 //! Differences from Redpanda: the header is laid out differently to carry
 //! metadata and flags; its checksum covers every header byte and the
@@ -29,7 +29,7 @@ mod connection;
 mod metadata;
 pub mod wire;
 
-pub use connection::{Connection, Frame, Head, IO_BUFFER};
+pub use connection::{Connection, Error, Frame, Head, IO_BUFFER};
 pub use metadata::{Metadata, MetadataBuilder, MetadataError};
 pub use wire::{
     DEFAULT_MAX_PAYLOAD, MAX_METADATA, SERVICE_STATUS_MIN, Status, method_id, service_of,

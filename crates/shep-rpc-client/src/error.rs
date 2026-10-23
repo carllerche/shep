@@ -25,13 +25,10 @@ pub enum RpcError {
     /// unread; the connection is fine.
     #[error("response body of {0} bytes is too large")]
     ResponseTooLarge(u32),
-    /// The response was malformed (its metadata, or compression this client
-    /// doesn't support). It was skipped; the connection is fine.
-    #[error("bad response: {0}")]
-    BadResponse(String),
-    /// 400: the server found the request's metadata malformed.
-    #[error("the server found the request malformed")]
-    BadRequest,
+    /// The response was compressed in a way this client doesn't support. It
+    /// was skipped unread; the connection is fine.
+    #[error("response compressed with unsupported scheme {0}")]
+    ResponseCompression(u8),
     /// 408: the server gave up on the request, typically while shutting down.
     #[error("the server abandoned the request")]
     Abandoned,
@@ -63,7 +60,6 @@ impl RpcError {
         }
         Some(match Status::from_u32(status) {
             Some(Status::Success) => return None,
-            Some(Status::BadRequest) => RpcError::BadRequest,
             Some(Status::Abandoned) => RpcError::Abandoned,
             Some(Status::PayloadTooLarge) => RpcError::PayloadTooLarge,
             Some(Status::UnsupportedCompression) => RpcError::UnsupportedCompression,

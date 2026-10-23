@@ -8,7 +8,6 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use bytes::Bytes;
 use futures::StreamExt;
 use shep_smp::{Smp, SmpConfig};
 use shep_wal::{WalConfig, WalNode};
@@ -186,7 +185,7 @@ impl Cluster {
 
     /// Waits for every running node to see the cluster founded, and returns
     /// its ID.
-    pub async fn founded(&self) -> Bytes {
+    pub async fn founded(&self) -> Vec<u8> {
         for _ in 0..1500 {
             let mut ids = Vec::new();
             for (n, _) in self.nodes.iter().flatten() {
@@ -318,21 +317,21 @@ impl Cluster {
 // ---- proposals ----
 
 pub fn key(k: &str) -> KeyRange {
-    KeyRange::point(Bytes::copy_from_slice(k.as_bytes()))
+    KeyRange::point(k.as_bytes().to_vec())
 }
 
 pub fn prefix(k: &str) -> KeyRange {
-    KeyRange::prefix(Bytes::copy_from_slice(k.as_bytes()))
+    KeyRange::prefix(k.as_bytes().to_vec())
 }
 
 pub fn at(p: PartitionId, prefix: u64) -> Dvv {
     Dvv::new().with_prefix(p, prefix)
 }
 
-pub fn unique_key() -> Bytes {
+pub fn unique_key() -> Vec<u8> {
     use rand::Rng;
     let k: u128 = rand::rng().random();
-    Bytes::from(format!("{k:032x}"))
+    Vec::<u8>::from(format!("{k:032x}"))
 }
 
 /// A mutation reading `reads` and writing `writes` at `read_version`.
@@ -349,8 +348,8 @@ pub fn mutation(
             read_version,
             read_set: reads,
             write_set: writes,
-            payload: Bytes::copy_from_slice(payload.as_bytes()),
-            reply: Bytes::from_static(b"ok"),
+            payload: payload.as_bytes().to_vec(),
+            reply: b"ok".to_vec(),
         }),
     }
 }
@@ -484,7 +483,7 @@ pub struct RegisterState {
     /// a serializability violation.
     pub violations: Vec<String>,
     /// Idempotency keys of every deciding entry, in log order.
-    pub keys: Vec<Bytes>,
+    pub keys: Vec<Vec<u8>>,
 }
 
 impl Registers {

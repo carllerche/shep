@@ -5,7 +5,6 @@ mod support;
 
 use std::collections::BTreeMap;
 
-use bytes::{Bytes, BytesMut};
 use shep_codec::{Decode, DecodeError, Decoder, Encode, from_bytes, to_bytes};
 use support::{decode, reencode, round_trip};
 
@@ -120,13 +119,10 @@ fn rejects_data_requiring_a_newer_reader() {
     );
     // The boundaries are inclusive: compat == reader version and
     // version == reader compat are both readable.
-    let mut bytes = BytesMut::from(&to_bytes(&TestMsg0 { i: 1, j: 2 })[..]);
+    let mut bytes = Vec::from(&to_bytes(&TestMsg0 { i: 1, j: 2 })[..]);
     bytes[0] = 9; // version
     bytes[1] = 1; // compat version == TestMsg0's version
-    assert_eq!(
-        from_bytes::<TestMsg0>(bytes.freeze()),
-        Ok(TestMsg0 { i: 1, j: 2 })
-    );
+    assert_eq!(from_bytes::<TestMsg0>(&bytes), Ok(TestMsg0 { i: 1, j: 2 }));
 }
 
 // Adapted from envelope_test_buffer_too_short in
@@ -135,7 +131,7 @@ fn rejects_data_requiring_a_newer_reader() {
 fn rejects_envelope_shorter_than_its_size() {
     let bytes = to_bytes(&msg1());
     assert!(matches!(
-        from_bytes::<TestMsg1>(bytes.slice(..bytes.len() - 1)),
+        from_bytes::<TestMsg1>(&bytes[..bytes.len() - 1]),
         Err(DecodeError::UnexpectedEnd { .. })
     ));
 }
@@ -351,7 +347,7 @@ fn envelopes_of_differing_sizes_in_a_vec() {
     };
     let bytes = to_bytes(&msg);
     assert_eq!(msg.encoded_len(), bytes.len());
-    assert_eq!(from_bytes::<ComplexMsg>(bytes), Ok(msg));
+    assert_eq!(from_bytes::<ComplexMsg>(&bytes), Ok(msg));
 }
 
 /// Data from a newer, still-compatible writer: fields both know are read and
@@ -509,7 +505,7 @@ fn generic_structs() {
     });
     round_trip(&Wrapper(Pair {
         a: (1u8, "s".to_string()),
-        b: vec![BTreeMap::from([(1u8, Bytes::from_static(b"v"))])],
+        b: vec![BTreeMap::from([(1u8, b"v".to_vec())])],
     }));
 
     round_trip(&WithDefaultGeneric {
@@ -519,12 +515,12 @@ fn generic_structs() {
     });
     // Old data with only `t`.
     let only_t = {
-        let mut b = BytesMut::from(&[0u8, 0, 8, 0, 0, 0][..]);
+        let mut b = Vec::from(&[0u8, 0, 8, 0, 0, 0][..]);
         NodeId(5).encode(&mut b);
-        b.freeze()
+        b
     };
     assert_eq!(
-        from_bytes::<WithDefaultGeneric<NodeId>>(only_t),
+        from_bytes::<WithDefaultGeneric<NodeId>>(&only_t),
         Ok(WithDefaultGeneric {
             t: NodeId(5),
             more: vec![],
@@ -556,7 +552,7 @@ fn borrowed_fields_encode() {
     let bytes = to_bytes(&borrowed);
     assert_eq!(borrowed.encoded_len(), bytes.len());
     assert_eq!(
-        from_bytes::<Owned>(bytes),
+        from_bytes::<Owned>(&bytes),
         Ok(Owned {
             name: "b".into(),
             items: vec![1, 2]
@@ -573,7 +569,7 @@ fn custom_impls_compose() {
     struct Plus2(u32);
 
     impl Encode for Plus2 {
-        fn encode(&self, buf: &mut BytesMut) {
+        fn encode(&self, buf: &mut Vec<u8>) {
             (self.0 + 1).encode(buf);
         }
     }
@@ -638,7 +634,7 @@ fn zero_byte_fields_round_trip() {
         b: u32,
     }
     assert!(matches!(
-        from_bytes::<Later>(to_bytes(&Empty {})),
+        from_bytes::<Later>(&to_bytes(&Empty {})),
         Err(DecodeError::MissingField { field: "b", .. })
     ));
 }

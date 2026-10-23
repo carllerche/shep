@@ -43,7 +43,7 @@ impl GroupLog {
         match self.kv.get(KeySpace::RAFT, &self.key("purged")) {
             None => Ok(None),
             Some(b) => {
-                let l: WireLogId = shep_codec::from_bytes(b).map_err(invalid)?;
+                let l: WireLogId = shep_codec::from_bytes(&b).map_err(invalid)?;
                 Ok(Some(l.into()))
             }
         }
@@ -101,7 +101,7 @@ impl RaftLogReader<TypeConfig> for GroupLog {
         match self.kv.get(KeySpace::RAFT, &self.key("vote")) {
             None => Ok(None),
             Some(b) => {
-                let v: WireVote = shep_codec::from_bytes(b).map_err(invalid)?;
+                let v: WireVote = shep_codec::from_bytes(&b).map_err(invalid)?;
                 Ok(Some(v.into()))
             }
         }

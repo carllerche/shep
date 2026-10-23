@@ -15,15 +15,13 @@
 //! cores, run a server on each.
 
 use std::future::Future;
-use std::io;
 use std::panic::AssertUnwindSafe;
 use std::rc::Rc;
 use std::time::Duration;
 
-use bytes::Bytes;
 use futures::FutureExt;
 use shep_rpc::wire::{COMPRESSION_NONE, DEFAULT_MAX_PAYLOAD, Header};
-use shep_rpc::{Connection, Frame, IO_BUFFER};
+use shep_rpc::{Connection, Error, Frame, Head, IO_BUFFER};
 use shep_rpc::{Metadata, Status};
 use tokio::io::{BufReader, BufWriter};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
@@ -60,7 +58,7 @@ pub struct Request {
     pub version: u8,
     pub method: u32,
     pub metadata: Metadata,
-    pub body: Bytes,
+    pub body: Vec<u8>,
 }
 
 /// A handler's answer. The body is sent only with [`Status::Success`]; other
@@ -69,11 +67,11 @@ pub struct Request {
 pub struct Response {
     pub status: u32,
     pub metadata: Metadata,
-    pub body: Bytes,
+    pub body: Vec<u8>,
 }
 
 impl Response {
-    pub fn ok(body: impl Into<Bytes>) -> Response {
+    pub fn ok(body: impl Into<Vec<u8>>) -> Response {
         Response {
             status: Status::Success.as_u32(),
             metadata: Metadata::empty(),
@@ -88,7 +86,7 @@ impl Response {
         Response {
             status,
             metadata: Metadata::empty(),
-            body: Bytes::new(),
+            body: Vec::<u8>::new(),
         }
     }
 
@@ -301,27 +299,13 @@ impl<S: Service> Server<S> {
         &self,
         frames: &mut Requests,
         tx: &mpsc::UnboundedSender<Frame>,
-    ) -> io::Result<()> {
+    ) -> Result<(), Error> {
         let shared = &self.shared;
         loop {
             let Some(head) = frames.next_head().await? else {
                 return Ok(());
             };
-            let header = head.header;
-            let metadata = match head.metadata {
-                Ok(metadata) => metadata,
-                Err(e) => {
-                    tracing::debug!(error = %e, "rpc request metadata malformed");
-                    refuse(
-                        frames,
-                        tx,
-                        &header,
-                        Response::error(Status::BadRequest.as_u32()),
-                    )
-                    .await?;
-                    continue;
-                }
-            };
+            let Head { header, metadata } = head;
             if header.compression != COMPRESSION_NONE {
                 refuse(
                     frames,
@@ -385,10 +369,10 @@ impl<S: Service> Server<S> {
                             bytes = response.body.len(),
                             "rpc response larger than the limit"
                         );
-                        (Status::ServerError.as_u32(), Bytes::new())
+                        (Status::ServerError.as_u32(), Vec::<u8>::new())
                     }
                     status if status == ok => (status, response.body),
-                    status => (status, Bytes::new()),
+                    status => (status, Vec::<u8>::new()),
                 };
                 let _ = tx.send(reply(&header, status, response.metadata, body));
             });
@@ -403,12 +387,12 @@ async fn refuse(
     tx: &mpsc::UnboundedSender<Frame>,
     header: &Header,
     response: Response,
-) -> io::Result<()> {
+) -> Result<(), Error> {
     let _ = tx.send(reply(
         header,
         response.status,
         response.metadata,
-        Bytes::new(),
+        Vec::<u8>::new(),
     ));
     frames.skip_body().await
 }
@@ -419,7 +403,7 @@ async fn refuse(
 async fn write_responses(
     mut rx: mpsc::UnboundedReceiver<Frame>,
     mut responses: Responses,
-) -> io::Result<()> {
+) -> Result<(), Error> {
     while let Some(frame) = rx.recv().await {
         responses.queue(frame);
         while responses.queued() < MAX_BATCH {
@@ -434,7 +418,7 @@ async fn write_responses(
 }
 
 /// The response to the request `header` heads, at the request's version.
-fn reply(header: &Header, status: u32, metadata: Metadata, body: Bytes) -> Frame {
+fn reply(header: &Header, status: u32, metadata: Metadata, body: Vec<u8>) -> Frame {
     Frame::new(
         header.version,
         status,

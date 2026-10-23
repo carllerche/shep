@@ -1,6 +1,5 @@
 use std::collections::BTreeMap;
 
-use bytes::Bytes;
 use shep_raft::{Admit, Entry, Machine};
 use shep_wal_api::PartitionId;
 use shep_wal_controller::*;
@@ -24,7 +23,7 @@ fn founded(n: u64) -> ControllerState {
             &rules(),
             1,
             Command::Found {
-                cluster_id: Bytes::from_static(b"c"),
+                cluster_id: b"c".to_vec(),
                 members
             }
         ),
@@ -50,7 +49,7 @@ fn founding_records_the_members_once() {
         &rules(),
         2,
         Command::Found {
-            cluster_id: Bytes::from_static(b"d"),
+            cluster_id: b"d".to_vec(),
             members: vec![node(9)],
         },
     );
@@ -185,7 +184,7 @@ fn the_machine_admits_applies_and_snapshots() {
         .admit(
             &admit(),
             Proposal::Found {
-                cluster_id: Bytes::from_static(b"c"),
+                cluster_id: b"c".to_vec(),
                 members: vec![node(1), node(2)],
             },
         )

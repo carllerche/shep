@@ -7,7 +7,6 @@ use std::net::SocketAddr;
 use std::rc::Rc;
 use std::time::Duration;
 
-use bytes::Bytes;
 use tokio::time::Instant;
 
 use crate::error::RpcError;
@@ -139,9 +138,9 @@ impl ReconnectTransport {
     pub async fn call(
         &self,
         method: u32,
-        body: Bytes,
+        body: Vec<u8>,
         timeout: Duration,
-    ) -> Result<Bytes, RpcError> {
+    ) -> Result<Vec<u8>, RpcError> {
         self.get_connected()
             .await?
             .call(method, body, timeout)
@@ -200,9 +199,9 @@ impl ConnectionCache {
         &self,
         addr: SocketAddr,
         method: u32,
-        body: Bytes,
+        body: Vec<u8>,
         timeout: Duration,
-    ) -> Result<Bytes, RpcError> {
+    ) -> Result<Vec<u8>, RpcError> {
         self.get(addr).call(method, body, timeout).await
     }
 

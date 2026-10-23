@@ -5,7 +5,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
-use bytes::Bytes;
 use shep_raft::{ProposeError, RaftNodeError};
 use shep_smp::CoreId;
 use shep_wal_api::{Member, PartitionId};
@@ -218,7 +217,7 @@ impl WalNode {
             )
             .await
             .map_err(|e| e.to_string())?;
-        shep_codec::from_bytes(body).map_err(|e| e.to_string())
+        shep_codec::from_bytes(&body).map_err(|e| e.to_string())
     }
 
     /// If this node leads the initialized, unfounded controller, appends the
@@ -231,7 +230,7 @@ impl WalNode {
                 if !g.leadership().is_leader {
                     return;
                 }
-                let cluster_id = Bytes::from(rand::random::<[u8; 16]>().to_vec());
+                let cluster_id = rand::random::<[u8; 16]>().to_vec();
                 let proposal = GroupProposal::Controller(Proposal::Found {
                     cluster_id,
                     members,

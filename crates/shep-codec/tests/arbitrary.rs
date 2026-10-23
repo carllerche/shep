@@ -21,7 +21,6 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Debug;
 use std::sync::Arc;
 
-use bytes::Bytes;
 use hegel::TestCase;
 use hegel::generators as gs;
 use shep_codec::{
@@ -38,7 +37,7 @@ struct Record {
     id: u64,
     flag: bool,
     name: String,
-    payload: Bytes,
+    payload: Vec<u8>,
     tags: BTreeMap<String, Vec<u16>>,
     set: BTreeSet<i64>,
     pair: (u8, Option<i16>),
@@ -52,7 +51,7 @@ struct Record {
 #[derive(Encode, Decode, Debug, Clone, PartialEq)]
 enum Event {
     Ping,
-    Data(Bytes),
+    Data(Vec<u8>),
     Move {
         from: (i8, i8),
         to: (i8, i8),
@@ -115,9 +114,9 @@ macro_rules! canonical {
 }
 
 canonical!(true =>
-    u8, u64, i16, bool, String, Bytes, Vec<u8>, Vec<String>, Option<u32>,
+    u8, u64, i16, bool, String, Vec<u8>, Box<[u8]>, Vec<String>, Option<u32>,
     (u8, bool, Option<i16>), [u16; 3], [u8; 0], Vec<[u8; 0]>,
-    Option<Box<Vec<Bytes>>>, Id, Nothing,
+    Option<Box<Vec<Vec<u8>>>>, Id, Nothing,
 );
 canonical!(false =>
     Record, Event, ZeroByteFields, Empty, ZeroByteElements, Shared,
@@ -125,20 +124,20 @@ canonical!(false =>
 );
 
 /// Decodes `input` as a `T` and checks what a successful decode promises.
-fn check<T>(input: &Bytes)
+fn check<T>(input: &[u8])
 where
     T: Encode + Decode + Canonical + PartialEq + Debug,
 {
-    let mut d = Decoder::with_limits(input.clone(), LIMITS);
+    let mut d = Decoder::with_limits(input, LIMITS);
     let Ok(value) = T::decode(&mut d) else {
         return;
     };
-    let read = input.slice(..input.len() - d.remaining());
+    let read = &input[..input.len() - d.remaining()];
     let type_name = std::any::type_name::<T>();
 
     // What it read stands alone: nothing it consumed belongs to what follows.
     assert_eq!(
-        from_bytes_with::<T>(read.clone(), LIMITS).as_ref(),
+        from_bytes_with::<T>(read, LIMITS).as_ref(),
         Ok(&value),
         "{type_name}: the bytes read don't decode alone"
     );
@@ -146,7 +145,7 @@ where
     let encoded = to_bytes(&value);
     assert_eq!(value.encoded_len(), encoded.len(), "{type_name}: {value:?}");
     assert_eq!(
-        from_bytes_with::<T>(encoded.clone(), LIMITS).as_ref(),
+        from_bytes_with::<T>(&encoded.clone(), LIMITS).as_ref(),
         Ok(&value),
         "{type_name} doesn't round-trip"
     );
@@ -154,18 +153,18 @@ where
         assert_eq!(encoded, read, "{type_name}: {value:?} has two encodings");
     }
     for n in 0..read.len() {
-        let prefix = from_bytes_with::<T>(read.slice(..n), LIMITS);
+        let prefix = from_bytes_with::<T>(&read[..n], LIMITS);
         assert!(prefix.is_err(), "{type_name}: {n}-byte prefix decoded");
     }
 }
 
-fn check_all(input: &Bytes) {
+fn check_all(input: &[u8]) {
     check::<u8>(input);
     check::<u64>(input);
     check::<i16>(input);
     check::<bool>(input);
     check::<String>(input);
-    check::<Bytes>(input);
+    check::<Vec<u8>>(input);
     check::<Vec<u8>>(input);
     check::<Vec<String>>(input);
     check::<Option<u32>>(input);
@@ -173,7 +172,7 @@ fn check_all(input: &Bytes) {
     check::<[u16; 3]>(input);
     check::<[u8; 0]>(input);
     check::<Vec<[u8; 0]>>(input);
-    check::<Option<Box<Vec<Bytes>>>>(input);
+    check::<Option<Box<Vec<Vec<u8>>>>>(input);
     check::<Id>(input);
     check::<Nothing>(input);
     check::<Record>(input);
@@ -190,7 +189,7 @@ fn check_all(input: &Bytes) {
 #[hegel::test(test_cases = 300)]
 fn raw_bytes(tc: TestCase) {
     let input = tc.draw(gs::binary().max_size(64));
-    check_all(&Bytes::from(input));
+    check_all(&input);
 }
 
 /// Bytes built from the format's pieces.
@@ -259,15 +258,15 @@ fn wire(tc: &TestCase, depth: u32) -> Vec<u8> {
 #[hegel::test(test_cases = 300)]
 fn structured_bytes(tc: TestCase) {
     let input = wire(&tc, 4);
-    check_all(&Bytes::from(input));
+    check_all(&input);
 }
 
-fn samples() -> Vec<Bytes> {
+fn samples() -> Vec<Vec<u8>> {
     let leaf = Record {
         id: 9,
         flag: true,
         name: "leaf".into(),
-        payload: Bytes::from_static(b"xyz"),
+        payload: b"xyz".to_vec(),
         tags: BTreeMap::from([("t".into(), vec![1, 2])]),
         set: BTreeSet::from([-1, 5]),
         pair: (3, Some(-4)),
@@ -279,7 +278,7 @@ fn samples() -> Vec<Bytes> {
     let root = Record {
         name: "root".into(),
         events: vec![
-            Event::Data(Bytes::from_static(b"d")),
+            Event::Data(b"d".to_vec()),
             Event::Move {
                 from: (1, 2),
                 to: (-3, 4),
@@ -341,7 +340,7 @@ fn mutated_encodings(tc: TestCase) {
             }
         }
     }
-    check_all(&Bytes::from(input));
+    check_all(&input);
 }
 
 /// An envelope is read exactly when its versions say this definition may
@@ -353,7 +352,7 @@ fn envelope_versions(tc: TestCase) {
         id: 1,
         flag: false,
         name: String::new(),
-        payload: Bytes::new(),
+        payload: Vec::<u8>::new(),
         tags: BTreeMap::new(),
         set: BTreeSet::new(),
         pair: (0, None),
@@ -367,7 +366,7 @@ fn envelope_versions(tc: TestCase) {
     let compat = tc.draw(gs::integers::<u8>());
     input[0] = version;
     input[1] = compat;
-    let decoded = from_bytes_with::<Record>(Bytes::from(input), LIMITS);
+    let decoded = from_bytes_with::<Record>(&input, LIMITS);
     let readable = compat <= 3 && version >= 1;
     match decoded {
         Ok(_) => assert!(readable, "read data at version {version}, compat {compat}"),
@@ -384,7 +383,7 @@ fn envelope_versions(tc: TestCase) {
 fn zero_byte_elements_are_bounded() {
     fn at_limit<T: Decode + Debug>(input: &[u8]) {
         assert_eq!(
-            from_bytes_with::<T>(Bytes::copy_from_slice(input), LIMITS).map(|_| ()),
+            from_bytes_with::<T>(input, LIMITS).map(|_| ()),
             Err(DecodeError::LimitExceeded {
                 limit: LIMITS.max_memory
             }),
@@ -408,13 +407,13 @@ fn the_budget_spans_the_whole_value() {
     let half = "x".repeat(LIMITS.max_memory / 2 + 1);
     let pair = to_bytes(&(half.clone(), half.clone()));
     assert_eq!(
-        from_bytes_with::<(String, String)>(pair.clone(), LIMITS),
+        from_bytes_with::<(String, String)>(&pair.clone(), LIMITS),
         Err(DecodeError::LimitExceeded {
             limit: LIMITS.max_memory
         })
     );
     assert_eq!(
-        from_bytes::<(String, String)>(pair),
+        from_bytes::<(String, String)>(&pair),
         Ok((half.clone(), half))
     );
 }

@@ -1013,7 +1013,6 @@ dependencies = [
 name = "shep-codec"
 version = "0.1.0"
 dependencies = [
- "bytes",
  "hegeltest",
  "rand 0.9.5",
  "shep-codec-derive",
@@ -1048,7 +1047,6 @@ dependencies = [
 name = "shep-raft"
 version = "0.1.0"
 dependencies = [
- "bytes",
  "futures",
  "rand 0.9.5",
  "serde",
@@ -1138,7 +1136,6 @@ dependencies = [
 name = "shep-rpc"
 version = "0.1.0"
 dependencies = [
- "bytes",
  "crc32c",
  "hegeltest",
  "thiserror",
@@ -1150,7 +1147,6 @@ dependencies = [
 name = "shep-rpc-client"
 version = "0.1.0"
 dependencies = [
- "bytes",
  "futures",
  "rand 0.9.5",
  "shep-rpc",
@@ -1164,7 +1160,6 @@ dependencies = [
 name = "shep-rpc-server"
 version = "0.1.0"
 dependencies = [
- "bytes",
  "futures",
  "rand 0.9.5",
  "shep-rpc",
@@ -1189,7 +1184,6 @@ dependencies = [
 name = "shep-storage"
 version = "0.1.0"
 dependencies = [
- "bytes",
  "crc32c",
  "futures",
  "rand 0.9.5",
@@ -1203,7 +1197,6 @@ dependencies = [
 name = "shep-version"
 version = "0.1.0"
 dependencies = [
- "bytes",
  "rand 0.9.5",
  "shep-codec",
 ]
@@ -1212,7 +1205,6 @@ dependencies = [
 name = "shep-wal"
 version = "0.1.0"
 dependencies = [
- "bytes",
  "futures",
  "hegeltest",
  "rand 0.9.5",
@@ -1236,7 +1228,6 @@ dependencies = [
 name = "shep-wal-api"
 version = "0.1.0"
 dependencies = [
- "bytes",
  "shep-codec",
  "shep-rpc",
  "shep-version",
@@ -1247,7 +1238,6 @@ dependencies = [
 name = "shep-wal-client"
 version = "0.1.0"
 dependencies = [
- "bytes",
  "futures",
  "shep-codec",
  "shep-rpc-client",
@@ -1263,7 +1253,6 @@ dependencies = [
 name = "shep-wal-controller"
 version = "0.1.0"
 dependencies = [
- "bytes",
  "shep-codec",
  "shep-raft",
  "shep-rpc",
@@ -1382,7 +1371,6 @@ dependencies = [
 name = "test-node"
 version = "0.1.0"
 dependencies = [
- "bytes",
  "futures",
  "rand 0.9.5",
  "shep-wal-client",

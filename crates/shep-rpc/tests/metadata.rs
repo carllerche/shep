@@ -8,7 +8,6 @@
 
 use std::collections::BTreeMap;
 
-use bytes::Bytes;
 use hegel::TestCase;
 use hegel::generators as gs;
 use shep_rpc::{MAX_METADATA, Metadata, MetadataBuilder, MetadataError};
@@ -37,7 +36,7 @@ fn model(bytes: &[u8]) -> Option<Vec<(u16, Vec<u8>)>> {
 }
 
 fn check(bytes: &[u8], probes: &[u16]) {
-    let parsed = Metadata::parse(Bytes::copy_from_slice(bytes));
+    let parsed = Metadata::parse(bytes.to_vec());
     match (model(bytes), parsed) {
         (None, Err(_)) => {}
         (Some(entries), Ok(metadata)) => {
@@ -111,7 +110,7 @@ fn builder_round_trips(tc: TestCase) {
         want.insert(key, value);
     }
     let metadata = builder.build().unwrap();
-    let parsed = Metadata::parse(metadata.as_bytes().clone()).unwrap();
+    let parsed = Metadata::parse(metadata.as_bytes().to_vec()).unwrap();
     assert_eq!(parsed, metadata);
     let got: Vec<(u16, Vec<u8>)> = parsed.iter().map(|(k, v)| (k, v.to_vec())).collect();
     let want: Vec<(u16, Vec<u8>)> = want.into_iter().collect();
@@ -136,10 +135,10 @@ fn limits() {
         MetadataBuilder::new().insert(1, vec![0; 70_000]).build(),
         Err(MetadataError::ValueTooLarge(70_000))
     );
-    let over = Bytes::from(vec![0; MAX_METADATA + 4]);
+    let over = vec![0; MAX_METADATA + 4];
     assert_eq!(
         Metadata::parse(over),
         Err(MetadataError::TooLarge(MAX_METADATA + 4))
     );
-    assert!(Metadata::parse(Bytes::new()).unwrap().is_empty());
+    assert!(Metadata::parse(Vec::<u8>::new()).unwrap().is_empty());
 }

@@ -4,7 +4,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::io;
 
-use bytes::Bytes;
 use shep_codec::{Decode, Encode};
 use shep_raft_engine::impls::BasicNode;
 use shep_raft_engine::impls::leader_id_std;
@@ -27,7 +26,7 @@ shep_raft_engine::declare_raft_types!(
 /// An entry's application payload, and a state machine's response to it:
 /// opaque to Raft.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
-pub struct Payload(pub Bytes);
+pub struct Payload(pub Vec<u8>);
 
 // The engine requires serde when its `serde` feature is on, which happens
 // whenever its test-support crates are built alongside.
@@ -40,7 +39,7 @@ impl serde::Serialize for Payload {
 impl<'de> serde::Deserialize<'de> for Payload {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Payload, D::Error> {
         let v: Vec<u8> = serde::Deserialize::deserialize(d)?;
-        Ok(Payload(v.into()))
+        Ok(Payload(v))
     }
 }
 
@@ -60,7 +59,7 @@ pub type AppendResponse = shep_raft_engine::raft::AppendEntriesResponse<TypeConf
 pub type RaftMembership = Membership<u64, BasicNode>;
 pub type StoredMembership = shep_raft_engine::StoredMembership<CommittedLeaderId, u64, BasicNode>;
 pub type RaftSnapshot =
-    shep_raft_engine::storage::Snapshot<CommittedLeaderId, u64, BasicNode, Bytes>;
+    shep_raft_engine::storage::Snapshot<CommittedLeaderId, u64, BasicNode, Vec<u8>>;
 pub type SnapshotMeta = shep_raft_engine::SnapshotMeta<CommittedLeaderId, u64, BasicNode>;
 
 /// A Raft group: a partition's or the controller's replicated log.
@@ -85,7 +84,7 @@ const MEMBERSHIP: u8 = 2;
 
 pub(crate) fn entry_to_record(e: &Entry) -> Record {
     let (kind, payload) = match &e.payload {
-        EntryPayload::Blank => (BLANK, Bytes::new()),
+        EntryPayload::Blank => (BLANK, Vec::<u8>::new()),
         EntryPayload::Normal(d) => (NORMAL, d.0.clone()),
         EntryPayload::Membership(m) => (MEMBERSHIP, shep_codec::to_bytes(&WireMembership::from(m))),
     };
@@ -97,7 +96,7 @@ pub(crate) fn record_to_entry(r: Record) -> io::Result<Entry> {
         BLANK => EntryPayload::Blank,
         NORMAL => EntryPayload::Normal(Payload(r.payload)),
         MEMBERSHIP => {
-            let m: WireMembership = shep_codec::from_bytes(r.payload).map_err(invalid)?;
+            let m: WireMembership = shep_codec::from_bytes(&r.payload).map_err(invalid)?;
             EntryPayload::Membership(m.into_membership()?)
         }
         k => return Err(invalid(format!("unknown entry kind {k}"))),
@@ -201,7 +200,7 @@ pub(crate) struct WireEntry {
     pub term: u64,
     pub index: u64,
     pub kind: u8,
-    pub payload: Bytes,
+    pub payload: Vec<u8>,
 }
 
 impl From<&Entry> for WireEntry {

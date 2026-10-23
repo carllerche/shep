@@ -10,7 +10,6 @@ use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
-use bytes::Bytes;
 use hegel::TestCase;
 use hegel::generators as gs;
 use shep_codec::{Decode, Decoder, Encode, Limits};
@@ -79,10 +78,10 @@ enum Amplified {
 
 /// Decodes `input` as a `T` under the limit and checks the most it held at
 /// once.
-fn check<T: Decode>(input: &Bytes) {
+fn check<T: Decode>(input: &[u8]) {
     let before = LIVE.get();
     PEAK.set(before);
-    let mut d = Decoder::with_limits(input.clone(), Limits { max_memory: LIMIT });
+    let mut d = Decoder::with_limits(input, Limits { max_memory: LIMIT });
     let decoded = T::decode(&mut d);
     let held = PEAK.get() - before;
     drop(decoded);
@@ -122,10 +121,9 @@ fn decoding_stays_within_the_limit(tc: TestCase) {
     let mut input = vec![0, 0];
     input.extend((body.len() as u32).to_le_bytes());
     input.extend(body);
-    let input = Bytes::from(input);
 
     check::<Amplified>(&input);
-    check::<Vec<String>>(&input.slice(7..));
-    check::<Vec<BTreeMap<u8, u8>>>(&input.slice(7..));
-    check::<Vec<Vec<Nothing>>>(&input.slice(7..));
+    check::<Vec<String>>(&input[7..]);
+    check::<Vec<BTreeMap<u8, u8>>>(&input[7..]);
+    check::<Vec<Vec<Nothing>>>(&input[7..]);
 }

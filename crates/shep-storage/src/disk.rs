@@ -15,7 +15,6 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 
-use bytes::Bytes;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 
 type Job = Box<dyn FnOnce() + Send>;
@@ -167,7 +166,7 @@ impl Disk {
         file: &Arc<DiskFile>,
         pos: u64,
         len: usize,
-    ) -> io::Result<Bytes> {
+    ) -> io::Result<Vec<u8>> {
         let file = file.clone();
         self.run(move || {
             let mut buf = vec![0; len];
@@ -179,7 +178,7 @@ impl Disk {
                 }
             }
             buf.truncate(done);
-            Ok(Bytes::from(buf))
+            Ok(buf)
         })
         .await
     }

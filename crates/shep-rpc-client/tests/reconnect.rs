@@ -50,7 +50,7 @@ fn default_backoff_matches_redpanda() {
 async fn reconnects_after_server_restart() {
     let (server, addr, _) = start(ServerConfig::default()).await;
     let peer = ReconnectTransport::new(addr, config(50, 200));
-    assert_eq!(peer.call(ECHO, "one".into(), LONG).await.unwrap(), "one");
+    assert_eq!(peer.call(ECHO, "one".into(), LONG).await.unwrap(), b"one");
 
     let old = peer.get_connected().await.unwrap();
     server.shutdown(LONG).await;
@@ -64,7 +64,7 @@ async fn reconnects_after_server_restart() {
 
     let (_server, _) = start_on(ServerConfig::default(), rebind(addr).await);
     tokio::time::sleep(Duration::from_millis(80)).await;
-    assert_eq!(peer.call(ECHO, "two".into(), LONG).await.unwrap(), "two");
+    assert_eq!(peer.call(ECHO, "two".into(), LONG).await.unwrap(), b"two");
 }
 
 /// While backing off, calls fail fast without trying to connect; the
@@ -116,7 +116,7 @@ async fn reset_backoff_retries_immediately() {
     let (_server, _) = start_on(ServerConfig::default(), rebind(addr).await);
     assert!(matches!(peer.get_connected().await, Err(RpcError::Backoff)));
     peer.reset_backoff();
-    assert_eq!(peer.call(ECHO, "back".into(), LONG).await.unwrap(), "back");
+    assert_eq!(peer.call(ECHO, "back".into(), LONG).await.unwrap(), b"back");
 }
 
 /// Concurrent callers share one connection.
@@ -132,7 +132,7 @@ async fn concurrent_callers_share_a_connection() {
         .into_iter()
         .enumerate()
     {
-        assert_eq!(reply.unwrap(), format!("{i}"));
+        assert_eq!(reply.unwrap(), format!("{i}").into_bytes());
     }
     let a = peer.get_connected().await.unwrap();
     let b = peer.get_connected().await.unwrap();
@@ -154,7 +154,7 @@ async fn disconnect_then_reconnect() {
     assert!(matches!(pending.await, Err(RpcError::Disconnected)));
     assert_eq!(
         peer.call(ECHO, "again".into(), LONG).await.unwrap(),
-        "again"
+        b"again"
     );
 }
 
@@ -169,11 +169,11 @@ async fn connection_cache() {
     for _ in 0..10 {
         assert_eq!(
             cache.call(addr_a, ECHO, "a".into(), LONG).await.unwrap(),
-            "a"
+            b"a"
         );
         assert_eq!(
             cache.call(addr_b, ECHO, "b".into(), LONG).await.unwrap(),
-            "b"
+            b"b"
         );
     }
     assert!(std::rc::Rc::ptr_eq(&cache.get(addr_a), &cache.get(addr_a)));
@@ -185,7 +185,7 @@ async fn connection_cache() {
     // Asking again makes a fresh entry.
     assert_eq!(
         cache.call(addr_a, ECHO, "a".into(), LONG).await.unwrap(),
-        "a"
+        b"a"
     );
 }
 

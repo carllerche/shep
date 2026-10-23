@@ -13,8 +13,6 @@
 //! All little-endian. Records are concatenated; an all-zero header marks the
 //! end of the log, which is what preallocated space reads as.
 
-use bytes::Bytes;
-
 /// Bytes of framing before each payload.
 pub const HEADER_LEN: usize = 29;
 
@@ -24,11 +22,11 @@ pub struct Record {
     pub index: u64,
     pub term: u64,
     pub kind: u8,
-    pub payload: Bytes,
+    pub payload: Vec<u8>,
 }
 
 impl Record {
-    pub fn new(index: u64, term: u64, kind: u8, payload: impl Into<Bytes>) -> Record {
+    pub fn new(index: u64, term: u64, kind: u8, payload: impl Into<Vec<u8>>) -> Record {
         Record {
             index,
             term,
@@ -108,8 +106,8 @@ pub(crate) fn parse_header(buf: &[u8]) -> Result<Option<Header>, &'static str> {
     }))
 }
 
-/// Parses the record at the start of `buf`, sharing its payload.
-pub(crate) fn parse(buf: &Bytes) -> Parsed {
+/// Parses the record at the start of `buf`, copying its payload out.
+pub(crate) fn parse(buf: &[u8]) -> Parsed {
     if buf.len() < HEADER_LEN {
         return Parsed::Short(HEADER_LEN);
     }
@@ -122,8 +120,8 @@ pub(crate) fn parse(buf: &Bytes) -> Parsed {
     if buf.len() < len {
         return Parsed::Short(len);
     }
-    let payload = buf.slice(HEADER_LEN..len);
-    if crc32c::crc32c(&payload) != h.payload_crc {
+    let payload = &buf[HEADER_LEN..len];
+    if crc32c::crc32c(payload) != h.payload_crc {
         return Parsed::Corrupt("payload checksum mismatch");
     }
     Parsed::Record(
@@ -131,7 +129,7 @@ pub(crate) fn parse(buf: &Bytes) -> Parsed {
             index: h.index,
             term: h.term,
             kind: h.kind,
-            payload,
+            payload: payload.to_vec(),
         },
         len,
     )

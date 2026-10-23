@@ -16,7 +16,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use bytes::Bytes;
 use futures::Stream;
 use futures::stream::{FuturesOrdered, StreamExt};
 use shep_raft_engine::base::{BoxFuture, BoxStream};
@@ -147,7 +146,7 @@ impl Peers {
                     .await
                     .map_err(|e| e.to_string())
                     .and_then(|b| {
-                        shep_codec::from_bytes::<wire::HeartbeatReplies>(b)
+                        shep_codec::from_bytes::<wire::HeartbeatReplies>(&b)
                             .map_err(|e| e.to_string())
                     });
                 match replies {
@@ -245,7 +244,7 @@ impl PeerClient {
             .call(addr, method, shep_codec::to_bytes(req), timeout)
             .await
             .map_err(rpc_err)?;
-        shep_codec::from_bytes(body).map_err(|e| RPCError::Network(NetworkError::new(&e)))
+        shep_codec::from_bytes(&body).map_err(|e| RPCError::Network(NetworkError::new(&e)))
     }
 
     fn to_wire(
@@ -350,7 +349,7 @@ where
             .fetch_max(self.inflight.len() as u64 + 1, Ordering::Relaxed);
         self.inflight.push_back(Box::pin(async move {
             let reply = match call.await {
-                Ok(body) => shep_codec::from_bytes::<AppendReply>(body)
+                Ok(body) => shep_codec::from_bytes::<AppendReply>(&body)
                     .map_err(|e| RPCError::Network(NetworkError::new(&e))),
                 Err(e) => Err(rpc_err(e)),
             };
@@ -393,7 +392,7 @@ where
 }
 
 impl RaftNetworkV2<TypeConfig> for PeerClient {
-    type SnapshotData = Bytes;
+    type SnapshotData = Vec<u8>;
 
     async fn append_entries(
         &mut self,

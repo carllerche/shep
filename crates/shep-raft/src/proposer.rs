@@ -14,7 +14,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use bytes::Bytes;
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::machine::{Admit, Applied, Decided, Envelope, Machine, ProposeError, Resolution};
@@ -40,7 +39,7 @@ impl<M: Machine> Clone for ProposerHandle<M> {
 }
 
 impl<M: Machine> ProposerHandle<M> {
-    pub(crate) async fn propose(&self, key: Option<Bytes>, proposal: M::Proposal) -> Outcome<M> {
+    pub(crate) async fn propose(&self, key: Option<Vec<u8>>, proposal: M::Proposal) -> Outcome<M> {
         let (reply, rx) = oneshot::channel();
         let gone = || ProposeError::Unknown("the group is shutting down".into());
         self.tx
@@ -56,7 +55,7 @@ impl<M: Machine> ProposerHandle<M> {
 
 enum Msg<M: Machine> {
     Propose {
-        key: Option<Bytes>,
+        key: Option<Vec<u8>>,
         proposal: M::Proposal,
         reply: Reply<M>,
     },
@@ -64,7 +63,7 @@ enum Msg<M: Machine> {
     Resolved {
         generation: u64,
         seq: u64,
-        key: Option<Bytes>,
+        key: Option<Vec<u8>>,
         fate: Fate<M>,
     },
 }
@@ -112,7 +111,7 @@ struct Leading<M: Machine> {
     next_seq: u64,
     last_commit_time_us: u64,
     /// Keys of entries in the log that aren't applied yet.
-    keys: HashMap<Bytes, KeyState<M>>,
+    keys: HashMap<Vec<u8>, KeyState<M>>,
 }
 
 enum KeyState<M: Machine> {
@@ -144,7 +143,7 @@ impl<M: Machine> Proposer<M> {
         }
     }
 
-    async fn propose(&mut self, key: Option<Bytes>, proposal: M::Proposal, reply: Reply<M>) {
+    async fn propose(&mut self, key: Option<Vec<u8>>, proposal: M::Proposal, reply: Reply<M>) {
         let lead = self.group.leadership();
         if !lead.is_leader {
             self.leading = None;
@@ -265,7 +264,7 @@ impl<M: Machine> Proposer<M> {
         }
     }
 
-    fn resolved(&mut self, generation: u64, seq: u64, key: Option<Bytes>, fate: Fate<M>) {
+    fn resolved(&mut self, generation: u64, seq: u64, key: Option<Vec<u8>>, fate: Fate<M>) {
         let Some(leading) = self.leading.as_mut().filter(|l| l.generation == generation) else {
             return;
         };
@@ -324,7 +323,7 @@ impl<M: Machine> Proposer<M> {
             for r in chunk.into_iter().rev() {
                 let env = match r.payload {
                     RawPayload::Normal(b) => {
-                        match shep_codec::from_bytes::<Envelope<M::Command>>(b) {
+                        match shep_codec::from_bytes::<Envelope<M::Command>>(&b) {
                             Ok(env) => Some(env),
                             Err(e) => {
                                 tracing::error!(index = r.index, "undecodable entry: {e}");
@@ -407,7 +406,7 @@ async fn await_fate<M: Machine>(
         }
     };
     let fate = match res {
-        Ok(w) => match shep_codec::from_bytes::<Applied<M::Response>>(w.response) {
+        Ok(w) => match shep_codec::from_bytes::<Applied<M::Response>>(&w.response) {
             Ok(applied) => Fate::Applied {
                 index: w.index,
                 applied,
@@ -474,7 +473,7 @@ async fn wait_for_retry<M: Machine>(
 /// Answers a retry of a key whose entry is in the log but not yet applied.
 async fn wait_for_key<M: Machine>(
     g: GroupHandle<M>,
-    key: Bytes,
+    key: Vec<u8>,
     index: u64,
     timeout: Duration,
     reply: Reply<M>,

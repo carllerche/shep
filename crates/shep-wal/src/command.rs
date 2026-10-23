@@ -1,6 +1,5 @@
 //! What a partition's log holds.
 
-use bytes::Bytes;
 use shep_codec::{Decode, Encode};
 use shep_wal_api::{Dvv, KeyRange};
 
@@ -12,16 +11,16 @@ pub enum PartitionCommand {
     Mutation {
         context: Dvv,
         write_set: Vec<KeyRange>,
-        payload: Bytes,
-        reply: Bytes,
+        payload: Vec<u8>,
+        reply: Vec<u8>,
     },
     Failure {
-        reply: Bytes,
+        reply: Vec<u8>,
     },
 }
 
 impl PartitionCommand {
-    pub fn reply(&self) -> &Bytes {
+    pub fn reply(&self) -> &Vec<u8> {
         match self {
             PartitionCommand::Mutation { reply, .. } | PartitionCommand::Failure { reply } => reply,
         }

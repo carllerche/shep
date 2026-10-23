@@ -204,17 +204,17 @@ impl WalNode {
             Response::ok(shep_codec::to_bytes(t))
         }
         match req.method {
-            method::PROPOSE => match shep_codec::from_bytes::<ProposeRequest>(req.body) {
+            method::PROPOSE => match shep_codec::from_bytes::<ProposeRequest>(&req.body) {
                 Ok(r) => reply(&ProposeReply::from(
                     self.propose(r.partition, r.proposal).await,
                 )),
                 Err(_) => Response::error(status::MALFORMED),
             },
-            method::FETCH => match shep_codec::from_bytes::<FetchRequest>(req.body) {
+            method::FETCH => match shep_codec::from_bytes::<FetchRequest>(&req.body) {
                 Ok(r) => reply(&self.fetch(r).await),
                 Err(_) => Response::error(status::MALFORMED),
             },
-            method::STATUS => match shep_codec::from_bytes::<StatusRequest>(req.body) {
+            method::STATUS => match shep_codec::from_bytes::<StatusRequest>(&req.body) {
                 Ok(r) => reply(&match self.status(r.partition).await {
                     Some(s) => StatusReply::Status(s),
                     None => StatusReply::UnknownPartition,
@@ -222,7 +222,7 @@ impl WalNode {
                 Err(_) => Response::error(status::MALFORMED),
             },
             method::CREATE_PARTITION => {
-                match shep_codec::from_bytes::<CreatePartitionRequest>(req.body) {
+                match shep_codec::from_bytes::<CreatePartitionRequest>(&req.body) {
                     Ok(r) => reply(&match self.create_partition(r.partition).await {
                         Ok(()) => AdminReply::Ok,
                         Err(e) => AdminReply::Failed(e.to_string()),
@@ -231,7 +231,7 @@ impl WalNode {
                 }
             }
             method::INITIALIZE_PARTITION => {
-                match shep_codec::from_bytes::<InitializePartitionRequest>(req.body) {
+                match shep_codec::from_bytes::<InitializePartitionRequest>(&req.body) {
                     Ok(r) => reply(
                         &match self.initialize_partition(r.partition, &r.members).await {
                             Ok(()) => AdminReply::Ok,
@@ -260,18 +260,18 @@ impl WalNode {
             Response::ok(shep_codec::to_bytes(t))
         }
         match req.method {
-            cm::STATE => match shep_codec::from_bytes::<StateRequest>(req.body) {
+            cm::STATE => match shep_codec::from_bytes::<StateRequest>(&req.body) {
                 Ok(_) => reply(&match self.controller_state().await {
                     Some(s) => StateReply::State(s),
                     None => StateReply::NoController,
                 }),
                 Err(_) => Response::error(status::MALFORMED),
             },
-            cm::CREATE_LOG_SET => match shep_codec::from_bytes::<CreateLogSetRequest>(req.body) {
+            cm::CREATE_LOG_SET => match shep_codec::from_bytes::<CreateLogSetRequest>(&req.body) {
                 Ok(r) => reply(&self.create_log_set(r).await),
                 Err(_) => Response::error(status::MALFORMED),
             },
-            cm::HELLO => match shep_codec::from_bytes::<HelloRequest>(req.body) {
+            cm::HELLO => match shep_codec::from_bytes::<HelloRequest>(&req.body) {
                 Ok(_) => reply(&self.hello().await),
                 Err(_) => Response::error(status::MALFORMED),
             },
@@ -375,11 +375,7 @@ impl WalNode {
     }
 
     /// The reply recorded in the entry at `index`.
-    async fn reply_at(
-        &self,
-        partition: PartitionId,
-        index: u64,
-    ) -> Result<bytes::Bytes, Rejection> {
+    async fn reply_at(&self, partition: PartitionId, index: u64) -> Result<Vec<u8>, Rejection> {
         let records = self
             .shared
             .raft

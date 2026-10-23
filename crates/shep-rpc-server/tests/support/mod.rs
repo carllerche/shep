@@ -8,7 +8,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use bytes::Bytes;
 use futures::future::BoxFuture;
 use shep_rpc::wire::{DEFAULT_MAX_PAYLOAD, HEADER_SIZE, Header, payload_checksum};
 use shep_rpc::{Metadata, method_id};
@@ -42,7 +41,7 @@ pub const FAILED: u32 = 1001;
 pub const LONG: Duration = Duration::from_secs(10);
 
 pub struct State {
-    pub log: Mutex<Vec<Bytes>>,
+    pub log: Mutex<Vec<Vec<u8>>>,
     /// Handlers that have started.
     pub started: AtomicUsize,
     pub release: tokio::sync::Semaphore,
@@ -63,7 +62,7 @@ impl State {
         self.started.load(Ordering::SeqCst)
     }
 
-    pub fn log(&self) -> Vec<Bytes> {
+    pub fn log(&self) -> Vec<Vec<u8>> {
         self.log.lock().unwrap().clone()
     }
 }
@@ -85,7 +84,7 @@ pub fn handler(
                 FAIL => Response {
                     status: FAILED,
                     metadata: Metadata::empty(),
-                    body: Bytes::from_static(b"dropped: errors have empty bodies"),
+                    body: b"dropped: errors have empty bodies".to_vec(),
                 },
                 PANIC => panic!("handler panic (expected by the test)"),
                 RECORD => {
@@ -96,7 +95,7 @@ pub fn handler(
                     state.release.acquire().await.unwrap().forget();
                     Response::ok(req.body)
                 }
-                OVERSIZED => Response::ok(Bytes::from(vec![0; DEFAULT_MAX_PAYLOAD + 1])),
+                OVERSIZED => Response::ok(vec![0; DEFAULT_MAX_PAYLOAD + 1]),
                 METADATA => Response::ok(vec![req.version]).with_metadata(req.metadata),
                 _ => Response::error(UNKNOWN_METHOD),
             }
@@ -104,8 +103,8 @@ pub fn handler(
     }
 }
 
-pub fn sleep_body(ms: u64) -> Bytes {
-    Bytes::copy_from_slice(&ms.to_le_bytes())
+pub fn sleep_body(ms: u64) -> Vec<u8> {
+    ms.to_le_bytes().to_vec()
 }
 
 /// A server for the test service, accepting on a fresh loopback port.
@@ -145,7 +144,7 @@ pub async fn write_frame(stream: &mut TcpStream, header: &Header, metadata: &[u8
 
 /// The next frame (header, metadata, body), or `None` if the peer closed the
 /// connection.
-pub async fn read_frame(stream: &mut TcpStream) -> Option<(Header, Bytes, Bytes)> {
+pub async fn read_frame(stream: &mut TcpStream) -> Option<(Header, Vec<u8>, Vec<u8>)> {
     let mut buf = [0; HEADER_SIZE];
     stream.read_exact(&mut buf).await.ok()?;
     let header = Header::decode(&buf);
@@ -153,7 +152,7 @@ pub async fn read_frame(stream: &mut TcpStream) -> Option<(Header, Bytes, Bytes)
     stream.read_exact(&mut metadata).await.ok()?;
     let mut body = vec![0; header.payload_size as usize];
     stream.read_exact(&mut body).await.ok()?;
-    Some((header, metadata.into(), body.into()))
+    Some((header, metadata, body))
 }
 
 /// Waits for the peer to close the connection, failing if it sends anything

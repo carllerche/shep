@@ -685,7 +685,7 @@ impl Log {
                     let mut off = 0;
                     let mut progressed = false;
                     while index < hi && !full(&out, bytes) && (pos + off as u64) < size {
-                        match record::parse(&buf.slice(off..)) {
+                        match record::parse(&buf[off..]) {
                             Parsed::Record(r, n) => {
                                 if r.index != index {
                                     return Err(corrupt(

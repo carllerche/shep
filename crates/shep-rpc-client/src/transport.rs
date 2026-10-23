@@ -7,7 +7,6 @@ use std::net::SocketAddr;
 use std::rc::Rc;
 use std::time::Duration;
 
-use bytes::Bytes;
 use tokio::io::{BufReader, BufWriter};
 use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
@@ -16,7 +15,7 @@ use tokio::task::AbortHandle;
 
 use shep_rpc::Metadata;
 use shep_rpc::wire::{COMPRESSION_NONE, DEFAULT_MAX_PAYLOAD, payload_checksum};
-use shep_rpc::{Connection, Frame, IO_BUFFER};
+use shep_rpc::{Connection, Error, Frame, Head, IO_BUFFER};
 
 use crate::error::RpcError;
 
@@ -28,12 +27,12 @@ pub struct Call {
     pub version: u8,
     pub method: u32,
     pub metadata: Metadata,
-    pub body: Bytes,
+    pub body: Vec<u8>,
 }
 
 impl Call {
     /// A call to `method` at version 0 with no metadata.
-    pub fn new(method: u32, body: impl Into<Bytes>) -> Call {
+    pub fn new(method: u32, body: impl Into<Vec<u8>>) -> Call {
         Call {
             version: 0,
             method,
@@ -57,7 +56,7 @@ impl Call {
 #[derive(Clone, Debug)]
 pub struct Reply {
     pub metadata: Metadata,
-    pub body: Bytes,
+    pub body: Vec<u8>,
 }
 
 #[derive(Clone, Debug)]
@@ -174,9 +173,9 @@ impl Transport {
     pub fn call(
         &self,
         method: u32,
-        body: Bytes,
+        body: Vec<u8>,
         timeout: Duration,
-    ) -> impl Future<Output = Result<Bytes, RpcError>> + 'static {
+    ) -> impl Future<Output = Result<Vec<u8>, RpcError>> + 'static {
         let reply = self.call_with(Call::new(method, body), timeout);
         async move { reply.await.map(|r| r.body) }
     }
@@ -296,7 +295,7 @@ async fn write_requests(
     shared: &Shared,
     mut rx: mpsc::UnboundedReceiver<Frame>,
     mut requests: Connection<BufWriter<OwnedWriteHalf>>,
-) -> std::io::Result<()> {
+) -> Result<(), Error> {
     let waiting = |frame: &Frame| {
         let state = shared.state.borrow_mut();
         state.pending.contains_key(&frame.header.correlation_id)
@@ -352,32 +351,27 @@ async fn read_responses(shared: Rc<Shared>, read: OwnedReadHalf, max_payload: us
 }
 
 /// The next response and the call it answers, or `None` at end of stream. A
-/// response this client can't accept fails its call and leaves its body to
-/// skip (skipping a body already read does nothing); only one that breaks
-/// the stream fails the connection.
+/// well-formed response this client won't take fails its call and leaves its
+/// body to skip (skipping a body already read does nothing); one that breaks
+/// the protocol fails the connection.
 async fn read_response(
     frames: &mut Connection<BufReader<OwnedReadHalf>>,
     max_payload: usize,
-) -> std::io::Result<Option<(u32, Outcome)>> {
+) -> Result<Option<(u32, Outcome)>, Error> {
     let Some(head) = frames.next_head().await? else {
         return Ok(None);
     };
-    let header = head.header;
-    let refused = match &head.metadata {
-        Err(e) => Some(RpcError::BadResponse(e.to_string())),
-        Ok(_) if header.compression != COMPRESSION_NONE => Some(RpcError::BadResponse(format!(
-            "unsupported compression {}",
-            header.compression
-        ))),
-        Ok(_) if header.payload_size as usize > max_payload => {
-            Some(RpcError::ResponseTooLarge(header.payload_size))
-        }
-        Ok(_) => None,
+    let Head { header, metadata } = head;
+    let refused = if header.compression != COMPRESSION_NONE {
+        Some(RpcError::ResponseCompression(header.compression))
+    } else if header.payload_size as usize > max_payload {
+        Some(RpcError::ResponseTooLarge(header.payload_size))
+    } else {
+        None
     };
     if let Some(e) = refused {
         return Ok(Some((header.correlation_id, Err(e))));
     }
-    let metadata = head.metadata.expect("checked above");
     let body = frames.read_body(max_payload).await?;
     let outcome = match RpcError::from_status(header.method_or_status, &metadata) {
         None => Ok(Reply { metadata, body }),

@@ -10,7 +10,6 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ops::Bound;
 
-use bytes::Bytes;
 use shep_wal_api::{Dot, Dvv, KeyRange, PartitionId};
 
 pub struct Table {
@@ -25,7 +24,7 @@ pub struct Table {
     slots: VecDeque<Slot>,
     /// Single keys written, to the sequence numbers that wrote them, oldest
     /// first.
-    points: BTreeMap<Bytes, VecDeque<u64>>,
+    points: BTreeMap<Vec<u8>, VecDeque<u64>>,
     /// Sequence numbers of entries that wrote ranges wider than one key.
     ranged: BTreeSet<u64>,
 }
@@ -33,7 +32,7 @@ pub struct Table {
 struct Slot {
     index: SlotIndex,
     commit_time_us: u64,
-    points: Vec<Bytes>,
+    points: Vec<Vec<u8>>,
     ranges: Vec<KeyRange>,
 }
 
@@ -91,8 +90,8 @@ impl Table {
         for w in write_set.iter().filter(|w| !w.is_empty()) {
             match w.as_point() {
                 Some(k) => {
-                    self.points.entry(k.clone()).or_default().push_back(seq);
-                    slot.points.push(k.clone());
+                    self.points.entry(k.to_vec()).or_default().push_back(seq);
+                    slot.points.push(k.to_vec());
                 }
                 None => slot.ranges.push(w.clone()),
             }
@@ -139,11 +138,9 @@ impl Table {
                     .flatten()
                     .any(|&s| self.unseen(s, read_version)),
                 None => {
-                    let end = r
-                        .end()
-                        .map_or(Bound::Unbounded, |e| Bound::Excluded(&e[..]));
+                    let end = r.end().map_or(Bound::Unbounded, Bound::Excluded);
                     self.points
-                        .range::<[u8], _>((Bound::Included(&r.start()[..]), end))
+                        .range::<[u8], _>((Bound::Included(r.start()), end))
                         .flat_map(|(_, seqs)| seqs)
                         .any(|&s| self.unseen(s, read_version))
                 }
