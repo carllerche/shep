@@ -127,7 +127,7 @@ async fn concurrent_callers_share_a_connection() {
     let calls: Vec<_> = (0..50)
         .map(|i| peer.call(ECHO, format!("{i}").into(), LONG))
         .collect();
-    for (i, reply) in futures::future::join_all(calls)
+    for (i, reply) in shep_futures::future::join_all(calls)
         .await
         .into_iter()
         .enumerate()

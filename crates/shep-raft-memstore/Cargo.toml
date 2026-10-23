@@ -14,9 +14,9 @@ openraft = { package = "shep-raft-engine", path = "../shep-raft-engine", feature
 openraft-rt-tokio = "=0.10.0-alpha.37"
 
 derive_more = { version = "2.1.1", features = ["std", "from", "try_into", "display"] }
-futures = "0.3"
 serde = { version = "1.0.114", features = ["derive", "rc"] }
 serde_json = "1.0.57"
+shep-futures.workspace = true
 tokio = { workspace = true }
 tracing.workspace = true
 

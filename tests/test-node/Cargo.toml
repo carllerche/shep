@@ -10,8 +10,8 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
-futures.workspace = true
 rand.workspace = true
+shep-futures.workspace = true
 shep-wal-client.workspace = true
 tempfile.workspace = true
 tokio.workspace = true

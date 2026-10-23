@@ -21,6 +21,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
+use shep_futures::future::join_all;
 use tokio::runtime::{Handle, LocalOptions};
 use tokio::sync::oneshot;
 
@@ -324,36 +325,4 @@ fn run_core(
     // Dropping the runtime drops the tasks still on it; then the state.
     drop(rt);
     STATE.with(|s| s.borrow_mut().take());
-}
-
-/// Awaits every future, in order of the inputs. Small enough not to need the
-/// `futures` crate.
-async fn join_all<F: Future>(futures: impl IntoIterator<Item = F>) -> Vec<F::Output> {
-    let handles: Vec<_> = futures.into_iter().map(Box::pin).collect();
-    let mut out = Vec::with_capacity(handles.len());
-    // Polling them all concurrently matters: each waits on a different core.
-    let mut pending: Vec<_> = handles.into_iter().map(Some).collect();
-    let mut results: Vec<Option<F::Output>> = (0..pending.len()).map(|_| None).collect();
-    std::future::poll_fn(|cx| {
-        let mut done = true;
-        for (slot, result) in pending.iter_mut().zip(results.iter_mut()) {
-            if let Some(fut) = slot {
-                match fut.as_mut().poll(cx) {
-                    std::task::Poll::Ready(v) => {
-                        *result = Some(v);
-                        *slot = None;
-                    }
-                    std::task::Poll::Pending => done = false,
-                }
-            }
-        }
-        if done {
-            std::task::Poll::Ready(())
-        } else {
-            std::task::Poll::Pending
-        }
-    })
-    .await;
-    out.extend(results.into_iter().map(|r| r.expect("all done")));
-    out
 }

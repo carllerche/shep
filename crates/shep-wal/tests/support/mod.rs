@@ -8,7 +8,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use futures::StreamExt;
+use shep_futures::StreamExt;
 use shep_smp::SmpConfig;
 use shep_wal::{WalConfig, WalNode};
 use shep_wal_client::api::{
@@ -398,7 +398,7 @@ pub fn committed(d: &Decided) -> bool {
 /// Collects `p`'s committed log until it holds `index`.
 pub async fn read_log(client: &WalClient, p: PartitionId, through: u64) -> Vec<LogEntry> {
     let stream = client.tail(p, 0);
-    futures::pin_mut!(stream);
+    let mut stream = std::pin::pin!(stream);
     let mut out = Vec::new();
     while out.last().is_none_or(|e: &LogEntry| e.dot.index < through) {
         let e = tokio::time::timeout(Duration::from_secs(20), stream.next())
@@ -491,7 +491,7 @@ impl Registers {
         let stream = client.tail(p, 0);
         let st = state.clone();
         tokio::task::spawn_local(async move {
-            futures::pin_mut!(stream);
+            let mut stream = std::pin::pin!(stream);
             while let Some(e) = stream.next().await {
                 let mut st = st.lock().unwrap();
                 match &e.kind {

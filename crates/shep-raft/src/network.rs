@@ -16,8 +16,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use futures::Stream;
-use futures::stream::{FuturesOrdered, StreamExt};
+use shep_futures::stream::FuturesOrdered;
+use shep_futures::{Stream, StreamExt};
 use shep_raft_engine::base::{BoxFuture, BoxStream};
 use shep_raft_engine::errors::{
     NetworkError, RPCError, ReplicationClosed, StreamingError, Unreachable,
@@ -427,7 +427,7 @@ impl RaftNetworkV2<TypeConfig> for PeerClient {
             let group = self.group;
             return Box::pin(async move {
                 let addr = addr?;
-                let stream = futures::stream::unfold(Some(input), move |state| {
+                let stream = shep_futures::stream::unfold(Some(input), move |state| {
                     let peers = peers.clone();
                     async move {
                         let mut input = state?;
@@ -472,7 +472,7 @@ impl RaftNetworkV2<TypeConfig> for PeerClient {
                 .map_err(rpc_err)?;
             // The first request names the leader's term, which orders sessions.
             let Some(first) = input.next().await else {
-                return Ok(Box::pin(futures::stream::empty()) as BoxStream<'s, _>);
+                return Ok(Box::pin(shep_futures::stream::empty()) as BoxStream<'s, _>);
             };
             let mut pipe = Pipeline {
                 input,
@@ -489,7 +489,7 @@ impl RaftNetworkV2<TypeConfig> for PeerClient {
                 faults: peers.faults.clone(),
             };
             pipe.send(first);
-            let stream = futures::stream::unfold(pipe, |pipe| pipe.next());
+            let stream = shep_futures::stream::unfold(pipe, |pipe| pipe.next());
             Ok(Box::pin(stream) as BoxStream<'s, _>)
         })
     }

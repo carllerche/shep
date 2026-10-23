@@ -10,10 +10,10 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
-futures.workspace = true
 rand.workspace = true
 serde.workspace = true
 shep-codec.workspace = true
+shep-futures.workspace = true
 shep-raft-engine = { workspace = true, features = ["tokio-rt", "single-threaded"] }
 shep-rpc.workspace = true
 shep-rpc-client.workspace = true

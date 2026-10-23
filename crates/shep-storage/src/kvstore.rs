@@ -38,8 +38,8 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
-use futures::FutureExt;
-use futures::future::{LocalBoxFuture, Shared};
+use shep_futures::FutureExt;
+use shep_futures::future::{LocalBoxFuture, Shared};
 use tokio::time::Instant;
 
 use crate::disk::{self, Disk, DiskFile};

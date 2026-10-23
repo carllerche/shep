@@ -161,7 +161,7 @@ fn serve_handed_off_connection() {
         let calls: Vec<_> = (0..100u32)
             .map(|i| t.call(ECHO, Vec::<u8>::from(i.to_string()), LONG))
             .collect();
-        for (i, reply) in futures::future::join_all(calls)
+        for (i, reply) in shep_futures::future::join_all(calls)
             .await
             .into_iter()
             .enumerate()
@@ -216,7 +216,7 @@ async fn forced_shutdown_answers_request_timeout() {
 
     server.shutdown(Duration::from_millis(50)).await;
     assert_eq!(quick.await.unwrap(), b"quick");
-    for reply in futures::future::join_all(calls).await {
+    for reply in shep_futures::future::join_all(calls).await {
         assert!(matches!(reply, Err(RpcError::Abandoned)), "{reply:?}");
     }
     let reply = t.call(ECHO, "x".into(), LONG).await;

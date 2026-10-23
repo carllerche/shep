@@ -124,7 +124,7 @@ async fn many_groups_stay_stable() {
         cluster.write(g, "x").await;
     }
     let terms: Vec<_> =
-        futures::future::join_all(groups.iter().map(|&g| cluster.status(0, g))).await;
+        shep_futures::future::join_all(groups.iter().map(|&g| cluster.status(0, g))).await;
     tokio::time::sleep(Duration::from_secs(3)).await;
     for (&g, before) in groups.iter().zip(terms) {
         let after = cluster.status(0, g).await;
@@ -281,7 +281,7 @@ async fn group_handles_propose_read_and_watch() {
         .with_group(G1, |g| async move {
             assert!(g.leadership().is_leader);
             // Proposed together, appended in the order proposed.
-            let out: Vec<_> = futures::future::join_all(
+            let out: Vec<_> = shep_futures::future::join_all(
                 (0..20).map(|i| g.propose(None, Vec::<u8>::from(format!("h{i}")))),
             )
             .await

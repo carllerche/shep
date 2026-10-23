@@ -67,7 +67,7 @@ struct Chunk {
 
 /// What [`Appender::close`] leaves to the caller.
 pub(crate) struct Closed {
-    pub sync: futures::future::BoxFuture<'static, std::io::Result<()>>,
+    pub sync: shep_futures::future::LocalBoxFuture<'static, std::io::Result<()>>,
     pub size: u64,
 }
 

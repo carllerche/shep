@@ -5,7 +5,7 @@ mod support;
 
 use std::time::Duration;
 
-use futures::StreamExt;
+use shep_futures::StreamExt;
 use shep_wal_client::api::EntryKind;
 use shep_wal_client::{ClientConfig, ProposeError, WalClient};
 use support::*;
@@ -92,7 +92,7 @@ async fn a_tail_leaves_a_replica_that_fell_behind() {
     )
     .unwrap();
     let stream = client.tail(P1, 0);
-    futures::pin_mut!(stream);
+    let mut stream = std::pin::pin!(stream);
     while stream.next().await.unwrap().dot.index < first.dot.index {}
 
     cluster.node(follower).faults().set_partitioned(true);

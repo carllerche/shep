@@ -3,7 +3,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use futures::future::join_all;
+use shep_futures::future::join_all;
 use shep_smp::{CoreId, Smp, SmpConfig, SmpError, current_core};
 
 fn config(cores: usize) -> SmpConfig {
@@ -117,7 +117,7 @@ async fn messages_from_one_sender_start_in_order() {
                 CoreId(1),
                 move |_| async move { seen.lock().unwrap().push(i) },
             ));
-        let _ = futures::poll!(call.as_mut());
+        let _ = shep_futures::poll!(call.as_mut());
         calls.push(call);
     }
     for r in join_all(calls).await {

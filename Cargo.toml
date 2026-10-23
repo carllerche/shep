@@ -11,6 +11,7 @@ publish = false
 [workspace.dependencies]
 shep-codec = { path = "crates/shep-codec" }
 shep-codec-derive = { path = "crates/shep-codec-derive" }
+shep-futures = { path = "crates/shep-futures" }
 shep-node = { path = "crates/shep-node" }
 shep-raft = { path = "crates/shep-raft" }
 shep-raft-engine = { path = "crates/shep-raft-engine", default-features = false }
@@ -28,8 +29,9 @@ shep-wal-controller = { path = "crates/shep-wal-controller" }
 bytes = "1"
 core_affinity = "0.8"
 crc32c = "0.6"
-futures = "0.3"
+futures-core = "0.3"
 hegeltest = "0.50"
+pin-project-lite = "0.2"
 proc-macro2 = "1"
 quote = "1"
 rand = "0.9"

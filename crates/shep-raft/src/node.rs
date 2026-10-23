@@ -704,7 +704,7 @@ impl<M: Machine> Shared<M> {
                 out
             })
         });
-        for done in futures::future::join_all(calls).await {
+        for done in shep_futures::future::join_all(calls).await {
             match done {
                 Ok(items) => {
                     for (i, reply) in items {

@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use futures::future::BoxFuture;
+use shep_futures::future::LocalBoxFuture;
 use shep_rpc::wire::{DEFAULT_MAX_PAYLOAD, HEADER_SIZE, Header, payload_checksum};
 use shep_rpc::{Metadata, method_id};
 use shep_rpc_server::{Request, Response, Server, ServerConfig, Service, service_fn};
@@ -69,7 +69,7 @@ impl State {
 
 pub fn handler(
     state: Arc<State>,
-) -> impl Fn(Request) -> BoxFuture<'static, Response> + Clone + Send + Sync + 'static {
+) -> impl Fn(Request) -> LocalBoxFuture<'static, Response> + Clone + Send + Sync + 'static {
     move |req: Request| {
         let state = state.clone();
         Box::pin(async move {
@@ -99,7 +99,7 @@ pub fn handler(
                 METADATA => Response::ok(vec![req.version]).with_metadata(req.metadata),
                 _ => Response::error(UNKNOWN_METHOD),
             }
-        }) as BoxFuture<'static, Response>
+        }) as LocalBoxFuture<'static, Response>
     }
 }
 

@@ -4,7 +4,7 @@ mod util;
 
 use std::time::Duration;
 
-use futures::future::join_all;
+use shep_futures::future::join_all;
 use shep_storage::{Error, LogConfig, Record};
 use util::*;
 
@@ -252,7 +252,7 @@ async fn flush_after_a_sync_starts_waits_for_another() {
     let before = env.disk.stats().fsyncs;
     let mut first = std::pin::pin!(log.flush());
     // Start the first sync.
-    assert!(futures::poll!(first.as_mut()).is_pending());
+    assert!(shep_futures::poll!(first.as_mut()).is_pending());
     log.append(recs(10..20, 1)).await.unwrap();
     let second = log.flush();
     let third = log.flush();

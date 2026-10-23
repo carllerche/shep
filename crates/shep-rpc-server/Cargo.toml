@@ -10,7 +10,7 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
-futures.workspace = true
+shep-futures.workspace = true
 shep-rpc.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true

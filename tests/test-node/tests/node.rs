@@ -3,7 +3,7 @@
 
 use std::time::Duration;
 
-use futures::StreamExt;
+use shep_futures::StreamExt;
 use shep_wal_client::api::{EntryKind, PartitionId};
 use test_node::*;
 
@@ -22,7 +22,7 @@ async fn payloads(
     through: u64,
 ) -> Vec<String> {
     let stream = client.tail(p, 0);
-    futures::pin_mut!(stream);
+    let mut stream = std::pin::pin!(stream);
     let mut out = Vec::new();
     loop {
         let e = tokio::time::timeout(Duration::from_secs(30), stream.next())

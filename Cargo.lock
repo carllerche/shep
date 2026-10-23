@@ -1030,6 +1030,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "shep-futures"
+version = "0.1.0"
+dependencies = [
+ "futures-core",
+ "hegeltest",
+ "pin-project-lite",
+ "tokio",
+]
+
+[[package]]
 name = "shep-node"
 version = "0.1.0"
 dependencies = [
@@ -1047,10 +1057,10 @@ dependencies = [
 name = "shep-raft"
 version = "0.1.0"
 dependencies = [
- "futures",
  "rand 0.9.5",
  "serde",
  "shep-codec",
+ "shep-futures",
  "shep-raft-engine",
  "shep-rpc",
  "shep-rpc-client",
@@ -1104,10 +1114,10 @@ name = "shep-raft-memstore"
 version = "0.1.0"
 dependencies = [
  "derive_more",
- "futures",
  "openraft-rt-tokio",
  "serde",
  "serde_json",
+ "shep-futures",
  "shep-raft-engine",
  "tokio",
  "tracing",
@@ -1128,8 +1138,8 @@ dependencies = [
 name = "shep-rpc-client"
 version = "0.1.0"
 dependencies = [
- "futures",
  "rand 0.9.5",
+ "shep-futures",
  "shep-rpc",
  "shep-rpc-server",
  "thiserror",
@@ -1141,8 +1151,8 @@ dependencies = [
 name = "shep-rpc-server"
 version = "0.1.0"
 dependencies = [
- "futures",
  "rand 0.9.5",
+ "shep-futures",
  "shep-rpc",
  "shep-rpc-client",
  "tokio",
@@ -1155,7 +1165,7 @@ name = "shep-smp"
 version = "0.1.0"
 dependencies = [
  "core_affinity",
- "futures",
+ "shep-futures",
  "thiserror",
  "tokio",
  "tracing",
@@ -1166,8 +1176,8 @@ name = "shep-storage"
 version = "0.1.0"
 dependencies = [
  "crc32c",
- "futures",
  "rand 0.9.5",
+ "shep-futures",
  "tempfile",
  "thiserror",
  "tokio",
@@ -1186,10 +1196,10 @@ dependencies = [
 name = "shep-wal"
 version = "0.1.0"
 dependencies = [
- "futures",
  "hegeltest",
  "rand 0.9.5",
  "shep-codec",
+ "shep-futures",
  "shep-raft",
  "shep-rpc-client",
  "shep-rpc-server",
@@ -1219,8 +1229,8 @@ dependencies = [
 name = "shep-wal-client"
 version = "0.1.0"
 dependencies = [
- "futures",
  "shep-codec",
+ "shep-futures",
  "shep-rpc-client",
  "shep-wal-api",
  "shep-wal-controller",
@@ -1352,8 +1362,8 @@ dependencies = [
 name = "test-node"
 version = "0.1.0"
 dependencies = [
- "futures",
  "rand 0.9.5",
+ "shep-futures",
  "shep-wal-client",
  "tempfile",
  "tokio",

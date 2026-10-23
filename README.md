@@ -14,6 +14,7 @@ replicates.
 |---|---|
 | `crates/shep-version` | Dots and dotted version vectors (§9) |
 | `crates/shep-codec` (+ `-derive`) | Binary serialization with versioned envelopes, after Redpanda's `serde` |
+| `crates/shep-futures` | The few future and stream utilities used in place of the `futures` crate, single-threaded: `join_all`, `Shared`, `catch_unwind`, `unfold`, `next` |
 | `crates/shep-rpc` | General-purpose request/response RPC framing, after Redpanda's: a 32-byte checksummed header, key/value metadata the service defines, frame I/O |
 | `crates/shep-rpc-server` | Serving it: concurrent handlers, routing on the header and metadata before the body is read |
 | `crates/shep-rpc-client` | Calling it: pipelined calls over one connection, reconnect with backoff, a connection cache |

@@ -19,7 +19,7 @@ use std::panic::AssertUnwindSafe;
 use std::rc::Rc;
 use std::time::Duration;
 
-use futures::FutureExt;
+use shep_futures::FutureExt;
 use shep_rpc::wire::{COMPRESSION_NONE, DEFAULT_MAX_PAYLOAD, Header};
 use shep_rpc::{Connection, Error, Frame, Head, IO_BUFFER};
 use shep_rpc::{Metadata, Status};

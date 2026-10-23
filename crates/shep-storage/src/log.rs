@@ -36,8 +36,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use futures::FutureExt;
-use futures::future::{LocalBoxFuture, Shared};
+use shep_futures::FutureExt;
+use shep_futures::future::{LocalBoxFuture, Shared};
 use tokio::sync::watch;
 
 use crate::appender::{Appender, AppenderConfig};

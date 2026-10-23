@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use futures::future::join_all;
+use shep_futures::future::join_all;
 use shep_storage::{Disk, Error, KeySpace, KvConfig, KvStore};
 use tempfile::TempDir;
 
@@ -138,7 +138,7 @@ async fn writes_are_visible_only_once_durable() {
         })
         .await;
     let mut put = std::pin::pin!(kv.put(KeySpace::TESTING, b"k", b("v")));
-    assert!(futures::poll!(put.as_mut()).is_pending());
+    assert!(shep_futures::poll!(put.as_mut()).is_pending());
     assert_eq!(kv.get(KeySpace::TESTING, b"k"), None);
     put.await.unwrap();
     assert_eq!(kv.get(KeySpace::TESTING, b"k"), Some(b("v")));
@@ -171,7 +171,7 @@ async fn commits_while_one_is_in_flight_share_the_next() {
     let env = Env::new();
     let kv = env.open(immediate()).await;
     let mut first = std::pin::pin!(kv.put(KeySpace::TESTING, b"first", b("v")));
-    assert!(futures::poll!(first.as_mut()).is_pending());
+    assert!(shep_futures::poll!(first.as_mut()).is_pending());
     let rest =
         join_all((0..20).map(|i| kv.put(KeySpace::TESTING, format!("k{i}").as_bytes(), b("v"))));
     let (a, rest) = tokio::join!(first, rest);
@@ -187,7 +187,7 @@ async fn dropped_waiters_still_commit() {
     {
         let mut put = std::pin::pin!(kv.put(KeySpace::TESTING, b"a", b("1")));
         // Starts the commit, then goes away.
-        assert!(futures::poll!(put.as_mut()).is_pending());
+        assert!(shep_futures::poll!(put.as_mut()).is_pending());
     }
     kv.put(KeySpace::TESTING, b"b", b("2")).await.unwrap();
     assert_eq!(kv.get(KeySpace::TESTING, b"a"), Some(b("1")));

@@ -7,8 +7,9 @@ use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::rc::Rc;
 
-use futures::{Stream, StreamExt};
 use shep_codec::{Decode, Encode};
+use shep_futures::Stream;
+use shep_futures::StreamExt;
 use shep_raft_engine::EntryPayload;
 use shep_raft_engine::storage::{EntryResponder, RaftSnapshotBuilder, RaftStateMachine, Snapshot};
 

@@ -24,8 +24,8 @@ tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
-futures.workspace = true
 hegeltest.workspace = true
+shep-futures.workspace = true
 shep-rpc-client.workspace = true
 shep-smp.workspace = true
 rand.workspace = true

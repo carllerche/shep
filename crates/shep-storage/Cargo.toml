@@ -11,13 +11,12 @@ workspace = true
 
 [dependencies]
 crc32c.workspace = true
-futures.workspace = true
+shep-futures.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
-futures.workspace = true
 rand.workspace = true
 tempfile.workspace = true
 tokio.workspace = true

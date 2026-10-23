@@ -4,10 +4,9 @@
 #[path = "../../shep-rpc-server/tests/support/mod.rs"]
 mod support;
 
+use std::cell::RefCell;
 use std::time::Duration;
 
-use futures::StreamExt;
-use futures::stream::FuturesUnordered;
 use rand::seq::SliceRandom;
 use shep_rpc::wire::{Header, payload_checksum};
 use shep_rpc::{MetadataBuilder, SERVICE_STATUS_MIN, method_id};
@@ -37,7 +36,7 @@ async fn large_bodies_round_trip() {
     let t = Transport::connect(addr).await.unwrap();
     let body: Vec<u8> = (0..4 << 20).map(|i| (i % 251) as u8).collect::<Vec<_>>();
     let calls: Vec<_> = (0..4).map(|_| t.call(ECHO, body.clone(), LONG)).collect();
-    for reply in futures::future::join_all(calls).await {
+    for reply in shep_futures::future::join_all(calls).await {
         assert_eq!(reply.unwrap(), body);
     }
 }
@@ -49,7 +48,7 @@ async fn many_pipelined_calls() {
     let calls: Vec<_> = (0..2000u32)
         .map(|i| t.call(ECHO, i.to_le_bytes().to_vec(), LONG))
         .collect();
-    let replies = futures::future::join_all(calls).await;
+    let replies = shep_futures::future::join_all(calls).await;
     for (i, reply) in replies.into_iter().enumerate() {
         assert_eq!(reply.unwrap(), (i as u32).to_le_bytes().to_vec());
     }
@@ -82,18 +81,17 @@ async fn concurrent_calls_from_many_tasks() {
 async fn out_of_order_responses() {
     let (_server, addr, _) = start(ServerConfig::default()).await;
     let t = Transport::connect(addr).await.unwrap();
-    let mut calls: FuturesUnordered<_> = (0..10u64)
-        .map(|i| {
-            let call = t.call(SLEEP, sleep_body((10 - i) * 30), LONG);
-            async move { (i, call.await) }
-        })
-        .collect();
-    let mut finished = Vec::new();
-    while let Some((i, reply)) = calls.next().await {
-        assert_eq!(reply.unwrap(), sleep_body((10 - i) * 30));
-        finished.push(i);
-    }
-    assert_eq!(finished, (0..10).rev().collect::<Vec<_>>());
+    let finished = RefCell::new(Vec::new());
+    let calls = (0..10u64).map(|i| {
+        let call = t.call(SLEEP, sleep_body((10 - i) * 30), LONG);
+        let finished = &finished;
+        async move {
+            assert_eq!(call.await.unwrap(), sleep_body((10 - i) * 30));
+            finished.borrow_mut().push(i);
+        }
+    });
+    shep_futures::future::join_all(calls).await;
+    assert_eq!(finished.into_inner(), (0..10).rev().collect::<Vec<_>>());
 }
 
 /// Adapted from Redpanda src/v/rpc/test/rpc_gen_cycling_test.cc
@@ -107,7 +105,7 @@ async fn requests_are_written_in_call_order() {
         .map(|i| t.call(RECORD, i.to_le_bytes().to_vec(), LONG))
         .collect();
     calls.shuffle(&mut rand::rng());
-    for reply in futures::future::join_all(calls).await {
+    for reply in shep_futures::future::join_all(calls).await {
         reply.unwrap();
     }
     let expected: Vec<Vec<u8>> = (0..500u32).map(|i| i.to_le_bytes().to_vec()).collect();
@@ -155,7 +153,7 @@ async fn zero_timeouts_leave_connection_healthy() {
     let calls: Vec<_> = (0..10)
         .map(|_| t.call(SLEEP, sleep_body(100), Duration::ZERO))
         .collect();
-    for reply in futures::future::join_all(calls).await {
+    for reply in shep_futures::future::join_all(calls).await {
         assert!(matches!(reply, Err(RpcError::Timeout)), "{reply:?}");
     }
     for _ in 0..10 {
@@ -197,7 +195,7 @@ async fn unknown_method() {
             async move { (missing, call.await) }
         })
         .collect();
-    for (missing, reply) in futures::future::join_all(calls).await {
+    for (missing, reply) in shep_futures::future::join_all(calls).await {
         if missing {
             let status = reply.unwrap_err().service_status();
             assert_eq!(status, Some(UNKNOWN_METHOD));
@@ -345,7 +343,7 @@ async fn server_drop_fails_pending_calls() {
     .await;
     let t = Transport::connect(addr).await.unwrap();
     let calls: Vec<_> = (0..5).map(|_| t.call(ECHO, "x".into(), LONG)).collect();
-    for reply in futures::future::join_all(calls).await {
+    for reply in shep_futures::future::join_all(calls).await {
         assert!(matches!(reply, Err(RpcError::Disconnected)), "{reply:?}");
     }
     assert!(t.is_closed());

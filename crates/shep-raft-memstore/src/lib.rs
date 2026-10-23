@@ -17,7 +17,8 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use futures::Stream;
+use shep_futures::Stream;
+use shep_futures::StreamExt;
 use openraft::EntryPayload;
 use openraft::OptionalSend;
 use openraft::Vote;
@@ -537,11 +538,10 @@ impl RaftStateMachine<TypeConfig> for Arc<MemStateMachine> {
     #[tracing::instrument(level = "trace", skip(self, entries))]
     async fn apply<Strm>(&mut self, mut entries: Strm) -> Result<(), io::Error>
     where Strm: Stream<Item = Result<EntryResponder<TypeConfig>, io::Error>> + Unpin + OptionalSend {
-        use futures::TryStreamExt;
-
         let mut sm = self.sm.write().await;
 
-        while let Some((entry, responder)) = entries.try_next().await? {
+        while let Some(next) = entries.next().await {
+            let (entry, responder) = next?;
             if self.panic_on_apply.load(Ordering::Relaxed) {
                 panic!("injected state-machine worker panic during apply");
             }

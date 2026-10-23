@@ -15,7 +15,7 @@ use std::net::SocketAddr;
 use std::rc::Rc;
 use std::time::Duration;
 
-use futures::Stream;
+use shep_futures::Stream;
 use shep_rpc_client::{ConnectionCache, ReconnectConfig, RpcError};
 use shep_wal_api::{
     AdminReply, CreatePartitionRequest, Decided, FetchReply, FetchRequest,
@@ -616,7 +616,7 @@ impl WalClient {
             .into_iter()
             .filter(|n| n.addr != current)
             .collect();
-        let statuses = futures::future::join_all(
+        let statuses = shep_futures::future::join_all(
             others
                 .iter()
                 .map(|n| tokio::time::timeout(timeout, n.status(partition))),
