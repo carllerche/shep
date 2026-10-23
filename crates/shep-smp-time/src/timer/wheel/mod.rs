@@ -16,15 +16,9 @@ use super::EntryList;
 
 /// Timing wheel implementation.
 ///
-/// This type provides the hashed timing wheel implementation that backs `Timer`
-/// and `DelayQueue`.
-///
-/// The structure is generic over `T: Stack`. This allows handling timeout data
-/// being stored on the heap or in a slab. In order to support the latter case,
-/// the slab must be passed into each function allowing the implementation to
-/// lookup timer entries.
-///
-/// See `Timer` documentation for some implementation notes.
+/// Buckets contain non-owning handles to pinned timer entries. An entry is
+/// detached before its deadline or list membership changes, then transferred
+/// to a new bucket or the pending queue while the owner borrows the wheel.
 #[derive(Debug)]
 pub(crate) struct Wheel {
     /// The number of milliseconds elapsed since the wheel started.
@@ -104,7 +98,8 @@ impl Wheel {
         &mut self,
         item: TimerHandle,
     ) -> Result<u64, (TimerHandle, InsertError)> {
-        let when = item.sync_when();
+        // SAFETY: The caller supplies a live pinned entry detached from lists.
+        let when = unsafe { item.sync_when() };
 
         if when <= self.elapsed {
             return Err((item, InsertError::Elapsed));
@@ -113,12 +108,13 @@ impl Wheel {
         // Get the level at which the entry should be stored
         let level = self.level_for(when);
 
+        // SAFETY: The caller supplies a live pinned entry, still detached here.
         unsafe {
-            self.levels.get_unchecked_mut(level).add_entry(item);
+            self.levels[level].add_entry(item);
         }
 
         debug_assert!({
-            unsafe { self.levels.get_unchecked(level) }
+            self.levels[level]
                 .next_expiration(self.elapsed)
                 .map(|e| e.deadline >= self.elapsed)
                 .unwrap_or(true)
@@ -129,6 +125,8 @@ impl Wheel {
 
     /// Remove `item` from the timing wheel.
     pub(crate) unsafe fn remove(&mut self, item: NonNull<TimerShared>) {
+        // SAFETY: The caller guarantees liveness and membership in this wheel.
+        // Cached deadlines change only after detaching from a bucket.
         unsafe {
             let when = item.as_ref().cached_when();
             if when == u64::MAX {
@@ -143,7 +141,7 @@ impl Wheel {
 
                 let level = self.level_for(when);
 
-                self.levels.get_unchecked_mut(level).remove_entry(item);
+                self.levels[level].remove_entry(item);
             }
         }
     }
@@ -240,11 +238,12 @@ impl Wheel {
 
         while let Some(item) = entries.pop_back() {
             if expiration.level == 0 {
+                // SAFETY: The owner keeps this detached entry alive and pinned.
                 debug_assert_eq!(unsafe { item.cached_when() }, expiration.deadline);
             }
 
-            // Try to expire the entry; this is cheap (doesn't synchronize) if
-            // the timer is not expired, and updates cached_when.
+            // SAFETY: Taking the slot detached every entry. Their pinned owners
+            // remain alive; callbacks cannot run while the wheel is borrowed.
             match unsafe { item.mark_pending(expiration.deadline) } {
                 Ok(()) => {
                     // Item was expired
@@ -252,8 +251,10 @@ impl Wheel {
                 }
                 Err(expiration_tick) => {
                     let level = level_for(expiration.deadline, expiration_tick);
+                    // SAFETY: The entry remains detached and pinned, and its
+                    // cached deadline now identifies this destination bucket.
                     unsafe {
-                        self.levels.get_unchecked_mut(level).add_entry(item);
+                        self.levels[level].add_entry(item);
                     }
                 }
             }
@@ -276,7 +277,7 @@ impl Wheel {
     /// Obtains the list of entries that need processing for the given
     /// expiration.
     fn take_entries(&mut self, expiration: &Expiration) -> EntryList {
-        unsafe { self.levels.get_unchecked_mut(expiration.level) }.take_slot(expiration.slot)
+        self.levels[expiration.level].take_slot(expiration.slot)
     }
 
     fn level_for(&self, when: u64) -> usize {

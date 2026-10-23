@@ -50,9 +50,7 @@
 // Copyright (c) 2021 ihciah, dyxushuai and other Monoio Contributors.
 // Portions Copyright (c) 2021 Tokio Contributors. Licensed under MIT.
 
-// Keep upstream's unsafe implementation intact while extracting from its
-// edition-2021 crate. These operations will be adapted in later changes.
-#![allow(unsafe_op_in_unsafe_fn)]
+#![deny(unsafe_op_in_unsafe_fn, unused_unsafe)]
 // Retain the upstream wheel's formatting and control flow.
 #![allow(clippy::collapsible_if)]
 
@@ -76,8 +74,5 @@ pub use timeout::{Timeout, timeout, timeout_at};
 pub use std::time::Duration;
 
 mod utils {
-    // Preserve the upstream helper and its tests, including methods not used
-    // by this extraction of Monoio.
-    #[allow(dead_code)]
     pub(crate) mod linked_list;
 }

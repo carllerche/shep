@@ -2,11 +2,6 @@
 // Copyright (c) 2021 ihciah, dyxushuai and other Monoio Contributors.
 // Portions Copyright (c) 2021 Tokio Contributors. Licensed under MIT.
 
-// Currently, rust warns when an unsafe fn contains an unsafe {} block. However,
-// in the future, this will change to the reverse. For now, suppress this
-// warning and generally stick with being explicit about unsafety.
-#![allow(unused_unsafe)]
-
 //! Reactor-owned timer wheel
 
 mod entry;
@@ -21,7 +16,7 @@ pub mod sleep;
 
 use std::{cell::RefCell, fmt, ptr::NonNull, rc::Rc};
 
-use crate::{Duration, Instant, error::Error};
+use crate::{Duration, Instant};
 
 /// A core-local timer wheel owned and advanced by the reactor.
 ///
@@ -168,55 +163,55 @@ impl Timer {
 }
 
 impl Handle {
-    /// Removes a registered timer from the driver.
+    /// Unlink an entry and mark it cancelled without waking its task.
     ///
     /// The timer will be moved to the cancelled state. Wakers will _not_ be
     /// invoked. If the timer is already completed, this function is a no-op.
     ///
-    /// This function always acquires the driver lock, even if the entry does
-    /// not appear to be registered.
+    /// # Safety
     ///
-    /// SAFETY: The timer must not be registered with some other driver, and
-    /// `add_entry` must not be called concurrently.
+    /// `entry` must point to a live, immovable entry belonging to this timer.
+    /// It must remain valid until cancellation returns. All list mutations
+    /// happen on this thread while the wheel is mutably borrowed.
     pub(self) unsafe fn clear_entry(&self, entry: NonNull<TimerShared>) {
-        unsafe {
+        // SAFETY: The caller keeps the entry alive and immovable. Removal uses
+        // its cached membership before fire marks it unregistered.
+        let waker = unsafe {
             let mut state = self.get().state.borrow_mut();
             if entry.as_ref().might_be_registered() {
                 state.wheel.remove(entry);
             }
-
-            entry.as_ref().handle().fire(Ok(()));
-        }
+            entry.as_ref().handle().fire(Ok(()))
+        };
+        // A waker's destructor can drop another sleep. Release the wheel
+        // borrow before dropping it so that sleep can unlink its own entry.
+        drop(waker);
     }
 
-    /// Removes and re-adds an entry to the driver.
+    /// Remove and re-add an entry at its new deadline.
     ///
-    /// SAFETY: The timer must be either unregistered, or registered with this
-    /// driver. No other threads are allowed to concurrently manipulate the
-    /// timer at all (the current thread should hold an exclusive reference to
-    /// the `TimerEntry`)
+    /// # Safety
+    ///
+    /// `entry` must be live and pinned, and either unregistered or registered
+    /// with this timer. Its owner must keep it pinned until cancellation.
     pub(self) unsafe fn reregister(&self, new_tick: u64, entry: NonNull<TimerShared>) {
+        // SAFETY: The caller keeps the entry alive and pinned. The wheel is
+        // borrowed for the entire remove/update/insert transition.
         let waker = unsafe {
             let mut state = self.get().state.borrow_mut();
 
-            // We may have raced with a firing/deregistration, so check before
-            // deregistering.
-            if unsafe { entry.as_ref().might_be_registered() } {
+            if entry.as_ref().might_be_registered() {
                 state.wheel.remove(entry);
             }
 
-            // Now that we have exclusive control of this entry, mint a handle to reinsert
-            // it.
+            // The entry is detached; its handle can now update membership.
             let entry = entry.as_ref().handle();
 
             entry.set_expiration(new_tick);
 
-            // Note: We don't have to worry about racing with some other resetting
-            // thread, because add_entry and reregister require exclusive control of
-            // the timer entry.
-            match unsafe { state.wheel.insert(entry) } {
+            match state.wheel.insert(entry) {
                 Ok(_) => None,
-                Err((entry, super::error::InsertError::Elapsed)) => unsafe { entry.fire(Ok(())) },
+                Err((entry, super::error::InsertError::Elapsed)) => entry.fire(Ok(())),
             }
         };
 

@@ -11,14 +11,12 @@
 //! specified node is actually contained by the list.
 // Heavily borrowed from tokio.
 // Copyright (c) 2021 Tokio Contributors, licensed under the MIT license.
-#![allow(unused)]
-
 use core::{
-    cell::UnsafeCell,
+    cell::Cell,
     fmt,
     marker::{PhantomData, PhantomPinned},
     mem::ManuallyDrop,
-    ptr::{self, NonNull},
+    ptr::NonNull,
 };
 
 /// An intrusive linked list.
@@ -66,43 +64,10 @@ pub(crate) unsafe trait Link {
     unsafe fn pointers(target: NonNull<Self::Target>) -> NonNull<Pointers<Self::Target>>;
 }
 
-/// Previous / next pointers
+/// Local, interior-mutable links in a pinned node.
 pub(crate) struct Pointers<T> {
-    inner: UnsafeCell<PointersInner<T>>,
-}
-/// We do not want the compiler to put the `noalias` attribute on mutable
-/// references to this type, so the type has been made `!Unpin` with a
-/// `PhantomPinned` field.
-///
-/// Additionally, we never access the `prev` or `next` fields directly, as any
-/// such access would implicitly involve the creation of a reference to the
-/// field, which we want to avoid since the fields are not `!Unpin`, and would
-/// hence be given the `noalias` attribute if we were to do such an access.
-/// As an alternative to accessing the fields directly, the `Pointers` type
-/// provides getters and setters for the two fields, and those are implemented
-/// using raw pointer casts and offsets, which is valid since the struct is
-/// #[repr(C)].
-///
-/// See this link for more information:
-/// <https://github.com/rust-lang/rust/pull/82834>
-#[repr(C)]
-struct PointersInner<T> {
-    /// The previous node in the list. null if there is no previous node.
-    ///
-    /// This field is accessed through pointer manipulation, so it is not dead
-    /// code.
-    #[allow(dead_code)]
-    prev: Option<NonNull<T>>,
-
-    /// The next node in the list. null if there is no previous node.
-    ///
-    /// This field is accessed through pointer manipulation, so it is not dead
-    /// code.
-    #[allow(dead_code)]
-    next: Option<NonNull<T>>,
-
-    /// This type is !Unpin due to the heuristic from:
-    /// <https://github.com/rust-lang/rust/pull/82834>
+    prev: Cell<Option<NonNull<T>>>,
+    next: Cell<Option<NonNull<T>>>,
     _pin: PhantomPinned,
 }
 
@@ -126,12 +91,15 @@ impl<L: Link> LinkedList<L, L::Target> {
         let val = ManuallyDrop::new(val);
         let ptr = L::as_raw(&val);
         assert_ne!(self.head, Some(ptr));
+        // SAFETY: Link's handle contract keeps this node alive and pinned.
+        // The caller transfers detached membership; existing neighbors remain
+        // live until removed. Mutations touch only shared Cell link fields.
         unsafe {
-            L::pointers(ptr).as_mut().set_next(self.head);
-            L::pointers(ptr).as_mut().set_prev(None);
+            L::pointers(ptr).as_ref().set_next(self.head);
+            L::pointers(ptr).as_ref().set_prev(None);
 
             if let Some(head) = self.head {
-                L::pointers(head).as_mut().set_prev(Some(ptr));
+                L::pointers(head).as_ref().set_prev(Some(ptr));
             }
 
             self.head = Some(ptr);
@@ -145,18 +113,20 @@ impl<L: Link> LinkedList<L, L::Target> {
     /// Removes the last element from a list and returns it, or None if it is
     /// empty.
     pub(crate) fn pop_back(&mut self) -> Option<L::Handle> {
+        // SAFETY: Every linked node remains live and pinned by Link's contract.
+        // Detach the tail before restoring its handle; no callback runs here.
         unsafe {
             let last = self.tail?;
             self.tail = L::pointers(last).as_ref().get_prev();
 
             if let Some(prev) = L::pointers(last).as_ref().get_prev() {
-                L::pointers(prev).as_mut().set_next(None);
+                L::pointers(prev).as_ref().set_next(None);
             } else {
                 self.head = None
             }
 
-            L::pointers(last).as_mut().set_prev(None);
-            L::pointers(last).as_mut().set_next(None);
+            L::pointers(last).as_ref().set_prev(None);
+            L::pointers(last).as_ref().set_next(None);
 
             Some(L::from_raw(last))
         }
@@ -179,37 +149,42 @@ impl<L: Link> LinkedList<L, L::Target> {
     /// The caller **must** ensure that `node` is currently contained by
     /// `self` or not contained by any other list.
     pub(crate) unsafe fn remove(&mut self, node: NonNull<L::Target>) -> Option<L::Handle> {
-        if let Some(prev) = L::pointers(node).as_ref().get_prev() {
-            debug_assert_eq!(L::pointers(prev).as_ref().get_next(), Some(node));
-            L::pointers(prev)
-                .as_mut()
-                .set_next(L::pointers(node).as_ref().get_next());
-        } else {
-            if self.head != Some(node) {
-                return None;
+        // SAFETY: The caller guarantees a live pinned node in this list or
+        // detached from all lists. Link's implementation supplies its shared
+        // Cell links. Neighbor pointers belong to the same live list.
+        unsafe {
+            if let Some(prev) = L::pointers(node).as_ref().get_prev() {
+                debug_assert_eq!(L::pointers(prev).as_ref().get_next(), Some(node));
+                L::pointers(prev)
+                    .as_ref()
+                    .set_next(L::pointers(node).as_ref().get_next());
+            } else {
+                if self.head != Some(node) {
+                    return None;
+                }
+
+                self.head = L::pointers(node).as_ref().get_next();
             }
 
-            self.head = L::pointers(node).as_ref().get_next();
-        }
+            if let Some(next) = L::pointers(node).as_ref().get_next() {
+                debug_assert_eq!(L::pointers(next).as_ref().get_prev(), Some(node));
+                L::pointers(next)
+                    .as_ref()
+                    .set_prev(L::pointers(node).as_ref().get_prev());
+            } else {
+                // This might be the last item in the list
+                if self.tail != Some(node) {
+                    return None;
+                }
 
-        if let Some(next) = L::pointers(node).as_ref().get_next() {
-            debug_assert_eq!(L::pointers(next).as_ref().get_prev(), Some(node));
-            L::pointers(next)
-                .as_mut()
-                .set_prev(L::pointers(node).as_ref().get_prev());
-        } else {
-            // This might be the last item in the list
-            if self.tail != Some(node) {
-                return None;
+                self.tail = L::pointers(node).as_ref().get_prev();
             }
 
-            self.tail = L::pointers(node).as_ref().get_prev();
+            L::pointers(node).as_ref().set_next(None);
+            L::pointers(node).as_ref().set_prev(None);
+
+            Some(L::from_raw(node))
         }
-
-        L::pointers(node).as_mut().set_next(None);
-        L::pointers(node).as_mut().set_prev(None);
-
-        Some(L::from_raw(node))
     }
 }
 
@@ -222,111 +197,33 @@ impl<L: Link> fmt::Debug for LinkedList<L, L::Target> {
     }
 }
 
-impl<L: Link> LinkedList<L, L::Target> {
-    pub(crate) fn last(&self) -> Option<&L::Target> {
-        let tail = self.tail.as_ref()?;
-        unsafe { Some(&*tail.as_ptr()) }
-    }
-}
-
 impl<L: Link> Default for LinkedList<L, L::Target> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-// ===== impl DrainFilter =====
-
-pub(crate) struct DrainFilter<'a, T: Link, F> {
-    list: &'a mut LinkedList<T, T::Target>,
-    filter: F,
-    curr: Option<NonNull<T::Target>>,
-}
-
-impl<T: Link> LinkedList<T, T::Target> {
-    pub(crate) fn drain_filter<F>(&mut self, filter: F) -> DrainFilter<'_, T, F>
-    where
-        F: FnMut(&mut T::Target) -> bool,
-    {
-        let curr = self.head;
-        DrainFilter {
-            curr,
-            filter,
-            list: self,
-        }
-    }
-}
-
-impl<T, F> Iterator for DrainFilter<'_, T, F>
-where
-    T: Link,
-    F: FnMut(&mut T::Target) -> bool,
-{
-    type Item = T::Handle;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        while let Some(curr) = self.curr {
-            // safety: the pointer references data contained by the list
-            self.curr = unsafe { T::pointers(curr).as_ref() }.get_next();
-
-            // safety: the value is still owned by the linked list.
-            if (self.filter)(unsafe { &mut *curr.as_ptr() }) {
-                return unsafe { self.list.remove(curr) };
-            }
-        }
-
-        None
-    }
-}
-
 // ===== impl Pointers =====
 
 impl<T> Pointers<T> {
-    /// Create a new set of empty pointers
-    pub(crate) fn new() -> Pointers<T> {
-        Pointers {
-            inner: UnsafeCell::new(PointersInner {
-                prev: None,
-                next: None,
-                _pin: PhantomPinned,
-            }),
+    pub(crate) fn new() -> Self {
+        Self {
+            prev: Cell::new(None),
+            next: Cell::new(None),
+            _pin: PhantomPinned,
         }
     }
-
     fn get_prev(&self) -> Option<NonNull<T>> {
-        // SAFETY: prev is the first field in PointersInner, which is #[repr(C)].
-        unsafe {
-            let inner = self.inner.get();
-            let prev = inner as *const Option<NonNull<T>>;
-            ptr::read(prev)
-        }
+        self.prev.get()
     }
     fn get_next(&self) -> Option<NonNull<T>> {
-        // SAFETY: next is the second field in PointersInner, which is #[repr(C)].
-        unsafe {
-            let inner = self.inner.get();
-            let prev = inner as *const Option<NonNull<T>>;
-            let next = prev.add(1);
-            ptr::read(next)
-        }
+        self.next.get()
     }
-
-    fn set_prev(&mut self, value: Option<NonNull<T>>) {
-        // SAFETY: prev is the first field in PointersInner, which is #[repr(C)].
-        unsafe {
-            let inner = self.inner.get();
-            let prev = inner as *mut Option<NonNull<T>>;
-            ptr::write(prev, value);
-        }
+    fn set_prev(&self, value: Option<NonNull<T>>) {
+        self.prev.set(value);
     }
-    fn set_next(&mut self, value: Option<NonNull<T>>) {
-        // SAFETY: next is the second field in PointersInner, which is #[repr(C)].
-        unsafe {
-            let inner = self.inner.get();
-            let prev = inner as *mut Option<NonNull<T>>;
-            let next = prev.add(1);
-            ptr::write(next, value);
-        }
+    fn set_next(&self, value: Option<NonNull<T>>) {
+        self.next.set(value);
     }
 }
 
@@ -362,13 +259,15 @@ mod tests {
         }
 
         unsafe fn from_raw(ptr: NonNull<Entry>) -> Pin<&'a Entry> {
-            Pin::new_unchecked(&*ptr.as_ptr())
+            // SAFETY: The test list retains the original shared pinned entry.
+            unsafe { Pin::new_unchecked(&*ptr.as_ptr()) }
         }
 
         unsafe fn pointers(target: NonNull<Entry>) -> NonNull<Pointers<Entry>> {
             // Test entries are held through shared pinned references. Access
             // the interior-mutable links without creating &mut to all of Entry.
-            NonNull::from(&target.as_ref().pointers)
+            // SAFETY: The list guarantees a live test entry.
+            NonNull::from(&unsafe { target.as_ref() }.pointers)
         }
     }
 

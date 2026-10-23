@@ -225,6 +225,86 @@ fn waking_a_timer_can_drop_another_timer_without_borrow_conflicts() {
 }
 
 #[test]
+fn cancelling_a_timer_can_drop_another_sleep_through_its_waker_destructor() {
+    // Dropping the final Arc behind a standard Waker can run arbitrary user
+    // destruction. The callback stays local rather than making sleeps Send.
+    thread_local! {
+        static ON_DROP: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    }
+    struct DropWake;
+    // Waker::noop has no final-Arc destructor, which is the behavior under test.
+    #[allow(clippy::manual_noop_waker)]
+    impl Wake for DropWake {
+        fn wake(self: Arc<Self>) {}
+    }
+    impl Drop for DropWake {
+        fn drop(&mut self) {
+            if let Some(callback) = ON_DROP.with(|slot| slot.take()) {
+                callback();
+            }
+        }
+    }
+
+    let now = Instant::now();
+    let timer = Timer::new(now);
+    let deadline = now + Duration::from_millis(1);
+    let mut first = Box::pin(timer.with(|| sleep_until(deadline)));
+    let waker = Waker::from(Arc::new(DropWake));
+    assert!(
+        first
+            .as_mut()
+            .poll(&mut Context::from_waker(&waker))
+            .is_pending()
+    );
+    drop(waker);
+
+    let mut sibling = Box::pin(timer.with(|| sleep_until(deadline)));
+    assert!(poll(sibling.as_mut()).is_pending());
+    ON_DROP.with(|slot| *slot.borrow_mut() = Some(Box::new(move || drop(sibling))));
+
+    // The old implementation dropped the waker while borrowing the wheel.
+    // This reentrant cancellation then panicked and freed a still-linked node.
+    drop(first);
+    assert!(ON_DROP.with(|slot| slot.borrow().is_none()));
+    assert_eq!(timer.next_wake(), None);
+    timer.advance(deadline);
+    assert_eq!(timer.next_wake(), None);
+}
+
+#[test]
+fn a_panicking_waker_destructor_leaves_other_timer_entries_valid() {
+    struct PanickingDropWake;
+    // The destructor is intentionally observable even though wake does no work.
+    #[allow(clippy::manual_noop_waker)]
+    impl Wake for PanickingDropWake {
+        fn wake(self: Arc<Self>) {}
+    }
+    impl Drop for PanickingDropWake {
+        fn drop(&mut self) {
+            panic!("waker destructor");
+        }
+    }
+    let now = Instant::now();
+    let timer = Timer::new(now);
+    let deadline = now + Duration::from_millis(1);
+    let mut first = Box::pin(timer.with(|| sleep_until(deadline)));
+    let waker = Waker::from(Arc::new(PanickingDropWake));
+    assert!(
+        first
+            .as_mut()
+            .poll(&mut Context::from_waker(&waker))
+            .is_pending()
+    );
+    drop(waker);
+    let mut sibling = Box::pin(timer.with(|| sleep_until(deadline)));
+    assert!(poll(sibling.as_mut()).is_pending());
+    assert!(catch_unwind(AssertUnwindSafe(|| drop(first))).is_err());
+    timer.advance(deadline);
+    assert!(poll(sibling.as_mut()).is_ready());
+    assert_eq!(timer.next_wake(), None);
+}
+
+#[test]
 fn timer_context_is_restored_after_nested_scopes_and_unwind() {
     let now = Instant::now();
     let outer = Timer::new(now);
@@ -238,4 +318,63 @@ fn timer_context_is_restored_after_nested_scopes_and_unwind() {
     });
     assert_eq!(outer.next_wake(), None);
     assert!(catch_unwind(|| sleep(Duration::ZERO)).is_err());
+}
+
+#[test]
+fn a_wake_callback_can_reset_a_sibling_already_queued_for_firing() {
+    thread_local! {
+        static ON_WAKE: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    }
+    struct WakeLocal;
+    impl Wake for WakeLocal {
+        fn wake(self: Arc<Self>) {
+            if let Some(callback) = ON_WAKE.with(|slot| slot.take()) {
+                callback();
+            }
+        }
+    }
+
+    for reset_to in [0, 5] {
+        let now = Instant::now();
+        let timer = Rc::new(Timer::new(now));
+        let deadline = now + Duration::from_millis(1);
+        let mut first = Box::pin(timer.with(|| sleep_until(deadline)));
+        let waker = Waker::from(Arc::new(WakeLocal));
+        assert!(
+            first
+                .as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
+        let sibling = Rc::new(RefCell::new(Box::pin(timer.with(|| sleep_until(deadline)))));
+        assert!(poll(sibling.borrow_mut().as_mut()).is_pending());
+        let callback_timer = timer.clone();
+        let callback_sibling = sibling.clone();
+        ON_WAKE.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                // Both deadlines have been detached from their bucket. The
+                // sibling remains in the pending queue during this callback.
+                assert_eq!(callback_timer.next_wake(), Some(deadline));
+                callback_sibling
+                    .borrow_mut()
+                    .as_mut()
+                    .reset(now + Duration::from_millis(reset_to));
+            }));
+        });
+        timer.advance(deadline);
+        assert!(poll(first.as_mut()).is_ready());
+        assert_eq!(
+            poll(sibling.borrow_mut().as_mut()).is_ready(),
+            reset_to == 0
+        );
+        if reset_to > 0 {
+            assert_eq!(
+                timer.next_wake(),
+                Some(now + Duration::from_millis(reset_to))
+            );
+            timer.advance(now + Duration::from_millis(reset_to));
+            assert!(poll(sibling.borrow_mut().as_mut()).is_ready());
+        }
+        assert_eq!(timer.next_wake(), None);
+    }
 }

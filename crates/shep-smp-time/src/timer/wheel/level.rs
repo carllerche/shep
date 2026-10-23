@@ -21,8 +21,7 @@ pub(crate) struct Level {
     /// The least-significant bit represents slot zero.
     occupied: u64,
 
-    /// Slots. We access these via the EntryInner `current_list` as well, so
-    /// this needs to be an UnsafeCell.
+    /// Buckets own list membership; all mutations borrow the owning wheel.
     slot: [EntryList; LEVEL_MULT],
 }
 
@@ -156,11 +155,8 @@ impl Level {
             // being placed in a slot that is beyond the end of all of the
             // arrays.
             //
-            // To deal with this, we first limit timers to being scheduled no
-            // more than MAX_DURATION ticks in the future; that is, they're at
-            // most one rotation of the top level away. Then, we force timers
-            // that logically would go into the top+1 level, to instead go into
-            // the top level's slots.
+            // To deal with this, we force timers that logically would go into
+            // the top+1 level to instead go into the top level's slots.
             //
             // What this means is that the top level's slots act as a
             // pseudo-ring buffer, and we rotate around them indefinitely. If we
@@ -196,8 +192,12 @@ impl Level {
             return None;
         }
 
-        // Get the slot for now using Maths
-        let now_slot = (now / self.slot_range) as usize;
+        // Top-level entries in the current slot belong to the next rotation:
+        // its start has already passed. Search subsequent slots first so that
+        // a distant timer here cannot hide an earlier timer in another slot.
+        // Lower levels cannot contain entries in an already processed slot.
+        let now_slot =
+            (now / self.slot_range) as usize + usize::from(self.level == super::NUM_LEVELS - 1);
         let occupied = self.occupied.rotate_right(now_slot as u32);
         let zeros = occupied.trailing_zeros() as usize;
         let slot = (zeros + now_slot) % 64;
@@ -206,7 +206,8 @@ impl Level {
     }
 
     pub(crate) unsafe fn add_entry(&mut self, item: TimerHandle) {
-        let slot = slot_for(item.cached_when(), self.level);
+        // SAFETY: The caller transfers a live pinned entry into this bucket.
+        let slot = slot_for(unsafe { item.cached_when() }, self.level);
 
         self.slot[slot].push_front(item);
 
@@ -214,6 +215,8 @@ impl Level {
     }
 
     pub(crate) unsafe fn remove_entry(&mut self, item: NonNull<TimerShared>) {
+        // SAFETY: The caller guarantees a live pinned node in this level's
+        // cached bucket. The cached deadline changes only after unlinking.
         let slot = slot_for(unsafe { item.as_ref().cached_when() }, self.level);
 
         unsafe { self.slot[slot].remove(item) };
