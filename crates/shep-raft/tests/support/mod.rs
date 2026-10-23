@@ -140,23 +140,21 @@ impl Cluster {
             configure,
         };
         for (i, l) in listeners.into_iter().enumerate() {
-            let node = cluster.open(i).await;
+            let node = cluster.open(i);
             node.node.serve(l);
             cluster.nodes.push(Some(node));
         }
         cluster
     }
 
-    async fn open(&self, i: usize) -> TestNode {
+    fn open(&self, i: usize) -> TestNode {
         let smp = SmpConfig {
             pin: false,
             ..SmpConfig::with_cores(self.cores)
         };
         let mut config = test_config(i as u64 + 1, self.dirs[i].path());
         (self.configure)(&mut config);
-        let node = RaftNode::start(config, smp, |_| Recorder::default())
-            .await
-            .unwrap();
+        let node = RaftNode::start(config, smp, |_| Recorder::default(), &[]).unwrap();
         TestNode { node }
     }
 
@@ -268,7 +266,7 @@ impl Cluster {
 
     pub async fn restart(&mut self, i: usize) {
         assert!(self.nodes[i].is_none());
-        let node = self.open(i).await;
+        let node = self.open(i);
         let mut tries = 0;
         let listener = loop {
             match TcpListener::bind(self.addrs[i]).await {

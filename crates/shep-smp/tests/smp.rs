@@ -14,8 +14,8 @@ fn config(cores: usize) -> SmpConfig {
 }
 
 /// Cores with no state of their own.
-async fn smp(cores: usize) -> Smp<()> {
-    Smp::start(config(cores), |_| async {}).await.unwrap()
+fn smp(cores: usize) -> Smp<()> {
+    Smp::start(config(cores), |_| async { Ok::<_, SmpError>(()) }).unwrap()
 }
 
 /// Stops `smp`'s cores from a thread of its own: `shutdown` blocks, so it
@@ -32,7 +32,7 @@ async fn stop<S: 'static>(smp: &Smp<S>) {
 
 #[tokio::test(flavor = "local")]
 async fn work_runs_on_the_core_it_was_sent_to() {
-    let smp = smp(4).await;
+    let smp = smp(4);
     assert_eq!(current_core(), None);
     for core in smp.core_ids() {
         let (on, thread) = smp
@@ -55,7 +55,7 @@ async fn work_runs_on_the_core_it_was_sent_to() {
 
 #[tokio::test(flavor = "local")]
 async fn a_cores_futures_need_not_be_send() {
-    let smp = smp(2).await;
+    let smp = smp(2);
     let n = smp
         .submit_to(CoreId(1), |_| async {
             let shared = Rc::new(RefCell::new(0));
@@ -73,7 +73,7 @@ async fn a_cores_futures_need_not_be_send() {
 
 #[tokio::test(flavor = "local")]
 async fn zero_cores_means_one() {
-    let smp = smp(0).await;
+    let smp = smp(0);
     assert_eq!(smp.cores(), 1);
     assert_eq!(smp.submit_to(CoreId(0), |_| async { 7 }).await, Ok(7));
     assert_eq!(
@@ -85,7 +85,7 @@ async fn zero_cores_means_one() {
 
 #[tokio::test(flavor = "local")]
 async fn calls_to_every_core_answer_in_core_order() {
-    let smp = smp(5).await;
+    let smp = smp(5);
     let cores = join_all(
         smp.core_ids()
             .map(|core| smp.submit_to(core, move |_| async move { (core, current_core()) })),
@@ -105,7 +105,7 @@ async fn calls_to_every_core_answer_in_core_order() {
 /// One sender's messages to one core start in the order they were sent.
 #[tokio::test(flavor = "local")]
 async fn messages_from_one_sender_start_in_order() {
-    let smp = smp(2).await;
+    let smp = smp(2);
     let seen = Arc::new(Mutex::new(Vec::new()));
     // A call is queued on its first poll, so polling each once, in turn,
     // queues them in order.
@@ -131,7 +131,7 @@ async fn messages_from_one_sender_start_in_order() {
 
 #[tokio::test(flavor = "local")]
 async fn cores_call_each_other() {
-    let smp = smp(3).await;
+    let smp = smp(3);
     let inner = smp.clone();
     // Core 0 asks core 1, which asks core 2.
     let path = smp
@@ -159,7 +159,7 @@ async fn cores_call_each_other() {
 /// and serving, all complete.
 #[tokio::test(flavor = "local")]
 async fn concurrent_calls_between_all_cores_complete() {
-    let smp = smp(4).await;
+    let smp = smp(4);
     let total = Arc::new(AtomicUsize::new(0));
     let inner = smp.clone();
     let t = total.clone();
@@ -195,7 +195,7 @@ async fn concurrent_calls_between_all_cores_complete() {
 
 #[tokio::test(flavor = "local")]
 async fn a_panic_fails_that_call_and_the_core_survives() {
-    let smp = smp(2).await;
+    let smp = smp(2);
     let r = smp.submit_to(CoreId(1), |_| async { panic!("boom") }).await;
     assert_eq!(r, Err::<(), _>(SmpError::Panicked));
     assert_eq!(smp.submit_to(CoreId(1), |_| async { 1 }).await, Ok(1));
@@ -204,7 +204,7 @@ async fn a_panic_fails_that_call_and_the_core_survives() {
 
 #[tokio::test(flavor = "local")]
 async fn shutdown_fails_pending_and_later_work() {
-    let smp = smp(2).await;
+    let smp = smp(2);
     let started = Arc::new(tokio::sync::Notify::new());
     let s = started.clone();
     let pending = tokio::task::spawn_local({
@@ -232,9 +232,10 @@ async fn shutdown_fails_pending_and_later_work() {
 /// target core's.
 #[tokio::test(flavor = "local")]
 async fn each_core_has_its_own_state() {
-    let smp = Smp::start(config(3), |core| async move { RefCell::new(core.0 * 100) })
-        .await
-        .unwrap();
+    let smp = Smp::start(config(3), |core| async move {
+        Ok::<_, SmpError>(RefCell::new(core.0 * 100))
+    })
+    .unwrap();
     for core in smp.core_ids() {
         smp.submit_to(core, |c| async move { *c.borrow_mut() += 1 })
             .await
@@ -274,14 +275,13 @@ async fn states_live_and_die_on_their_cores() {
     let smp = Smp::start(config(3), move |_| {
         let log = l.clone();
         async move {
-            Probe {
+            Ok::<_, SmpError>(Probe {
                 what: "state",
                 built_on: current_core(),
                 log,
-            }
+            })
         }
     })
-    .await
     .unwrap();
     // A task on every core that never finishes, holding a probe of its own.
     let l = log.clone();
@@ -319,6 +319,82 @@ async fn states_live_and_die_on_their_cores() {
 #[tokio::test(flavor = "local")]
 #[should_panic(expected = "Smp::shutdown blocks")]
 async fn shutdown_refuses_to_block_a_runtime() {
-    let smp = smp(1).await;
+    let smp = smp(1);
     smp.shutdown();
+}
+
+/// Starting needs no runtime: `start` blocks while each core builds its
+/// state on its own runtime, and the state's async work runs there.
+#[test]
+fn starts_and_stops_without_a_runtime() {
+    let built = Arc::new(Mutex::new(Vec::new()));
+    let b = built.clone();
+    let smp = Smp::start(config(3), move |core| {
+        let built = b.clone();
+        async move {
+            tokio::task::yield_now().await;
+            built.lock().unwrap().push((core, current_core()));
+            Ok::<_, SmpError>(())
+        }
+    })
+    .unwrap();
+    let mut built = built.lock().unwrap().clone();
+    built.sort();
+    assert_eq!(
+        built,
+        (0..3)
+            .map(|i| (CoreId(i), Some(CoreId(i))))
+            .collect::<Vec<_>>()
+    );
+    smp.shutdown();
+}
+
+#[derive(Debug, PartialEq)]
+enum StartError {
+    Smp(SmpError),
+    Core(usize),
+}
+
+impl From<SmpError> for StartError {
+    fn from(e: SmpError) -> StartError {
+        StartError::Smp(e)
+    }
+}
+
+/// If any core fails to build its state, `start` stops every core, dropping
+/// the states that were built, and returns the lowest core's error.
+#[test]
+fn a_failing_core_stops_them_all() {
+    struct Probe(Arc<AtomicUsize>);
+    impl Drop for Probe {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let d = dropped.clone();
+    let r = Smp::start(config(4), move |core| {
+        let dropped = d.clone();
+        async move {
+            match core.0 {
+                1 | 3 => Err(StartError::Core(core.0)),
+                _ => Ok(Probe(dropped)),
+            }
+        }
+    });
+    assert_eq!(r.err(), Some(StartError::Core(1)));
+    // Cores 0 and 2 built theirs; both are gone by the time `start` returns.
+    assert_eq!(dropped.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn a_panicking_core_fails_start() {
+    let r = Smp::start(config(2), |core| async move {
+        assert_ne!(core, CoreId(1), "core 1 can't start");
+        Ok::<_, SmpError>(())
+    });
+    assert_eq!(
+        r.err(),
+        Some(SmpError::Start("core 1 panicked while starting".into()))
+    );
 }

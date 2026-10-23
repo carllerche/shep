@@ -249,64 +249,56 @@ pub struct RaftStats {
 }
 
 impl<M: Machine> RaftNode<M> {
-    /// Starts the cores `smp` describes, opens each one's storage, and
-    /// reopens the groups it hosted. The node's own tasks (serving) run on
-    /// the calling thread, which must run a
-    /// [`LocalRuntime`](tokio::runtime::LocalRuntime).
-    pub async fn start(
+    /// Starts the cores `smp` describes and, on each, opens its storage and
+    /// reopens the groups it hosted. Then creates each of `required` that no
+    /// core hosts, on the core given; one hosted on another core fails the
+    /// start. Blocks until all that is done, so when it returns the node is
+    /// set up and nothing has been served: the caller needn't be async.
+    /// Serving ([`RaftNode::serve`]) needs a
+    /// [`LocalRuntime`](tokio::runtime::LocalRuntime) on the calling thread.
+    pub fn start(
         config: RaftConfig,
         smp: SmpConfig,
         make_sm: impl Fn(GroupId) -> M + Send + Sync + 'static,
+        required: &[(GroupId, CoreId)],
     ) -> Result<RaftNode<M>, RaftNodeError> {
         let config = Arc::new(config);
+        let cores = smp.cores.max(1);
         // Fail on a bad config here, not on every core.
         config.engine_config()?;
+        if let Some(&(_, core)) = required.iter().find(|(_, core)| core.0 >= cores) {
+            return Err(SmpError::NoSuchCore(core).into());
+        }
         let lock = lock_data_dir(&config.data_dir)?;
-        check_removed_cores(&config, smp.cores.max(1)).await?;
+        check_removed_cores(&config, cores)?;
         let make_sm: Arc<MakeSm<M>> = Arc::new(make_sm);
         let stats = Arc::new(NetStats::default());
         let faults = Arc::new(Faults::default());
-        let errors = Arc::new(Mutex::new(Vec::new()));
-        let (c, m, e, st, f) = (
+        let hosted = Arc::new(Mutex::new(Vec::new()));
+        let (c, m, st, f, h) = (
             config.clone(),
             make_sm.clone(),
-            errors.clone(),
             stats.clone(),
             faults.clone(),
+            hosted.clone(),
         );
-        let cores = Smp::start(smp, move |core| {
-            let (config, make_sm, errors, stats, faults) =
-                (c.clone(), m.clone(), e.clone(), st.clone(), f.clone());
+        let cores = Smp::start(smp, move |id| {
+            let (config, make_sm, stats, faults, hosted) =
+                (c.clone(), m.clone(), st.clone(), f.clone(), h.clone());
             async move {
-                match Core::open(core, config, make_sm, stats, faults).await {
-                    Ok(core) => core,
-                    Err(err) => {
-                        errors.lock().unwrap().push(err.to_string());
-                        Core::failed(core)
-                    }
-                }
+                let core = Core::open(id, config, make_sm, stats, faults).await?;
+                hosted.lock().unwrap().push((id, core.group_ids()));
+                Ok::<_, RaftNodeError>(core)
             }
-        })
-        .await?;
-        let failed = errors.lock().unwrap().first().cloned();
-        if let Some(err) = failed {
-            stop_cores(cores).await;
-            return Err(RaftNodeError::Raft(format!("opening a core: {err}")));
-        }
-        let hosted = match cores
-            .invoke_on_all(|c| async move { (c.id, c.group_ids()) })
-            .await
-        {
-            Ok(hosted) => hosted,
+        })?;
+        let hosted = std::mem::take(&mut *hosted.lock().unwrap());
+        let routes = match create_required(&cores, hosted, required) {
+            Ok(routes) => routes,
             Err(e) => {
-                stop_cores(cores).await;
-                return Err(e.into());
+                stop_cores_blocking(cores);
+                return Err(e);
             }
         };
-        let routes = hosted
-            .into_iter()
-            .flat_map(|(core, groups)| groups.into_iter().map(move |g| (g, core)))
-            .collect();
         Ok(RaftNode {
             shared: Arc::new(Shared {
                 config,
@@ -991,9 +983,57 @@ async fn stop_cores<S: 'static>(cores: Smp<S>) {
     let _ = stopped.await;
 }
 
+/// The routing table from what each core hosts, after creating each
+/// required group no core hosts, on its core. Only once every core has
+/// reported is it known that no other core has a group.
+fn create_required<M: Machine>(
+    cores: &Smp<Core<M>>,
+    hosted: Vec<(CoreId, Vec<GroupId>)>,
+    required: &[(GroupId, CoreId)],
+) -> Result<HashMap<GroupId, CoreId>, RaftNodeError> {
+    let mut routes = HashMap::new();
+    for (core, groups) in hosted {
+        for group in groups {
+            if let Some(other) = routes.insert(group, core) {
+                return Err(RaftNodeError::Raft(format!(
+                    "group {group} is on both {other} and {core}"
+                )));
+            }
+        }
+    }
+    for &(group, core) in required {
+        match routes.get(&group) {
+            Some(&on) if on == core => {}
+            Some(&on) => {
+                return Err(RaftNodeError::Raft(format!(
+                    "group {group} is required on {core} but is on {on}"
+                )));
+            }
+            None => {
+                // The cores run it; this thread only waits.
+                shep_futures::future::block_on(cores.submit_to(core, move |c| async move {
+                    c.create(group).await.map_err(|e| e.to_string())
+                }))?
+                .map_err(RaftNodeError::Raft)?;
+                routes.insert(group, core);
+            }
+        }
+    }
+    Ok(routes)
+}
+
+/// Stops the cores and waits, for `start`, which blocks anyway. The stop runs
+/// on a thread of its own: the caller may be running a runtime, and
+/// `Smp::shutdown` won't block one.
+fn stop_cores_blocking<S: 'static>(cores: Smp<S>) {
+    std::thread::scope(|scope| {
+        scope.spawn(|| cores.shutdown());
+    });
+}
+
 /// Refuses to start with fewer cores than host groups: a core's groups are
 /// in its own directory, and no core would open them.
-async fn check_removed_cores(config: &RaftConfig, cores: usize) -> Result<(), RaftNodeError> {
+fn check_removed_cores(config: &RaftConfig, cores: usize) -> Result<(), RaftNodeError> {
     let cores_dir = config.data_dir.join("cores");
     let entries = match std::fs::read_dir(&cores_dir) {
         Ok(entries) => entries,
@@ -1009,29 +1049,47 @@ async fn check_removed_cores(config: &RaftConfig, cores: usize) -> Result<(), Ra
             removed.push(core);
         }
     }
-    removed.sort();
-    for core in removed {
-        let dir = cores_dir.join(core.to_string());
-        let storage = Storage::open(dir, config.storage.clone()).await?;
-        let groups = storage.kvstore().scan(KeySpace::SHARD_PLACEMENT).len();
-        if groups > 0 {
-            return Err(RaftNodeError::CoreRemoved {
-                core,
-                groups,
-                cores,
-            });
-        }
+    if removed.is_empty() {
+        return Ok(());
     }
-    Ok(())
+    removed.sort();
+    // Opening storage is async. The cores aren't running yet, and the caller
+    // may be running a runtime of its own, so it gets a thread and runtime
+    // to itself.
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build_local(Default::default())?;
+                rt.block_on(async {
+                    for core in removed {
+                        let dir = cores_dir.join(core.to_string());
+                        let storage = Storage::open(dir, config.storage.clone()).await?;
+                        let groups = storage.kvstore().scan(KeySpace::SHARD_PLACEMENT).len();
+                        if groups > 0 {
+                            return Err(RaftNodeError::CoreRemoved {
+                                core,
+                                groups,
+                                cores,
+                            });
+                        }
+                    }
+                    Ok(())
+                })
+            })
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+    })
 }
 
 /// One core's groups.
 struct Core<M: Machine> {
     id: CoreId,
     config: Arc<RaftConfig>,
-    storage: Option<Storage>,
+    storage: Storage,
     peers: Rc<Peers>,
-    make_sm: Option<Arc<MakeSm<M>>>,
+    make_sm: Arc<MakeSm<M>>,
     groups: Rc<RefCell<HashMap<GroupId, Rc<Group<M>>>>>,
 }
 
@@ -1094,9 +1152,9 @@ impl<M: Machine> Core<M> {
         let core = Core {
             id,
             config: config.clone(),
-            storage: Some(storage),
+            storage,
             peers,
-            make_sm: Some(make_sm),
+            make_sm,
             groups: Rc::new(RefCell::new(HashMap::new())),
         };
         for (key, _) in core.storage().kvstore().scan(KeySpace::SHARD_PLACEMENT) {
@@ -1111,29 +1169,8 @@ impl<M: Machine> Core<M> {
         Ok(core)
     }
 
-    /// A core that couldn't open, so `start` can report it.
-    fn failed(id: CoreId) -> Core<M> {
-        Core {
-            id,
-            config: Arc::new(RaftConfig::new(0, "")),
-            storage: None,
-            peers: Rc::new(Peers::new(
-                NetConfig {
-                    append_window: 1,
-                    heartbeat_linger: Duration::ZERO,
-                    rpc_timeout: Duration::ZERO,
-                    reconnect: ReconnectConfig::default(),
-                },
-                Arc::default(),
-                Arc::default(),
-            )),
-            make_sm: None,
-            groups: Rc::new(RefCell::new(HashMap::new())),
-        }
-    }
-
     fn storage(&self) -> &Storage {
-        self.storage.as_ref().expect("core opened")
+        &self.storage
     }
 
     fn group_ids(&self) -> Vec<GroupId> {
@@ -1203,8 +1240,7 @@ impl<M: Machine> Core<M> {
             storage.kvstore().clone(),
             self.config.max_append_bytes,
         );
-        let make_sm = self.make_sm.as_ref().expect("core opened");
-        let sm = SmAdapter::new(make_sm(group));
+        let sm = SmAdapter::new((self.make_sm)(group));
         let network = NetworkFactory {
             group,
             peers: self.peers.clone(),

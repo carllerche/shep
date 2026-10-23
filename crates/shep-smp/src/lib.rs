@@ -113,6 +113,15 @@ struct Core {
     stop: Mutex<Option<oneshot::Sender<()>>>,
 }
 
+impl Core {
+    /// Tells the core's runtime to end, once.
+    fn stop(&self) {
+        if let Some(stop) = self.stop.lock().unwrap().take() {
+            let _ = stop.send(());
+        }
+    }
+}
+
 thread_local! {
     static CURRENT: Cell<Option<CoreId>> = const { Cell::new(None) };
     /// This core's state. A core belongs to one `Smp`, so it has one, of
@@ -136,57 +145,80 @@ fn state<S: 'static>() -> Rc<S> {
 }
 
 impl<S: 'static> Smp<S> {
-    /// Starts the cores, building each one's state with `make`, on that
-    /// core. Each runs until [`Smp::shutdown`].
-    pub async fn start<F, Fut>(config: SmpConfig, make: F) -> Result<Smp<S>, SmpError>
+    /// Starts the cores and builds each one's state with `make`, run on that
+    /// core's runtime, so it can be async and use the core as any task does.
+    /// Blocks until every core's state is built: the caller needn't be async
+    /// or run a runtime. Each core then runs until [`Smp::shutdown`].
+    ///
+    /// The cores start together. If `make` fails, or panics, on any core,
+    /// every core is stopped and the lowest-numbered core's error returned.
+    pub fn start<F, Fut, E>(config: SmpConfig, make: F) -> Result<Smp<S>, E>
     where
         F: Fn(CoreId) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = S> + 'static,
+        Fut: Future<Output = Result<S, E>> + 'static,
+        E: From<SmpError> + Send + 'static,
     {
         let cpus = if config.pin {
             core_affinity::get_core_ids().unwrap_or_default()
         } else {
             Vec::new()
         };
-        let mut cores = Vec::new();
-        let mut threads = Vec::new();
+        let make = Arc::new(make);
+        let mut starting = Vec::new();
+        let mut failed = None;
         for i in 0..config.cores.max(1) {
             let (stop, stopped) = oneshot::channel();
-            let (handle_tx, handle_rx) = std::sync::mpsc::channel();
+            let (ready_tx, ready) = std::sync::mpsc::channel();
             let cpu = cpus.get(i).copied();
-            let thread = std::thread::Builder::new()
+            let make = make.clone();
+            let spawned = std::thread::Builder::new()
                 .name(format!("{}-{i}", config.name))
-                .spawn(move || run_core(CoreId(i), cpu, handle_tx, stopped))
-                .map_err(|e| SmpError::Start(e.to_string()))?;
-            let handle = handle_rx
-                .recv()
-                .map_err(|_| SmpError::Start(format!("core {i} exited while starting")))?;
-            cores.push(Core {
-                handle,
-                stop: Mutex::new(Some(stop)),
-            });
+                .spawn(move || run_core(CoreId(i), cpu, &*make, ready_tx, stopped));
+            match spawned {
+                Ok(thread) => starting.push((thread, ready, stop)),
+                Err(e) => {
+                    failed = Some(SmpError::Start(e.to_string()).into());
+                    break;
+                }
+            }
+        }
+        let mut cores = Vec::new();
+        let mut threads = Vec::new();
+        for (i, (thread, ready, stop)) in starting.into_iter().enumerate() {
+            match ready.recv() {
+                Ok(Ok(handle)) => cores.push(Core {
+                    handle,
+                    stop: Mutex::new(Some(stop)),
+                }),
+                Ok(Err(e)) => {
+                    failed.get_or_insert(e);
+                }
+                // The thread ended without a word: `make` panicked.
+                Err(_) => {
+                    failed.get_or_insert(
+                        SmpError::Start(format!("core {i} panicked while starting")).into(),
+                    );
+                }
+            }
             threads.push(thread);
         }
-        let smp = Smp {
+        if let Some(e) = failed {
+            for core in &cores {
+                core.stop();
+            }
+            for thread in threads {
+                let _ = thread.join();
+            }
+            return Err(e);
+        }
+        Ok(Smp {
             shared: Arc::new(Shared {
                 cores,
                 threads: Mutex::new(threads),
                 shut_down: AtomicBool::new(false),
             }),
             _state: PhantomData,
-        };
-        let make = Arc::new(make);
-        let built = smp.core_ids().map(|core| {
-            let make = make.clone();
-            smp.run_on(core, move || async move {
-                let state: Rc<dyn Any> = Rc::new(make(core).await);
-                STATE.with(|s| *s.borrow_mut() = Some(state));
-            })
-        });
-        for r in join_all(built).await {
-            r?;
-        }
-        Ok(smp)
+        })
     }
 
     pub fn cores(&self) -> usize {
@@ -289,9 +321,7 @@ impl<S: 'static> Smp<S> {
             return;
         }
         for core in &self.shared.cores {
-            if let Some(stop) = core.stop.lock().unwrap().take() {
-                let _ = stop.send(());
-            }
+            core.stop();
         }
         let threads = std::mem::take(&mut *self.shared.threads.lock().unwrap());
         for t in threads {
@@ -300,12 +330,17 @@ impl<S: 'static> Smp<S> {
     }
 }
 
-fn run_core(
+fn run_core<S, F, Fut, E>(
     core: CoreId,
     cpu: Option<core_affinity::CoreId>,
-    handle: std::sync::mpsc::Sender<Handle>,
+    make: &F,
+    ready: std::sync::mpsc::Sender<Result<Handle, E>>,
     stopped: oneshot::Receiver<()>,
-) {
+) where
+    S: 'static,
+    F: Fn(CoreId) -> Fut,
+    Fut: Future<Output = Result<S, E>>,
+{
     if let Some(cpu) = cpu
         && !core_affinity::set_for_current(cpu)
     {
@@ -316,7 +351,18 @@ fn run_core(
         .enable_all()
         .build_local(LocalOptions::default())
         .expect("building a core's runtime");
-    let _ = handle.send(rt.handle().clone());
+    match rt.block_on(make(core)) {
+        Ok(state) => {
+            let state: Rc<dyn Any> = Rc::new(state);
+            STATE.with(|s| *s.borrow_mut() = Some(state));
+            let _ = ready.send(Ok(rt.handle().clone()));
+        }
+        Err(e) => {
+            // Whatever `make` spawned goes with the runtime.
+            let _ = ready.send(Err(e));
+            return;
+        }
+    }
     // Work arrives as tasks spawned through the handle; the runtime runs
     // them until told to stop.
     rt.block_on(async move {

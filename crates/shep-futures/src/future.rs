@@ -1,14 +1,42 @@
-//! Futures: running many at once, sharing one result, catching panics.
+//! Futures: running many at once, sharing one result, catching panics, and
+//! waiting on one from a thread without a runtime.
 
 use std::any::Any;
 use std::future::Future;
 use std::panic::{AssertUnwindSafe, UnwindSafe, catch_unwind};
-use std::pin::Pin;
-use std::task::{Context, Poll};
+use std::pin::{Pin, pin};
+use std::sync::Arc;
+use std::task::{Context, Poll, Wake, Waker};
+use std::thread::Thread;
 
 mod shared;
 
 pub use shared::Shared;
+
+/// Runs `future` to completion on the calling thread, parking it while the
+/// future waits. Nothing else runs meanwhile, so it suits futures driven
+/// elsewhere, like a result from another thread's runtime, not ones that
+/// need a runtime on this thread (timers, sockets, `spawn_local`).
+pub fn block_on<F: Future>(future: F) -> F::Output {
+    struct Unpark(Thread);
+    impl Wake for Unpark {
+        fn wake(self: Arc<Self>) {
+            self.0.unpark();
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.unpark();
+        }
+    }
+    let waker = Waker::from(Arc::new(Unpark(std::thread::current())));
+    let mut cx = Context::from_waker(&waker);
+    let mut future = pin!(future);
+    loop {
+        if let Poll::Ready(v) = future.as_mut().poll(&mut cx) {
+            return v;
+        }
+        std::thread::park();
+    }
+}
 
 /// A boxed future that need not be `Send`.
 pub type LocalBoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;

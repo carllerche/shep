@@ -102,7 +102,7 @@ impl Cluster {
             client,
         };
         for (i, l) in listeners.into_iter().enumerate() {
-            let node = cluster.open(i).await;
+            let node = cluster.open(i);
             node.serve(l);
             cluster.nodes.push(Some(node));
         }
@@ -112,7 +112,7 @@ impl Cluster {
         cluster
     }
 
-    async fn open(&self, i: usize) -> WalNode {
+    fn open(&self, i: usize) -> WalNode {
         let mut config = WalConfig::new(i as u64 + 1, self.dirs[i].path());
         test_config(&mut config);
         if self.controlled {
@@ -123,7 +123,7 @@ impl Cluster {
             pin: false,
             ..SmpConfig::with_cores(CORES)
         };
-        WalNode::start(config, smp).await.unwrap()
+        WalNode::start(config, smp).unwrap()
     }
 
     /// `n` nodes that found a cluster with a WAL controller; partitions come
@@ -175,7 +175,7 @@ impl Cluster {
                 cluster.nodes.push(None);
                 continue;
             }
-            let node = cluster.open(i).await;
+            let node = cluster.open(i);
             node.serve(l);
             cluster.nodes.push(Some(node));
         }
@@ -286,7 +286,7 @@ impl Cluster {
     /// Restarts node `i` from its data directory, at its address.
     pub async fn restart(&mut self, i: usize) {
         assert!(self.nodes[i].is_none(), "node {i} is running");
-        let node = self.open(i).await;
+        let node = self.open(i);
         let mut tries = 0;
         let listener = loop {
             match TcpListener::bind(self.addrs[i]).await {

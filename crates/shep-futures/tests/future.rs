@@ -3,7 +3,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use shep_futures::FutureExt;
-use shep_futures::future::{LocalBoxFuture, join_all};
+use shep_futures::future::{LocalBoxFuture, block_on, join_all};
 
 #[tokio::test(flavor = "local")]
 async fn join_all_keeps_the_given_order() {
@@ -58,4 +58,18 @@ async fn poll_polls_once() {
         shep_futures::poll!(rx.as_mut()),
         std::task::Poll::Ready(Ok(1))
     );
+}
+
+/// `block_on` waits for a future another thread completes, with no runtime
+/// on this one.
+#[test]
+fn block_on_waits_for_another_thread() {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let sender = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(20));
+        tx.send(5u8).unwrap();
+    });
+    assert_eq!(block_on(rx), Ok(5));
+    sender.join().unwrap();
+    assert_eq!(block_on(async { 1 + 1 }), 2);
 }

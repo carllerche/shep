@@ -12,12 +12,12 @@ use support::*;
 
 const G1: GroupId = GroupId(1);
 
-async fn start(dir: &Path, cores: usize) -> Result<RaftNode<Recorder>, RaftNodeError> {
+fn start(dir: &Path, cores: usize) -> Result<RaftNode<Recorder>, RaftNodeError> {
     let smp = SmpConfig {
         pin: false,
         ..SmpConfig::with_cores(cores)
     };
-    RaftNode::start(test_config(1, dir), smp, |_| Recorder::default()).await
+    RaftNode::start(test_config(1, dir), smp, |_| Recorder::default(), &[])
 }
 
 async fn stop(node: RaftNode<Recorder>) {
@@ -43,7 +43,7 @@ async fn write(node: &RaftNode<Recorder>, payload: &'static str) {
 async fn fewer_cores_than_host_groups_is_refused() {
     init_tracing();
     let dir = tempfile::tempdir().unwrap();
-    let node = start(dir.path(), 2).await.unwrap();
+    let node = start(dir.path(), 2).unwrap();
     assert_eq!(
         node.create_group_on(G1, CoreId(1)).await.unwrap(),
         CoreId(1)
@@ -53,7 +53,7 @@ async fn fewer_cores_than_host_groups_is_refused() {
     write(&node, "kept").await;
     stop(node).await;
 
-    match start(dir.path(), 1).await {
+    match start(dir.path(), 1) {
         Err(RaftNodeError::CoreRemoved {
             core: 1,
             groups: 1,
@@ -64,7 +64,7 @@ async fn fewer_cores_than_host_groups_is_refused() {
     }
 
     // More cores is fine; the group stays on core 1.
-    let node = start(dir.path(), 3).await.unwrap();
+    let node = start(dir.path(), 3).unwrap();
     assert_eq!(node.core_of(G1), Some(CoreId(1)));
     write(&node, "more").await;
     let entries = node
@@ -75,7 +75,7 @@ async fn fewer_cores_than_host_groups_is_refused() {
     stop(node).await;
 
     // Core 2 never hosted a group, so it can go again.
-    let node = start(dir.path(), 2).await.unwrap();
+    let node = start(dir.path(), 2).unwrap();
     assert_eq!(node.groups(), vec![G1]);
     stop(node).await;
 }

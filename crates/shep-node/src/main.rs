@@ -55,8 +55,7 @@ fn parse(args: impl Iterator<Item = String>) -> Result<NodeConfig, String> {
     })
 }
 
-#[tokio::main(flavor = "local")]
-async fn main() -> ExitCode {
+fn main() -> ExitCode {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -70,20 +69,33 @@ async fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let node = match Node::start(config).await {
+    let mut node = match Node::start(config) {
         Ok(n) => n,
         Err(e) => {
             eprintln!("starting: {e}");
             return ExitCode::FAILURE;
         }
     };
-    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        .expect("signal handler");
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => {}
-        _ = term.recv() => {}
-    }
-    tracing::info!("shutting down");
-    node.shutdown().await;
-    ExitCode::SUCCESS
+    // This thread serves: it accepts connections, runs the controller's
+    // background work, and waits for a signal to stop.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build_local(Default::default())
+        .expect("building the serving runtime");
+    rt.block_on(async move {
+        if let Err(e) = node.serve() {
+            eprintln!("serving: {e}");
+            node.shutdown().await;
+            return ExitCode::FAILURE;
+        }
+        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("signal handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = term.recv() => {}
+        }
+        tracing::info!("shutting down");
+        node.shutdown().await;
+        ExitCode::SUCCESS
+    })
 }

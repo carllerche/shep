@@ -15,6 +15,9 @@ use shep_wal_controller::{
 
 use crate::{GroupProposal, GroupRejection, GroupResponse, WalError, WalNode};
 
+/// The core this node's controller replica lives on.
+pub(crate) const CONTROLLER_CORE: CoreId = CoreId(0);
+
 /// How often founding and reconciling retry what didn't work yet.
 const RETRY: Duration = Duration::from_millis(100);
 
@@ -102,17 +105,13 @@ impl WalNode {
         })
     }
 
-    /// Opens this node's controller replica, on core 0, and starts founding
-    /// and reconciling in the background.
-    pub(crate) async fn start_controller(&self) -> Result<(), WalError> {
-        self.raft()
-            .create_group_on(CONTROLLER_GROUP, CoreId(0))
-            .await?;
+    /// Starts founding and reconciling in the background. The controller's
+    /// replica, on [`CONTROLLER_CORE`], was opened when the node started.
+    pub(crate) fn start_controller(&self) {
         let node = self.clone();
         self.spawn_background(async move { node.found().await });
         let node = self.clone();
         self.spawn_background(async move { node.reconcile().await });
-        Ok(())
     }
 
     fn seeds(&self) -> Vec<NodeInfo> {

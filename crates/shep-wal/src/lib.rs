@@ -20,7 +20,7 @@ mod state_machine;
 #[doc(hidden)]
 pub mod table;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -105,6 +105,7 @@ struct Shared {
     servers: RefCell<Vec<tokio::task::JoinHandle<()>>>,
     /// The controller's founding and reconciling.
     background: RefCell<Vec<tokio::task::JoinHandle<()>>>,
+    controller_started: Cell<bool>,
     /// For calls to peers outside Raft, like founding's hellos.
     peers: shep_rpc_client::ConnectionCache,
 }
@@ -115,9 +116,20 @@ fn group(p: PartitionId) -> GroupId {
 
 impl WalNode {
     /// Starts the cores `smp` describes, opens the node's storage on them,
-    /// and reopens the partitions it hosted.
-    pub async fn start(config: WalConfig, smp: SmpConfig) -> Result<WalNode, WalError> {
-        let raft = RaftNode::start(config.raft.clone(), smp, GroupSm::for_group).await?;
+    /// and reopens the partitions it hosted; with seeds, it opens the
+    /// controller's replica too. Blocks until that's done; the caller needn't
+    /// be async. The controller's founding and reconciling start with
+    /// [`WalNode::serve`].
+    pub fn start(config: WalConfig, smp: SmpConfig) -> Result<WalNode, WalError> {
+        let required: &[_] = if config.seeds.is_empty() {
+            &[]
+        } else {
+            &[(
+                shep_wal_controller::CONTROLLER_GROUP,
+                controller::CONTROLLER_CORE,
+            )]
+        };
+        let raft = RaftNode::start(config.raft.clone(), smp, GroupSm::for_group, required)?;
         let node = WalNode {
             shared: Rc::new(Shared {
                 peers: shep_rpc_client::ConnectionCache::new(config.raft.reconnect.clone()),
@@ -126,11 +138,9 @@ impl WalNode {
                 shutdown: watch::channel(false).0,
                 servers: RefCell::new(Vec::new()),
                 background: RefCell::new(Vec::new()),
+                controller_started: Cell::new(false),
             }),
         };
-        if !node.config().seeds.is_empty() {
-            node.start_controller().await?;
-        }
         Ok(node)
     }
 
@@ -154,6 +164,15 @@ impl WalNode {
         self.shared.background.borrow_mut().push(task);
     }
 
+    /// Starts the controller's background work, once, on a node with seeds.
+    /// For a node whose server is the caller's ([`WalNode::handle`]); `serve`
+    /// does it itself.
+    pub fn run_controller(&self) {
+        if !self.config().seeds.is_empty() && !self.shared.controller_started.replace(true) {
+            self.start_controller();
+        }
+    }
+
     pub fn node_id(&self) -> u64 {
         self.shared.raft.node_id()
     }
@@ -166,9 +185,12 @@ impl WalNode {
         self.shared.raft.faults()
     }
 
-    /// Serves the Raft and WAL services on `listener` until
-    /// [`WalNode::shutdown`].
+    /// Serves the Raft and WAL services on `listener`, and with seeds runs
+    /// the controller's founding and reconciling, until
+    /// [`WalNode::shutdown`]. Call it on a thread running a
+    /// [`LocalRuntime`](tokio::runtime::LocalRuntime).
     pub fn serve(&self, listener: TcpListener) {
+        self.run_controller();
         let node = self.clone();
         let server = Server::new(
             self.shared.config.raft.server.clone(),

@@ -73,26 +73,50 @@ impl Service {
 /// A running node.
 pub struct Node {
     wal: WalNode,
+    node_id: u64,
+    /// Bound by `start`, accepted on by `serve`.
+    listener: Option<std::net::TcpListener>,
     shutdown: watch::Sender<bool>,
     server: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Node {
-    /// Starts the cores, opens storage, and serves on `config.listen`.
-    pub async fn start(config: NodeConfig) -> Result<Node, NodeError> {
+    /// Binds `config.listen`, starts the cores, and opens storage. Blocks
+    /// until the node is set up; nothing is accepted until [`Node::serve`].
+    /// The caller needn't be async or run a runtime.
+    pub fn start(config: NodeConfig) -> Result<Node, NodeError> {
         let wal_config = config.wal();
         if !wal_config.seeds.iter().any(|s| s.node_id == config.node_id) {
             return Err(NodeError::NotASeed(config.node_id));
         }
-        let listener = TcpListener::bind(config.listen).await?;
+        // Bound first, so a port in use fails before storage recovery runs.
+        // Peers connecting meanwhile wait in the backlog.
+        let listener = std::net::TcpListener::bind(config.listen)?;
+        listener.set_nonblocking(true)?;
         let smp_config = match config.cores {
             Some(n) => SmpConfig::with_cores(n),
             None => SmpConfig::new(),
         };
         let cores = smp_config.cores;
-        let wal = WalNode::start(wal_config.clone(), smp_config).await?;
-        let server = Server::new(wal_config.raft.server.clone(), {
-            let wal = wal.clone();
+        let wal = WalNode::start(wal_config, smp_config)?;
+        tracing::info!(node = config.node_id, listen = %config.listen, cores, "started");
+        Ok(Node {
+            wal,
+            node_id: config.node_id,
+            listener: Some(listener),
+            shutdown: watch::channel(false).0,
+            server: None,
+        })
+    }
+
+    /// Accepts on the listener and runs the controller's background work,
+    /// until [`Node::shutdown`]. Call it once, on a thread running a
+    /// [`LocalRuntime`](tokio::runtime::LocalRuntime).
+    pub fn serve(&mut self) -> Result<(), NodeError> {
+        let listener = self.listener.take().expect("Node::serve is called once");
+        let listener = TcpListener::from_std(listener)?;
+        let server = Server::new(self.wal.config().raft.server.clone(), {
+            let wal = self.wal.clone();
             service_fn(move |req: Request| {
                 let wal = wal.clone();
                 async move {
@@ -103,21 +127,18 @@ impl Node {
                 }
             })
         });
-        let (shutdown, mut stop) = watch::channel(false);
-        let task = tokio::task::spawn_local(async move {
+        let mut stop = self.shutdown.subscribe();
+        self.server = Some(tokio::task::spawn_local(async move {
             tokio::select! {
                 _ = server.serve(listener) => {}
                 _ = async { let _ = stop.wait_for(|s| *s).await; } => {
                     server.shutdown(Duration::from_millis(500)).await
                 }
             }
-        });
-        tracing::info!(node = config.node_id, listen = %config.listen, cores, "started");
-        Ok(Node {
-            wal,
-            shutdown,
-            server: Some(task),
-        })
+        }));
+        self.wal.run_controller();
+        tracing::info!(node = self.node_id, "serving");
+        Ok(())
     }
 
     pub fn wal(&self) -> &WalNode {
