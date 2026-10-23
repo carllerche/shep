@@ -1195,6 +1195,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "shep-smp-exec"
+version = "0.1.0"
+dependencies = [
+ "shep-futures",
+ "shep-smp-task",
+ "tokio",
+]
+
+[[package]]
 name = "shep-smp-io"
 version = "0.1.0"
 dependencies = [
@@ -1212,6 +1221,23 @@ version = "0.1.0"
 dependencies = [
  "shep-smp-io",
  "tokio",
+]
+
+[[package]]
+name = "shep-smp-task"
+version = "0.1.0"
+dependencies = [
+ "shep-futures",
+ "tokio",
+]
+
+[[package]]
+name = "shep-smp-time"
+version = "0.1.0"
+dependencies = [
+ "pin-project-lite",
+ "shep-futures",
+ "shep-smp-exec",
 ]
 
 [[package]]

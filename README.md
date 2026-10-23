@@ -19,6 +19,9 @@ replicates.
 | `crates/shep-rpc-server` | Serving it: concurrent handlers, routing on the header and metadata before the body is read |
 | `crates/shep-rpc-client` | Calling it: pipelined calls over one connection, reconnect with backoff, a connection cache |
 | `crates/shep-smp` | Thread-per-core: a `LocalRuntime` per core, each with its own state, reached with `submit_to` |
+| `crates/shep-smp-task` | Local task ownership and execution, adapted from Monoio; the first component of the future SMP runtime |
+| `crates/shep-smp-exec` | Local FIFO executor with scoped `spawn`, bounded task turns, and driver wakeups |
+| `crates/shep-smp-time` | Monoio's local timer driver, hierarchical timing wheel, sleeps, timeouts, and intervals |
 | `crates/shep-smp-io` | Core-local io_uring files, owned aligned buffers, and explicit I/O lifetime management |
 | `crates/shep-smp-io-scheduler` | Weighted admission with shared physical-device capacity and per-class metrics |
 | `crates/shep-append` | Format-independent buffered append files with explicit written and durable positions |
@@ -35,7 +38,7 @@ replicates.
 | `formal/lean`, `formal/tla` | Lean proofs and TLA+ models of the design's semantics and protocols |
 
 Each crate's interface is tested from `crates/<crate>/tests/`; there are no
-unit tests in `src` (the vendored openraft crates keep theirs). Tests that
+new unit tests in `src` (vendored crates keep their upstream tests). Tests that
 span many components go in `tests/test-<aspect>` crates.
 
 ## Running

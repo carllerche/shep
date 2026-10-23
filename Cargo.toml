@@ -20,6 +20,9 @@ shep-rpc = { path = "crates/shep-rpc" }
 shep-rpc-client = { path = "crates/shep-rpc-client" }
 shep-rpc-server = { path = "crates/shep-rpc-server" }
 shep-smp = { path = "crates/shep-smp" }
+shep-smp-exec = { path = "crates/shep-smp-exec" }
+shep-smp-task = { path = "crates/shep-smp-task" }
+shep-smp-time = { path = "crates/shep-smp-time" }
 shep-smp-io = { path = "crates/shep-smp-io" }
 shep-smp-io-scheduler = { path = "crates/shep-smp-io-scheduler" }
 shep-storage = { path = "crates/shep-storage" }
