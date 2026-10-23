@@ -7,41 +7,21 @@ use std::path::Path;
 use std::time::Duration;
 
 use shep_raft::{GroupId, ProposeError, RaftNode, RaftNodeError};
-use shep_smp::{CoreId, Smp, SmpConfig};
+use shep_smp::{CoreId, SmpConfig};
 use support::*;
 
 const G1: GroupId = GroupId(1);
 
-async fn start(dir: &Path, cores: usize) -> Result<(RaftNode<Recorder>, Smp), RaftNodeError> {
-    let smp = Smp::start(SmpConfig {
+async fn start(dir: &Path, cores: usize) -> Result<RaftNode<Recorder>, RaftNodeError> {
+    let smp = SmpConfig {
         pin: false,
         ..SmpConfig::with_cores(cores)
-    })
-    .unwrap();
-    match RaftNode::start(test_config(1, dir), smp.clone(), |_| Recorder::default()).await {
-        Ok(node) => Ok((node, smp)),
-        Err(e) => {
-            let smp = smp.clone();
-            let (done, finished) = tokio::sync::oneshot::channel();
-            std::thread::spawn(move || {
-                smp.shutdown();
-                let _ = done.send(());
-            });
-            let _ = finished.await;
-            Err(e)
-        }
-    }
+    };
+    RaftNode::start(test_config(1, dir), smp, |_| Recorder::default()).await
 }
 
-async fn stop((node, smp): (RaftNode<Recorder>, Smp)) {
+async fn stop(node: RaftNode<Recorder>) {
     node.shutdown().await;
-    let smp = smp.clone();
-    let (done, finished) = tokio::sync::oneshot::channel();
-    std::thread::spawn(move || {
-        smp.shutdown();
-        let _ = done.send(());
-    });
-    let _ = finished.await;
 }
 
 async fn write(node: &RaftNode<Recorder>, payload: &'static str) {
@@ -65,12 +45,12 @@ async fn fewer_cores_than_host_groups_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let node = start(dir.path(), 2).await.unwrap();
     assert_eq!(
-        node.0.create_group_on(G1, CoreId(1)).await.unwrap(),
+        node.create_group_on(G1, CoreId(1)).await.unwrap(),
         CoreId(1)
     );
     let members = BTreeMap::from([(1, "127.0.0.1:1".to_string())]);
-    node.0.initialize_group(G1, members).await.unwrap();
-    write(&node.0, "kept").await;
+    node.initialize_group(G1, members).await.unwrap();
+    write(&node, "kept").await;
     stop(node).await;
 
     match start(dir.path(), 1).await {
@@ -85,10 +65,9 @@ async fn fewer_cores_than_host_groups_is_refused() {
 
     // More cores is fine; the group stays on core 1.
     let node = start(dir.path(), 3).await.unwrap();
-    assert_eq!(node.0.core_of(G1), Some(CoreId(1)));
-    write(&node.0, "more").await;
+    assert_eq!(node.core_of(G1), Some(CoreId(1)));
+    write(&node, "more").await;
     let entries = node
-        .0
         .with_state_machine(G1, |sm| sm.entries.clone())
         .await
         .unwrap();
@@ -97,6 +76,6 @@ async fn fewer_cores_than_host_groups_is_refused() {
 
     // Core 2 never hosted a group, so it can go again.
     let node = start(dir.path(), 2).await.unwrap();
-    assert_eq!(node.0.groups(), vec![G1]);
+    assert_eq!(node.groups(), vec![G1]);
     stop(node).await;
 }

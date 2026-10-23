@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use shep_rpc_server::{Request, Response, Server, service_fn};
-use shep_smp::{Smp, SmpConfig};
+use shep_smp::SmpConfig;
 use shep_wal::{WalConfig, WalNode};
 use shep_wal_api::Member;
 use tokio::net::TcpListener;
@@ -72,7 +72,6 @@ impl Service {
 
 /// A running node.
 pub struct Node {
-    smp: Smp,
     wal: WalNode,
     shutdown: watch::Sender<bool>,
     server: Option<tokio::task::JoinHandle<()>>,
@@ -90,8 +89,8 @@ impl Node {
             Some(n) => SmpConfig::with_cores(n),
             None => SmpConfig::new(),
         };
-        let smp = Smp::start(smp_config)?;
-        let wal = WalNode::start(wal_config.clone(), smp.clone()).await?;
+        let cores = smp_config.cores;
+        let wal = WalNode::start(wal_config.clone(), smp_config).await?;
         let server = Server::new(wal_config.raft.server.clone(), {
             let wal = wal.clone();
             service_fn(move |req: Request| {
@@ -113,9 +112,8 @@ impl Node {
                 }
             }
         });
-        tracing::info!(node = config.node_id, listen = %config.listen, cores = smp.cores(), "started");
+        tracing::info!(node = config.node_id, listen = %config.listen, cores, "started");
         Ok(Node {
-            smp,
             wal,
             shutdown,
             server: Some(task),
@@ -126,15 +124,12 @@ impl Node {
         &self.wal
     }
 
-    /// Stops serving and closes every log cleanly, then hands back the
-    /// cores, for the caller to stop off any runtime with
-    /// [`Smp::shutdown`].
-    pub async fn shutdown(mut self) -> Smp {
+    /// Stops serving, closes every log cleanly, and stops the cores.
+    pub async fn shutdown(mut self) {
         self.shutdown.send_replace(true);
         if let Some(server) = self.server.take() {
             let _ = server.await;
         }
         self.wal.shutdown().await;
-        self.smp
     }
 }

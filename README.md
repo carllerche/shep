@@ -17,7 +17,7 @@ replicates.
 | `crates/shep-rpc` | General-purpose request/response RPC framing, after Redpanda's: a 32-byte checksummed header, key/value metadata the service defines, frame I/O |
 | `crates/shep-rpc-server` | Serving it: concurrent handlers, routing on the header and metadata before the body is read |
 | `crates/shep-rpc-client` | Calling it: pipelined calls over one connection, reconnect with backoff, a connection cache |
-| `crates/shep-smp` | Thread-per-core: a `current_thread` runtime per core, bounded mailboxes, sharded services |
+| `crates/shep-smp` | Thread-per-core: a `LocalRuntime` per core, each with its own state, reached with `submit_to` |
 | `crates/shep-storage` | Per-core storage, after Redpanda's: segmented logs with coalesced fsync and crash recovery, and a key-value store |
 | `crates/shep-raft-engine` | openraft 0.10.0-alpha.37, forked (see its `FORK.md`), with its test suite |
 | `crates/shep-raft-memstore` | openraft's test-support store, vendored |

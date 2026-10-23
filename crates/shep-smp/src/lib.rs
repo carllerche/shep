@@ -2,26 +2,22 @@
 //!
 //! An [`Smp`] runs one OS thread per core, each with its own tokio
 //! [`LocalRuntime`](tokio::runtime::LocalRuntime), which runs `!Send` tasks
-//! spawned with `spawn_local` directly. Work on a core is ordinary async code with no
-//! locks: state a core owns is `Rc`/`RefCell`, and futures needn't be `Send`.
-//! Cores talk only through [`Smp::submit_to`], which runs a closure on another
-//! core and returns its result.
-//!
-//! [`Sharded`] is Seastar's `sharded<T>`: one instance of a service per core,
-//! reached locally with [`Sharded::local`] or on another core with
-//! [`Sharded::invoke_on`].
+//! spawned with `spawn_local` directly, and each with its own state, an `S`
+//! built on that core when the cores start. Work on a core is ordinary async
+//! code with no locks: the state is `Rc`/`RefCell`, and futures needn't be
+//! `Send`. Cores talk only through [`Smp::submit_to`], which runs a closure
+//! with another core's state, on that core, and returns its result.
 //!
 //! A single core is a complete deployment: everything runs, just on one
 //! thread.
 
 use std::any::Any;
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
 use std::marker::PhantomData;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
@@ -81,12 +77,25 @@ pub enum SmpError {
     /// The work panicked.
     #[error("the task panicked")]
     Panicked,
+    /// A core's thread couldn't be started.
+    #[error("starting a core: {0}")]
+    Start(String),
 }
 
-/// A running set of cores. Cheap to clone and usable from any thread.
-#[derive(Clone)]
-pub struct Smp {
+/// A running set of cores, each with its state `S`. Cheap to clone and
+/// usable from any thread; the states never leave their cores.
+pub struct Smp<S> {
     shared: Arc<Shared>,
+    _state: PhantomData<fn() -> S>,
+}
+
+impl<S> Clone for Smp<S> {
+    fn clone(&self) -> Self {
+        Smp {
+            shared: self.shared.clone(),
+            _state: PhantomData,
+        }
+    }
 }
 
 struct Shared {
@@ -105,8 +114,10 @@ struct Core {
 
 thread_local! {
     static CURRENT: Cell<Option<CoreId>> = const { Cell::new(None) };
-    /// This core's instances of every `Sharded` service, by service id.
-    static LOCALS: RefCell<HashMap<u64, Rc<dyn Any>>> = RefCell::new(HashMap::new());
+    /// This core's state. A core belongs to one `Smp`, so it has one, of
+    /// that `Smp`'s `S`; it's stored erased because a static can't be
+    /// generic.
+    static STATE: RefCell<Option<Rc<dyn Any>>> = const { RefCell::new(None) };
 }
 
 /// The core the calling thread is, if it's one.
@@ -114,9 +125,23 @@ pub fn current_core() -> Option<CoreId> {
     CURRENT.with(|c| c.get())
 }
 
-impl Smp {
-    /// Starts the cores. Each runs until [`Smp::shutdown`].
-    pub fn start(config: SmpConfig) -> std::io::Result<Smp> {
+/// The calling core's state.
+fn state<S: 'static>() -> Rc<S> {
+    let state = STATE.with(|s| s.borrow().clone());
+    state
+        .expect("a core's state is set before any call reaches it")
+        .downcast::<S>()
+        .expect("a core's state is its Smp's S")
+}
+
+impl<S: 'static> Smp<S> {
+    /// Starts the cores, building each one's state with `make`, on that
+    /// core. Each runs until [`Smp::shutdown`].
+    pub async fn start<F, Fut>(config: SmpConfig, make: F) -> Result<Smp<S>, SmpError>
+    where
+        F: Fn(CoreId) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = S> + 'static,
+    {
         let cpus = if config.pin {
             core_affinity::get_core_ids().unwrap_or_default()
         } else {
@@ -130,35 +155,49 @@ impl Smp {
             let cpu = cpus.get(i).copied();
             let thread = std::thread::Builder::new()
                 .name(format!("{}-{i}", config.name))
-                .spawn(move || run_core(CoreId(i), cpu, handle_tx, stopped))?;
+                .spawn(move || run_core(CoreId(i), cpu, handle_tx, stopped))
+                .map_err(|e| SmpError::Start(e.to_string()))?;
             let handle = handle_rx
                 .recv()
-                .map_err(|_| std::io::Error::other("a core failed to start"))?;
+                .map_err(|_| SmpError::Start(format!("core {i} exited while starting")))?;
             cores.push(Core {
                 handle,
                 stop: Mutex::new(Some(stop)),
             });
             threads.push(thread);
         }
-        Ok(Smp {
+        let smp = Smp {
             shared: Arc::new(Shared {
                 cores,
                 threads: Mutex::new(threads),
                 shut_down: AtomicBool::new(false),
             }),
-        })
+            _state: PhantomData,
+        };
+        let make = Arc::new(make);
+        let built = smp.core_ids().map(|core| {
+            let make = make.clone();
+            smp.run_on(core, move || async move {
+                let state: Rc<dyn Any> = Rc::new(make(core).await);
+                STATE.with(|s| *s.borrow_mut() = Some(state));
+            })
+        });
+        for r in join_all(built).await {
+            r?;
+        }
+        Ok(smp)
     }
 
     pub fn cores(&self) -> usize {
         self.shared.cores.len()
     }
 
-    pub fn core_ids(&self) -> impl Iterator<Item = CoreId> + use<> {
+    pub fn core_ids(&self) -> impl Iterator<Item = CoreId> + use<S> {
         (0..self.cores()).map(CoreId)
     }
 
-    /// Runs `f` on `core` and returns what its future resolves to. The future
-    /// runs on that core's thread and needn't be `Send`; `f` itself, and the
+    /// Runs `f` with `core`'s state, on that core, and returns what its
+    /// future resolves to. The future needn't be `Send`; `f` itself, and the
     /// result, cross threads.
     ///
     /// The call is queued on the core when the returned future is first
@@ -166,22 +205,52 @@ impl Smp {
     /// to one core starts in submission order.
     ///
     /// The returned future holds its own handle, so not to wait for the
-    /// result, spawn it. [`Sharded::invoke_on_all`] reaches every core with
-    /// its service.
+    /// result, spawn it. [`invoke_on_all`](Smp::invoke_on_all) reaches every
+    /// core.
     pub fn submit_to<F, Fut, T>(
         &self,
         core: CoreId,
         f: F,
-    ) -> impl Future<Output = Result<T, SmpError>> + use<F, Fut, T>
+    ) -> impl Future<Output = Result<T, SmpError>> + use<F, Fut, T, S>
+    where
+        F: FnOnce(Rc<S>) -> Fut + Send + 'static,
+        Fut: Future<Output = T> + 'static,
+        T: Send + 'static,
+    {
+        self.run_on(core, move || f(state::<S>()))
+    }
+
+    /// Runs `f` with every core's state, collecting the results in core
+    /// order.
+    pub async fn invoke_on_all<F, Fut, T>(&self, f: F) -> Result<Vec<T>, SmpError>
+    where
+        F: Fn(Rc<S>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = T> + 'static,
+        T: Send + 'static,
+    {
+        let f = Arc::new(f);
+        let calls = self.core_ids().map(|core| {
+            let f = f.clone();
+            self.submit_to(core, move |state| f(state))
+        });
+        join_all(calls).await.into_iter().collect()
+    }
+
+    /// Runs `f` on `core`: `submit_to`, without the state, which doesn't
+    /// exist until `start` has built it.
+    fn run_on<F, Fut, T>(
+        &self,
+        core: CoreId,
+        f: F,
+    ) -> impl Future<Output = Result<T, SmpError>> + use<F, Fut, T, S>
     where
         F: FnOnce() -> Fut + Send + 'static,
         Fut: Future<Output = T> + 'static,
         T: Send + 'static,
     {
         // Owns a handle, so the call can be spawned.
-        let smp = self.clone();
+        let shared = self.shared.clone();
         async move {
-            let shared = &smp.shared;
             if shared.shut_down.load(Ordering::SeqCst) {
                 return Err(SmpError::Shutdown);
             }
@@ -200,27 +269,9 @@ impl Smp {
         }
     }
 
-    /// Runs `f` on every core and collects the results, in core order.
-    async fn on_every_core<F, Fut, T>(&self, f: F) -> Result<Vec<T>, SmpError>
-    where
-        F: Fn(CoreId) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = T> + 'static,
-        T: Send + 'static,
-    {
-        let f = Arc::new(f);
-        let calls = self.core_ids().map(|core| {
-            let f = f.clone();
-            self.submit_to(core, move || f(core))
-        });
-        let mut out = Vec::with_capacity(self.cores());
-        for r in join_all(calls).await {
-            out.push(r?);
-        }
-        Ok(out)
-    }
-
-    /// Stops every core, dropping the work still on them, and blocks the
-    /// calling thread until their threads have exited.
+    /// Stops every core, dropping the work still on them and then their
+    /// states, and blocks the calling thread until their threads have
+    /// exited.
     ///
     /// # Panics
     ///
@@ -270,107 +321,9 @@ fn run_core(
     rt.block_on(async move {
         let _ = stopped.await;
     });
-    // Dropping the runtime drops the tasks still on it; then the services.
+    // Dropping the runtime drops the tasks still on it; then the state.
     drop(rt);
-    LOCALS.with(|l| l.borrow_mut().clear());
-}
-
-/// One instance of `T` per core, like Seastar's `sharded<T>`. The handle is
-/// `Send` and `Sync`; each instance lives on its core and needn't be.
-pub struct Sharded<T> {
-    id: u64,
-    smp: Smp,
-    _t: PhantomData<fn() -> T>,
-}
-
-impl<T> Clone for Sharded<T> {
-    fn clone(&self) -> Self {
-        Sharded {
-            id: self.id,
-            smp: self.smp.clone(),
-            _t: PhantomData,
-        }
-    }
-}
-
-static NEXT_SERVICE: AtomicU64 = AtomicU64::new(0);
-
-impl<T: 'static> Sharded<T> {
-    /// Builds an instance on every core with `make`, which runs on that core.
-    pub async fn start<F, Fut>(smp: &Smp, make: F) -> Result<Sharded<T>, SmpError>
-    where
-        F: Fn(CoreId) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = T> + 'static,
-    {
-        let id = NEXT_SERVICE.fetch_add(1, Ordering::Relaxed);
-        let make = Arc::new(make);
-        smp.on_every_core(move |core| {
-            let make = make.clone();
-            async move {
-                let instance: Rc<dyn Any> = Rc::new(make(core).await);
-                LOCALS.with(|l| l.borrow_mut().insert(id, instance));
-            }
-        })
-        .await?;
-        Ok(Sharded {
-            id,
-            smp: smp.clone(),
-            _t: PhantomData,
-        })
-    }
-
-    /// This core's instance. Panics if the caller isn't on one of the
-    /// service's cores, or the service was stopped.
-    pub fn local(&self) -> Rc<T> {
-        self.try_local()
-            .expect("Sharded::local called off its cores, or after stop")
-    }
-
-    pub fn try_local(&self) -> Option<Rc<T>> {
-        let any = LOCALS.with(|l| l.borrow().get(&self.id).cloned())?;
-        Some(any.downcast::<T>().expect("service ids are unique"))
-    }
-
-    pub fn smp(&self) -> &Smp {
-        &self.smp
-    }
-
-    /// Runs `f` with `core`'s instance, on that core.
-    pub async fn invoke_on<F, Fut, R>(&self, core: CoreId, f: F) -> Result<R, SmpError>
-    where
-        F: FnOnce(Rc<T>) -> Fut + Send + 'static,
-        Fut: Future<Output = R> + 'static,
-        R: Send + 'static,
-    {
-        let this = self.clone();
-        self.smp
-            .submit_to(core, move || async move { f(this.local()).await })
-            .await
-    }
-
-    /// Runs `f` with every core's instance, collecting the results in core
-    /// order.
-    pub async fn invoke_on_all<F, Fut, R>(&self, f: F) -> Result<Vec<R>, SmpError>
-    where
-        F: Fn(Rc<T>) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = R> + 'static,
-        R: Send + 'static,
-    {
-        let this = self.clone();
-        self.smp.on_every_core(move |_| f(this.local())).await
-    }
-
-    /// Drops every core's instance, on its core.
-    pub async fn stop(&self) -> Result<(), SmpError> {
-        let id = self.id;
-        self.smp
-            .on_every_core(move |_| async move {
-                let instance = LOCALS.with(|l| l.borrow_mut().remove(&id));
-                drop(instance);
-            })
-            .await?;
-        Ok(())
-    }
+    STATE.with(|s| s.borrow_mut().take());
 }
 
 /// Awaits every future, in order of the inputs. Small enough not to need the

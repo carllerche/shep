@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures::StreamExt;
-use shep_smp::{Smp, SmpConfig};
+use shep_smp::SmpConfig;
 use shep_wal::{WalConfig, WalNode};
 use shep_wal_client::api::{
     Decided, DecidedStatus, Dot, Dvv, EntryKind, KeyRange, LogEntry, Member, Mutation, PartitionId,
@@ -35,7 +35,7 @@ type Configure = dyn Fn(usize, &mut WalConfig) + Send + Sync;
 pub const CORES: usize = 2;
 
 pub struct Cluster {
-    nodes: Vec<Option<(WalNode, Smp)>>,
+    nodes: Vec<Option<WalNode>>,
     dirs: Vec<TempDir>,
     addrs: Vec<SocketAddr>,
     configure: Arc<Configure>,
@@ -102,9 +102,9 @@ impl Cluster {
             client,
         };
         for (i, l) in listeners.into_iter().enumerate() {
-            let (node, smp) = cluster.open(i).await;
+            let node = cluster.open(i).await;
             node.serve(l);
-            cluster.nodes.push(Some((node, smp)));
+            cluster.nodes.push(Some(node));
         }
         for &p in partitions {
             cluster.create_partition(p).await;
@@ -112,19 +112,18 @@ impl Cluster {
         cluster
     }
 
-    async fn open(&self, i: usize) -> (WalNode, Smp) {
+    async fn open(&self, i: usize) -> WalNode {
         let mut config = WalConfig::new(i as u64 + 1, self.dirs[i].path());
         test_config(&mut config);
         if self.controlled {
             config.seeds = self.members();
         }
         (self.configure)(i, &mut config);
-        let smp = Smp::start(SmpConfig {
+        let smp = SmpConfig {
             pin: false,
             ..SmpConfig::with_cores(CORES)
-        })
-        .unwrap();
-        (WalNode::start(config, smp.clone()).await.unwrap(), smp)
+        };
+        WalNode::start(config, smp).await.unwrap()
     }
 
     /// `n` nodes that found a cluster with a WAL controller; partitions come
@@ -176,9 +175,9 @@ impl Cluster {
                 cluster.nodes.push(None);
                 continue;
             }
-            let (node, smp) = cluster.open(i).await;
+            let node = cluster.open(i).await;
             node.serve(l);
-            cluster.nodes.push(Some((node, smp)));
+            cluster.nodes.push(Some(node));
         }
         cluster
     }
@@ -188,7 +187,7 @@ impl Cluster {
     pub async fn founded(&self) -> Vec<u8> {
         for _ in 0..1500 {
             let mut ids = Vec::new();
-            for (n, _) in self.nodes.iter().flatten() {
+            for n in self.nodes.iter().flatten() {
                 ids.push(n.controller_state().await.and_then(|s| s.cluster_id));
             }
             if let Some(Some(id)) = ids.first()
@@ -236,7 +235,7 @@ impl Cluster {
     }
 
     pub fn node(&self, i: usize) -> &WalNode {
-        &self.nodes[i].as_ref().expect("node is stopped").0
+        self.nodes[i].as_ref().expect("node is stopped")
     }
 
     pub fn node_client(&self, i: usize) -> NodeClient {
@@ -257,11 +256,11 @@ impl Cluster {
     pub async fn leader_where(&self, p: PartitionId, ok: impl Fn(usize) -> bool) -> usize {
         for _ in 0..1000 {
             let mut views: Vec<Option<u64>> = Vec::new();
-            for (n, _) in self
+            for n in self
                 .nodes
                 .iter()
                 .flatten()
-                .filter(|(n, _)| !n.faults().is_partitioned())
+                .filter(|n| !n.faults().is_partitioned())
             {
                 views.push(n.status(p).await.and_then(|s| s.leader).map(|m| m.node_id));
             }
@@ -280,21 +279,14 @@ impl Cluster {
 
     /// Stops node `i`, as if its process exited.
     pub async fn stop(&mut self, i: usize) {
-        let (node, smp) = self.nodes[i].take().expect("already stopped");
+        let node = self.nodes[i].take().expect("already stopped");
         node.shutdown().await;
-        let smp = smp.clone();
-        let (done, finished) = tokio::sync::oneshot::channel();
-        std::thread::spawn(move || {
-            smp.shutdown();
-            let _ = done.send(());
-        });
-        let _ = finished.await;
     }
 
     /// Restarts node `i` from its data directory, at its address.
     pub async fn restart(&mut self, i: usize) {
         assert!(self.nodes[i].is_none(), "node {i} is running");
-        let (node, smp) = self.open(i).await;
+        let node = self.open(i).await;
         let mut tries = 0;
         let listener = loop {
             match TcpListener::bind(self.addrs[i]).await {
@@ -308,7 +300,7 @@ impl Cluster {
             }
         };
         node.serve(listener);
-        self.nodes[i] = Some((node, smp));
+        self.nodes[i] = Some(node);
     }
 
     pub async fn shutdown(mut self) {

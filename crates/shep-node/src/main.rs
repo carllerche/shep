@@ -9,8 +9,7 @@
 
 use std::process::ExitCode;
 
-use shep_node::{Node, NodeConfig, NodeError};
-use shep_smp::Smp;
+use shep_node::{Node, NodeConfig};
 use shep_wal_api::Member;
 
 const USAGE: &str = "usage: shep-node --id <u64> --listen <addr:port> --data-dir <path> [--seed <id>=<addr:port>]... [--cores <n>]";
@@ -56,7 +55,8 @@ fn parse(args: impl Iterator<Item = String>) -> Result<NodeConfig, String> {
     })
 }
 
-fn main() -> ExitCode {
+#[tokio::main(flavor = "local")]
+async fn main() -> ExitCode {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -70,26 +70,13 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build_local(Default::default())
-        .expect("building the main runtime");
-    let cores = match rt.block_on(run(config)) {
-        Ok(cores) => cores,
+    let node = match Node::start(config).await {
+        Ok(n) => n,
         Err(e) => {
             eprintln!("starting: {e}");
             return ExitCode::FAILURE;
         }
     };
-    // Off the runtime: stopping the cores blocks until their threads exit.
-    drop(rt);
-    cores.shutdown();
-    ExitCode::SUCCESS
-}
-
-/// Runs the node until a signal, and hands back its cores to stop.
-async fn run(config: NodeConfig) -> Result<Smp, NodeError> {
-    let node = Node::start(config).await?;
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .expect("signal handler");
     tokio::select! {
@@ -97,5 +84,6 @@ async fn run(config: NodeConfig) -> Result<Smp, NodeError> {
         _ = term.recv() => {}
     }
     tracing::info!("shutting down");
-    Ok(node.shutdown().await)
+    node.shutdown().await;
+    ExitCode::SUCCESS
 }

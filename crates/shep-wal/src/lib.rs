@@ -31,7 +31,7 @@ use shep_raft::{
     RecordKind,
 };
 use shep_rpc_server::{Request, Response, Server, service_fn};
-use shep_smp::{Smp, SmpError};
+use shep_smp::{SmpConfig, SmpError};
 use shep_wal_api::{
     AdminReply, CreatePartitionRequest, Decided, DecidedStatus, Dot, EntryKind, FetchReply,
     FetchRequest, InitializePartitionRequest, LogEntry, Member, MutationEntry, PartitionId,
@@ -114,9 +114,9 @@ fn group(p: PartitionId) -> GroupId {
 }
 
 impl WalNode {
-    /// Opens the node's storage on `smp`'s cores and reopens the partitions
-    /// it hosted.
-    pub async fn start(config: WalConfig, smp: Smp) -> Result<WalNode, WalError> {
+    /// Starts the cores `smp` describes, opens the node's storage on them,
+    /// and reopens the partitions it hosted.
+    pub async fn start(config: WalConfig, smp: SmpConfig) -> Result<WalNode, WalError> {
         let raft = RaftNode::start(config.raft.clone(), smp, GroupSm::for_group).await?;
         let node = WalNode {
             shared: Rc::new(Shared {
@@ -447,8 +447,7 @@ impl WalNode {
         r.ok()
     }
 
-    /// Stops serving and shuts every partition down. The `Smp` keeps running;
-    /// it's the caller's.
+    /// Stops serving, shuts every partition down, and stops the cores.
     pub async fn shutdown(&self) {
         self.shared.shutdown.send_replace(true);
         let tasks: Vec<_> = std::mem::take(&mut *self.shared.servers.borrow_mut())

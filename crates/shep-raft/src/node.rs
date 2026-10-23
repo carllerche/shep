@@ -1,5 +1,5 @@
-//! A node: Raft groups on every core of an [`Smp`], and the RPC service that
-//! routes peers' messages to the core that owns each group.
+//! A node: Raft groups on every core of an [`Smp`] the node starts, and the
+//! RPC service that routes peers' messages to the core that owns each group.
 //!
 //! Which core hosts a group is the node's own business (Redpanda's node-local
 //! core assignment). Peers address groups, and the receiving node hops to
@@ -21,7 +21,7 @@ use shep_raft_engine::raft::{AppendEntriesRequest, TransferLeaderRequest, VoteRe
 use shep_raft_engine::{Config, Raft, ServerState, SnapshotPolicy};
 use shep_rpc_client::ReconnectConfig;
 use shep_rpc_server::{Request, Response, Server, ServerConfig, service_fn};
-use shep_smp::{CoreId, Sharded, Smp, SmpError};
+use shep_smp::{CoreId, Smp, SmpConfig, SmpError};
 use shep_storage::{KeySpace, Log, Storage, StorageConfig};
 use tokio::net::TcpListener;
 use tokio::sync::{oneshot, watch};
@@ -225,7 +225,7 @@ impl<M: Machine> Clone for RaftNode<M> {
 
 struct Shared<M: Machine> {
     config: Arc<RaftConfig>,
-    cores: Sharded<Core<M>>,
+    cores: Smp<Core<M>>,
     /// Which core hosts each group.
     routes: RwLock<HashMap<GroupId, CoreId>>,
     shutdown: watch::Sender<bool>,
@@ -249,17 +249,20 @@ pub struct RaftStats {
 }
 
 impl<M: Machine> RaftNode<M> {
-    /// Opens every core's storage and reopens the groups it hosted.
+    /// Starts the cores `smp` describes, opens each one's storage, and
+    /// reopens the groups it hosted. The node's own tasks (serving) run on
+    /// the calling thread, which must run a
+    /// [`LocalRuntime`](tokio::runtime::LocalRuntime).
     pub async fn start(
         config: RaftConfig,
-        smp: Smp,
+        smp: SmpConfig,
         make_sm: impl Fn(GroupId) -> M + Send + Sync + 'static,
     ) -> Result<RaftNode<M>, RaftNodeError> {
         let config = Arc::new(config);
         // Fail on a bad config here, not on every core.
         config.engine_config()?;
         let lock = lock_data_dir(&config.data_dir)?;
-        check_removed_cores(&config, &smp).await?;
+        check_removed_cores(&config, smp.cores.max(1)).await?;
         let make_sm: Arc<MakeSm<M>> = Arc::new(make_sm);
         let stats = Arc::new(NetStats::default());
         let faults = Arc::new(Faults::default());
@@ -271,7 +274,7 @@ impl<M: Machine> RaftNode<M> {
             stats.clone(),
             faults.clone(),
         );
-        let cores = Sharded::start(&smp, move |core| {
+        let cores = Smp::start(smp, move |core| {
             let (config, make_sm, errors, stats, faults) =
                 (c.clone(), m.clone(), e.clone(), st.clone(), f.clone());
             async move {
@@ -285,12 +288,21 @@ impl<M: Machine> RaftNode<M> {
             }
         })
         .await?;
-        if let Some(err) = errors.lock().unwrap().first() {
+        let failed = errors.lock().unwrap().first().cloned();
+        if let Some(err) = failed {
+            stop_cores(cores).await;
             return Err(RaftNodeError::Raft(format!("opening a core: {err}")));
         }
-        let hosted = cores
+        let hosted = match cores
             .invoke_on_all(|c| async move { (c.id, c.group_ids()) })
-            .await?;
+            .await
+        {
+            Ok(hosted) => hosted,
+            Err(e) => {
+                stop_cores(cores).await;
+                return Err(e.into());
+            }
+        };
         let routes = hosted
             .into_iter()
             .flat_map(|(core, groups)| groups.into_iter().map(move |g| (g, core)))
@@ -422,7 +434,7 @@ impl<M: Machine> RaftNode<M> {
         };
         self.shared
             .cores
-            .invoke_on(core, move |c| async move {
+            .submit_to(core, move |c| async move {
                 c.create(group).await.map_err(|e| e.to_string())
             })
             .await?
@@ -441,7 +453,7 @@ impl<M: Machine> RaftNode<M> {
         let core = self.route(group)?;
         self.shared
             .cores
-            .invoke_on(core, move |c| async move {
+            .submit_to(core, move |c| async move {
                 let g = c.group(group).ok_or(RaftNodeError::NoSuchGroup(group))?;
                 let nodes: BTreeMap<NodeId, BasicNode> = members
                     .into_iter()
@@ -475,7 +487,7 @@ impl<M: Machine> RaftNode<M> {
         };
         self.shared
             .cores
-            .invoke_on(core, move |c| async move {
+            .submit_to(core, move |c| async move {
                 let g = c.group(group).ok_or(ProposeError::NoSuchGroup(group))?;
                 GroupHandle { g, id: group }.propose(key, proposal).await
             })
@@ -489,7 +501,7 @@ impl<M: Machine> RaftNode<M> {
         let core = self.route(group)?;
         self.shared
             .cores
-            .invoke_on(core, move |c| async move {
+            .submit_to(core, move |c| async move {
                 let g = c.group(group).ok_or(RaftNodeError::NoSuchGroup(group))?;
                 g.raft
                     .trigger()
@@ -504,7 +516,7 @@ impl<M: Machine> RaftNode<M> {
         let core = self.route(group)?;
         self.shared
             .cores
-            .invoke_on(core, move |c| async move {
+            .submit_to(core, move |c| async move {
                 let g = c.group(group).ok_or(RaftNodeError::NoSuchGroup(group))?;
                 let m = g.raft.metrics().borrow_watched().clone();
                 Ok(GroupStatus {
@@ -531,19 +543,13 @@ impl<M: Machine> RaftNode<M> {
         let core = self.route(group)?;
         self.shared
             .cores
-            .invoke_on(core, move |c| async move {
+            .submit_to(core, move |c| async move {
                 match c.group(group) {
                     Some(g) => Ok(f(GroupHandle { g, id: group }).await),
                     None => Err(RaftNodeError::NoSuchGroup(group)),
                 }
             })
             .await?
-    }
-
-    /// `group`, if the calling thread is the core that hosts it.
-    pub fn local_group(&self, group: GroupId) -> Option<GroupHandle<M>> {
-        let core = self.shared.cores.try_local()?;
-        core.group(group).map(|g| GroupHandle { g, id: group })
     }
 
     /// Runs `f` on `group`'s core with its state machine.
@@ -555,15 +561,15 @@ impl<M: Machine> RaftNode<M> {
         let core = self.route(group)?;
         self.shared
             .cores
-            .invoke_on(core, move |c| async move {
+            .submit_to(core, move |c| async move {
                 let g = c.group(group).ok_or(RaftNodeError::NoSuchGroup(group))?;
                 Ok(g.sm.with(f))
             })
             .await?
     }
 
-    /// Stops serving and shuts every group down, closing logs cleanly. The
-    /// `Smp` keeps running; it's the caller's.
+    /// Stops serving, shuts every group down, closing logs cleanly, and
+    /// stops the cores.
     pub async fn shutdown(&self) {
         self.shared.shutdown.send_replace(true);
         let servers = std::mem::take(&mut *self.shared.servers.lock().unwrap());
@@ -575,7 +581,7 @@ impl<M: Machine> RaftNode<M> {
             .cores
             .invoke_on_all(|c| async move { c.shutdown().await })
             .await;
-        let _ = self.shared.cores.stop().await;
+        stop_cores(self.shared.cores.clone()).await;
         // Only now may another process open the directory.
         self.shared.lock.lock().unwrap().take();
     }
@@ -668,7 +674,7 @@ impl<M: Machine> Shared<M> {
             .route(group)
             .ok_or_else(|| format!("no group {group} on this node"))?;
         self.cores
-            .invoke_on(core, f)
+            .submit_to(core, f)
             .await
             .map_err(|e| e.to_string())?
     }
@@ -690,7 +696,7 @@ impl<M: Machine> Shared<M> {
             }
         }
         let calls = by_core.into_iter().map(|(core, items)| {
-            self.cores.invoke_on(core, move |c| async move {
+            self.cores.submit_to(core, move |c| async move {
                 let mut out = Vec::with_capacity(items.len());
                 for (i, item) in items {
                     out.push((i, c.heartbeat(item).await));
@@ -721,8 +727,8 @@ impl<M: Machine> Shared<M> {
     }
 }
 
-/// One group, used on the core that hosts it: see [`RaftNode::with_group`]
-/// and [`RaftNode::local_group`]. Not `Send`.
+/// One group, used on the core that hosts it: see [`RaftNode::with_group`].
+/// Not `Send`.
 pub struct GroupHandle<M: Machine> {
     g: Rc<Group<M>>,
     id: GroupId,
@@ -974,9 +980,20 @@ fn lock_data_dir(dir: &std::path::Path) -> Result<std::fs::File, RaftNodeError> 
     }
 }
 
+/// Stops `cores` and waits for their threads to exit. Stopping blocks, so it
+/// runs on a thread of its own rather than the caller's runtime.
+async fn stop_cores<S: 'static>(cores: Smp<S>) {
+    let (done, stopped) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        cores.shutdown();
+        let _ = done.send(());
+    });
+    let _ = stopped.await;
+}
+
 /// Refuses to start with fewer cores than host groups: a core's groups are
 /// in its own directory, and no core would open them.
-async fn check_removed_cores(config: &RaftConfig, smp: &Smp) -> Result<(), RaftNodeError> {
+async fn check_removed_cores(config: &RaftConfig, cores: usize) -> Result<(), RaftNodeError> {
     let cores_dir = config.data_dir.join("cores");
     let entries = match std::fs::read_dir(&cores_dir) {
         Ok(entries) => entries,
@@ -987,7 +1004,7 @@ async fn check_removed_cores(config: &RaftConfig, smp: &Smp) -> Result<(), RaftN
     for entry in entries {
         let name = entry?.file_name();
         if let Some(core) = name.to_str().and_then(|n| n.parse::<usize>().ok())
-            && core >= smp.cores()
+            && core >= cores
         {
             removed.push(core);
         }
@@ -995,19 +1012,13 @@ async fn check_removed_cores(config: &RaftConfig, smp: &Smp) -> Result<(), RaftN
     removed.sort();
     for core in removed {
         let dir = cores_dir.join(core.to_string());
-        let storage = config.storage.clone();
-        let groups = smp
-            .submit_to(CoreId(0), move || async move {
-                let storage = Storage::open(dir, storage).await?;
-                let groups = storage.kvstore().scan(KeySpace::SHARD_PLACEMENT).len();
-                Ok::<_, shep_storage::Error>(groups)
-            })
-            .await??;
+        let storage = Storage::open(dir, config.storage.clone()).await?;
+        let groups = storage.kvstore().scan(KeySpace::SHARD_PLACEMENT).len();
         if groups > 0 {
             return Err(RaftNodeError::CoreRemoved {
                 core,
                 groups,
-                cores: smp.cores(),
+                cores,
             });
         }
     }

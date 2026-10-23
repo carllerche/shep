@@ -11,7 +11,7 @@ use shep_raft::{
     RaftNode, Resolution,
 };
 use shep_rpc_client::ReconnectConfig;
-use shep_smp::{Smp, SmpConfig};
+use shep_smp::SmpConfig;
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 
@@ -93,7 +93,6 @@ impl Machine for Recorder {
 
 pub struct TestNode {
     pub node: RaftNode<Recorder>,
-    pub smp: Smp,
 }
 
 pub struct Cluster {
@@ -149,17 +148,16 @@ impl Cluster {
     }
 
     async fn open(&self, i: usize) -> TestNode {
-        let smp = Smp::start(SmpConfig {
+        let smp = SmpConfig {
             pin: false,
             ..SmpConfig::with_cores(self.cores)
-        })
-        .unwrap();
+        };
         let mut config = test_config(i as u64 + 1, self.dirs[i].path());
         (self.configure)(&mut config);
-        let node = RaftNode::start(config, smp.clone(), |_| Recorder::default())
+        let node = RaftNode::start(config, smp, |_| Recorder::default())
             .await
             .unwrap();
-        TestNode { node, smp }
+        TestNode { node }
     }
 
     pub fn len(&self) -> usize {
@@ -266,13 +264,6 @@ impl Cluster {
     pub async fn stop(&mut self, i: usize) {
         let n = self.nodes[i].take().expect("already stopped");
         n.node.shutdown().await;
-        let smp = n.smp.clone();
-        let (done, finished) = tokio::sync::oneshot::channel();
-        std::thread::spawn(move || {
-            smp.shutdown();
-            let _ = done.send(());
-        });
-        let _ = finished.await;
     }
 
     pub async fn restart(&mut self, i: usize) {
