@@ -22,6 +22,7 @@ replicates.
 | `crates/shep-smp-task` | Local task ownership and execution, adapted from Monoio; the first component of the future SMP runtime |
 | `crates/shep-smp-exec` | Local FIFO executor with scoped `spawn`, bounded task turns, and driver wakeups |
 | `crates/shep-smp-time` | Reactor-owned hierarchical timing wheel, sleeps, timeouts, and intervals, adapted from Monoio |
+| `crates/shep-util-slab` | Safe reusable indexed storage, with the small API needed by runtime components |
 | `crates/shep-smp-io` | Core-local io_uring files, owned aligned buffers, and explicit I/O lifetime management |
 | `crates/shep-smp-io-scheduler` | Weighted admission with shared physical-device capacity and per-class metrics |
 | `crates/shep-append` | Format-independent buffered append files with explicit written and durable positions |

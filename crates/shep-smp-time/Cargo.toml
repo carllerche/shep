@@ -13,5 +13,10 @@ workspace = true
 pin-project-lite.workspace = true
 
 [dev-dependencies]
+criterion.workspace = true
 shep-smp-exec.workspace = true
 shep-futures.workspace = true
+
+[[bench]]
+name = "timers"
+harness = false

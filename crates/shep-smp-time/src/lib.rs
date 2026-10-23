@@ -72,7 +72,3 @@ mod timeout;
 pub use timeout::{Timeout, timeout, timeout_at};
 
 pub use std::time::Duration;
-
-mod utils {
-    pub(crate) mod linked_list;
-}

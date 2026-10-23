@@ -209,7 +209,9 @@ impl Level {
         // SAFETY: The caller transfers a live pinned entry into this bucket.
         let slot = slot_for(unsafe { item.cached_when() }, self.level);
 
-        self.slot[slot].push_front(item);
+        // SAFETY: The caller retains the pinned owner and transfers detached
+        // membership to this bucket, keeping the entry live until removal.
+        unsafe { self.slot[slot].push_front(item) };
 
         self.occupied |= occupied_bit(slot);
     }

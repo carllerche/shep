@@ -26,6 +26,7 @@ shep-smp-time = { path = "crates/shep-smp-time" }
 shep-smp-io = { path = "crates/shep-smp-io" }
 shep-smp-io-scheduler = { path = "crates/shep-smp-io-scheduler" }
 shep-storage = { path = "crates/shep-storage" }
+shep-util-slab = { path = "crates/shep-util-slab" }
 shep-version = { path = "crates/shep-version" }
 shep-wal = { path = "crates/shep-wal" }
 shep-wal-api = { path = "crates/shep-wal-api" }
@@ -34,6 +35,7 @@ shep-wal-controller = { path = "crates/shep-wal-controller" }
 
 bytes = "1"
 core_affinity = "0.8"
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
 crc32c = "0.6"
 futures-core = "0.3"
 hegeltest = "0.50"

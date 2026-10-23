@@ -10,7 +10,8 @@ The wheel, timer entries, sleep/timeout/interval futures, and intrusive list
 come from Monoio. The six-level, 64-slot hierarchy, millisecond rounding,
 pinned entries, lazy registration and deadline extension, timeout polling
 order, and interval missed-tick policies are retained. The unused upstream
-`wheel/stack.rs` is not copied; the active wheel uses `utils::linked_list`.
+`wheel/stack.rs` is not copied; the active wheel uses a concrete timer-entry
+list in `timer/entry/list.rs`, specialized from `utils::linked_list`.
 
 Changes for Shep:
 
@@ -39,8 +40,18 @@ Changes for Shep:
   waker destructors.
 - Use `Cell` for copyable completion results, initial deadlines, and list links.
   Link mutations use shared references instead of constructing mutable references
-  to aliased nodes. Retain the outer entry `UnsafeCell` and pinning required by
-  the wheel's non-owning pointers.
+  to aliased nodes. Remove the outer entry `UnsafeCell`: `TimerShared` is never
+  replaced or mutably referenced, and every aliased mutation uses the inner
+  `Cell`/`RefCell` fields. Retain pinning and unlink-before-drop for the wheel's
+  non-owning pointers.
+- Specialize the intrusive list for `TimerShared`. Remove the unsafe `Link`
+  trait, its implementation, generic pointer wrapper, conversion hooks,
+  `ManuallyDrop`, and phantom type bookkeeping. Keep next/previous cells in
+  the entry's wheel state and direct non-owning handles in bucket/pending lists.
+  Insertion now explicitly requires an unsafe caller to retain the pinned owner
+  until removal, replacing the generic trait's implicit lifetime assumption.
+  Adapt the four upstream list tests to actual pinned timer entries, preserving
+  FIFO, neighbor consistency, repeated removal, and absent-node coverage.
 - Use safe pinned shared access in polling and resetting, and shared cancellation
   in `Drop`. Remove unchecked wheel indexing, unused list filtering/tail APIs,
   the unused `true_when` field, and inherited cache-line padding. Cell-only state

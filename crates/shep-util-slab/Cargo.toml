@@ -1,0 +1,19 @@
+[package]
+name = "shep-util-slab"
+description = "Safe reusable indexed storage for Shep runtime components"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+hegeltest.workspace = true
+slab.workspace = true
+
+[[bench]]
+name = "slab"
+harness = false

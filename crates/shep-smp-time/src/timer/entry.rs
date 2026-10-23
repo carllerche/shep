@@ -6,8 +6,8 @@
 //!
 //! The wheel holds non-owning pointers into TimerEntry. Registration requires
 //! pinning; dropping an entry unlinks it before its storage is released. The
-//! outer UnsafeCell permits shared access to this inline state without exposing
-//! a mutable reference to it. Individual fields use Cell or RefCell.
+//! shared state is accessed only through shared references; all mutations use
+//! Cell or RefCell. No mutable reference to TimerShared is created or exposed.
 //!
 //! List membership changes require the owning wheel's mutable borrow. The
 //! unsafe raw-handle methods enforce liveness and detached-entry requirements;
@@ -18,7 +18,7 @@
 //! bucket deadline in place. The wheel reconciles them when visiting that bucket.
 
 use std::{
-    cell::{Cell, RefCell, UnsafeCell},
+    cell::{Cell, RefCell},
     marker::PhantomPinned,
     pin::Pin,
     ptr::NonNull,
@@ -26,7 +26,10 @@ use std::{
 };
 
 use super::Handle;
-use crate::{Instant, utils::linked_list};
+use crate::Instant;
+
+mod list;
+pub(super) use list::EntryList;
 
 type TimerResult = Result<(), crate::error::Error>;
 
@@ -118,7 +121,7 @@ pub(super) struct TimerEntry {
     /// Keeps the local wheel alive until this entry has been unlinked.
     driver: Handle,
     /// Raw wheel handles alias this state through shared references only.
-    inner: UnsafeCell<TimerShared>,
+    inner: TimerShared,
     /// Consumed by first poll or reset; updating it never moves pinned state.
     initial_deadline: Cell<Option<Instant>>,
     _pin: PhantomPinned,
@@ -131,8 +134,6 @@ pub(super) struct TimerEntry {
 pub(crate) struct TimerHandle {
     inner: NonNull<TimerShared>,
 }
-
-pub(super) type EntryList = linked_list::LinkedList<TimerShared, TimerShared>;
 
 #[derive(Debug)]
 pub(crate) struct TimerShared {
@@ -191,38 +192,17 @@ impl TimerShared {
 struct WheelState {
     /// The deadline used to locate the current bucket, or u64::MAX for pending.
     cached_when: Cell<u64>,
-    pointers: linked_list::Pointers<TimerShared>,
+    prev: Cell<Option<NonNull<TimerShared>>>,
+    next: Cell<Option<NonNull<TimerShared>>>,
 }
 
 impl WheelState {
     fn new() -> Self {
         Self {
             cached_when: Cell::new(0),
-            pointers: linked_list::Pointers::new(),
+            prev: Cell::new(None),
+            next: Cell::new(None),
         }
-    }
-}
-
-// SAFETY: TimerEntry registers only after pinning and unlinks on Drop. Handles
-// retain no ownership, so their callers must uphold liveness. Links use shared
-// Cell access; this implementation never creates &mut to an aliased entry.
-unsafe impl linked_list::Link for TimerShared {
-    type Handle = TimerHandle;
-    type Target = TimerShared;
-
-    fn as_raw(handle: &Self::Handle) -> NonNull<Self::Target> {
-        handle.inner
-    }
-
-    unsafe fn from_raw(ptr: NonNull<Self::Target>) -> Self::Handle {
-        TimerHandle { inner: ptr }
-    }
-
-    unsafe fn pointers(
-        target: NonNull<Self::Target>,
-    ) -> NonNull<linked_list::Pointers<Self::Target>> {
-        // SAFETY: Link's caller guarantees that target is a live pinned entry.
-        NonNull::from(&unsafe { target.as_ref() }.wheel_state.pointers)
     }
 }
 
@@ -230,16 +210,16 @@ impl TimerEntry {
     pub(crate) fn new(handle: &Handle, deadline: Instant) -> Self {
         Self {
             driver: handle.clone(),
-            inner: UnsafeCell::new(TimerShared::new()),
+            inner: TimerShared::new(),
             initial_deadline: Cell::new(Some(deadline)),
             _pin: PhantomPinned,
         }
     }
 
     fn inner(&self) -> &TimerShared {
-        // SAFETY: The cell belongs to this live entry. It is never replaced or
-        // mutably referenced. Shared mutations use its Cell/RefCell fields.
-        unsafe { &*self.inner.get() }
+        // The state is never replaced or mutably referenced. All mutations
+        // through this reference or wheel aliases use its Cell/RefCell fields.
+        &self.inner
     }
 
     pub(crate) fn is_elapsed(&self) -> bool {

@@ -247,7 +247,9 @@ impl Wheel {
             match unsafe { item.mark_pending(expiration.deadline) } {
                 Ok(()) => {
                     // Item was expired
-                    self.pending.push_front(item);
+                    // SAFETY: The entry was detached from the expired bucket.
+                    // Its pinned owner remains alive until it is unlinked.
+                    unsafe { self.pending.push_front(item) };
                 }
                 Err(expiration_tick) => {
                     let level = level_for(expiration.deadline, expiration_tick);
