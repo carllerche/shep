@@ -24,8 +24,21 @@ pub mod method {
 
     /// Whether `method` belongs to the WAL service.
     pub fn is_wal(method: u32) -> bool {
-        (method >> 16) as u16 == SERVICE
+        shep_rpc::service_of(method) == SERVICE
     }
+}
+
+/// The version of the WAL's protocols (the WAL service's and the
+/// controller's) this crate speaks.
+pub const VERSION: u8 = 0;
+
+/// The statuses of the WAL's services, the WAL and its controller.
+pub mod status {
+    /// The method isn't one the server knows.
+    pub const UNKNOWN_METHOD: u32 = 1000;
+    /// The request is at a version the server doesn't speak, or its body
+    /// doesn't decode.
+    pub const MALFORMED: u32 = 1002;
 }
 
 /// A range of keys in the WAL's conflict space: `[start, end)`, or

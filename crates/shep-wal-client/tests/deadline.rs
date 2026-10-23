@@ -24,7 +24,7 @@ fn silent_peer() -> (std::net::TcpListener, WalClient) {
 }
 
 /// A silent peer can't hold `propose` past its deadline.
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn propose_stops_at_its_deadline() {
     let (silent, client) = silent_peer();
     let proposal = Proposal {
@@ -45,7 +45,7 @@ async fn propose_stops_at_its_deadline() {
 }
 
 /// Nor `create_universe`, which has the same deadline.
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn create_universe_stops_at_its_deadline() {
     let (silent, client) = silent_peer();
     let start = Instant::now();
@@ -60,7 +60,7 @@ async fn create_universe_stops_at_its_deadline() {
 }
 
 /// A client with no nodes fails rather than panicking.
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn create_universe_without_nodes_fails() {
     let client = WalClient::with_config(Vec::<String>::new(), ClientConfig::default()).unwrap();
     assert!(client.create_universe("prod", 1, 1).await.is_err());

@@ -1,0 +1,19 @@
+[package]
+name = "shep-rpc-server"
+description = "Serving shep-rpc: concurrent handlers, routing before the body is read"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+bytes.workspace = true
+futures.workspace = true
+shep-rpc.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+rand.workspace = true
+shep-rpc-client.workspace = true

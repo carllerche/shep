@@ -1,7 +1,8 @@
 //! Thread-per-core, after Seastar's `smp` (design §3, §9.6).
 //!
 //! An [`Smp`] runs one OS thread per core, each with its own tokio
-//! `current_thread` runtime. Work on a core is ordinary async code with no
+//! [`LocalRuntime`](tokio::runtime::LocalRuntime), which runs `!Send` tasks
+//! spawned with `spawn_local` directly. Work on a core is ordinary async code with no
 //! locks: state a core owns is `Rc`/`RefCell`, and futures needn't be `Send`.
 //! Cores talk only by message: [`Smp::submit_to`] runs a closure on another
 //! core and returns its result, through a bounded mailbox per core, so a slow
@@ -25,8 +26,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
+use tokio::runtime::LocalOptions;
 use tokio::sync::{mpsc, oneshot};
-use tokio::task::LocalSet;
 
 /// A core of an [`Smp`], numbered from 0.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -99,7 +100,7 @@ struct Shared {
 }
 
 enum Message {
-    /// Spawn this on the core's `LocalSet`.
+    /// Spawn this on the core's runtime.
     Run(Box<dyn FnOnce() + Send>),
     /// Stop the core: its pending tasks are dropped.
     Shutdown,
@@ -264,10 +265,9 @@ fn run_core(core: CoreId, cpu: Option<core_affinity::CoreId>, mut rx: mpsc::Rece
     CURRENT.with(|c| c.set(Some(core)));
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
-        .build()
+        .build_local(LocalOptions::default())
         .expect("building a core's runtime");
-    let local = LocalSet::new();
-    local.block_on(&rt, async move {
+    rt.block_on(async move {
         while let Some(msg) = rx.recv().await {
             match msg {
                 Message::Run(task) => task(),
@@ -275,8 +275,8 @@ fn run_core(core: CoreId, cpu: Option<core_affinity::CoreId>, mut rx: mpsc::Rece
             }
         }
     });
-    // Dropping the LocalSet drops the tasks still on it; then the services.
-    drop(local);
+    // Dropping the runtime drops the tasks still on it; then the services.
+    drop(rt);
     LOCALS.with(|l| l.borrow_mut().clear());
 }
 

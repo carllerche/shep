@@ -8,7 +8,7 @@ use support::*;
 
 const G1: GroupId = GroupId(1);
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "local")]
 async fn a_single_node_commits() {
     let cluster = Cluster::start(1, 2).await;
     cluster.create_group(G1).await;
@@ -24,7 +24,7 @@ async fn a_single_node_commits() {
     cluster.shutdown().await;
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "local")]
 async fn three_nodes_replicate() {
     let cluster = Cluster::start(3, 2).await;
     cluster.create_group(G1).await;
@@ -38,7 +38,7 @@ async fn three_nodes_replicate() {
     cluster.shutdown().await;
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "local")]
 async fn followers_point_to_the_leader() {
     let cluster = Cluster::start(3, 1).await;
     cluster.create_group(G1).await;
@@ -67,7 +67,7 @@ async fn followers_point_to_the_leader() {
 
 /// Many concurrent writes go through the pipelined replication streams and
 /// commit in one order on every node.
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "local")]
 async fn concurrent_writes_commit_in_one_order() {
     let cluster = std::sync::Arc::new(Cluster::start(3, 2).await);
     cluster.create_group(G1).await;
@@ -76,7 +76,7 @@ async fn concurrent_writes_commit_in_one_order() {
     let tasks: Vec<_> = (0..500)
         .map(|i| {
             let node = node.clone();
-            tokio::spawn(async move {
+            tokio::task::spawn_local(async move {
                 // A leader without a lease yet refuses writes for a moment.
                 loop {
                     match node.propose(G1, None, Bytes::from(format!("w{i}"))).await {
@@ -106,7 +106,7 @@ async fn concurrent_writes_commit_in_one_order() {
 
 /// Many groups on few cores: they spread over the cores, elect, and stay
 /// stable (no spurious elections) while heartbeats share RPCs.
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "local")]
 async fn many_groups_stay_stable() {
     let cluster = Cluster::start(3, 2).await;
     let groups: Vec<_> = (1..=40).map(GroupId).collect();
@@ -131,7 +131,7 @@ async fn many_groups_stay_stable() {
     cluster.shutdown().await;
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "local")]
 async fn a_new_leader_takes_over() {
     let mut cluster = Cluster::start(3, 2).await;
     cluster.create_group(G1).await;
@@ -159,7 +159,7 @@ async fn a_new_leader_takes_over() {
 }
 
 /// A follower that missed many entries catches up through the pipeline.
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "local")]
 async fn a_lagging_follower_catches_up() {
     let mut cluster = Cluster::start(3, 2).await;
     cluster.create_group(G1).await;
@@ -177,7 +177,7 @@ async fn a_lagging_follower_catches_up() {
 
 /// Every node restarted: groups reopen on the cores that hosted them, and
 /// the log replays into the state machines.
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "local")]
 async fn a_full_restart_keeps_everything() {
     let mut cluster = Cluster::start(3, 3).await;
     let groups: Vec<_> = (1..=6).map(GroupId).collect();
@@ -216,7 +216,7 @@ async fn a_full_restart_keeps_everything() {
 
 /// Heartbeats from many groups share RPCs, and replication keeps several
 /// AppendEntries in flight.
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "local")]
 async fn heartbeats_batch_and_appends_pipeline() {
     let cluster = Cluster::start(3, 1).await;
     let groups: Vec<_> = (1..=20).map(GroupId).collect();
@@ -249,7 +249,7 @@ async fn heartbeats_batch_and_appends_pipeline() {
     let writes: Vec<_> = (0..200)
         .map(|i| {
             let node = node.clone();
-            tokio::spawn(async move {
+            tokio::task::spawn_local(async move {
                 node.propose(GroupId(1), None, Bytes::from(format!("p{i}")))
                     .await
             })
@@ -267,7 +267,7 @@ async fn heartbeats_batch_and_appends_pipeline() {
 }
 
 /// On its core, a group can be proposed to in order, read back, and watched.
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "local")]
 async fn group_handles_propose_read_and_watch() {
     let cluster = Cluster::start(3, 2).await;
     cluster.create_group(G1).await;
@@ -322,7 +322,7 @@ async fn group_handles_propose_read_and_watch() {
 }
 
 /// A leader cut off from its peers is replaced, and follows once healed.
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "local")]
 async fn a_partitioned_leader_is_replaced() {
     let cluster = Cluster::start(3, 1).await;
     cluster.create_group(G1).await;
@@ -377,7 +377,7 @@ async fn a_partitioned_leader_is_replaced() {
 /// A leader restarted within its election timeout doesn't resume its old
 /// term: its replication sessions restart numbering, and followers would
 /// take the new ones for stale ones. It wins a new term first.
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "local")]
 async fn a_restarted_leader_needs_a_new_term() {
     let mut cluster = Cluster::start(3, 1).await;
     cluster.create_group(G1).await;

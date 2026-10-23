@@ -14,6 +14,8 @@ serde.workspace = true
 shep-codec.workspace = true
 shep-raft-engine = { workspace = true, features = ["tokio-rt", "single-threaded"] }
 shep-rpc.workspace = true
+shep-rpc-client.workspace = true
+shep-rpc-server.workspace = true
 shep-smp.workspace = true
 shep-storage.workspace = true
 thiserror.workspace = true
@@ -23,3 +25,4 @@ tracing.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 tracing-subscriber.workspace = true
+shep-rpc-client.workspace = true

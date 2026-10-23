@@ -15,6 +15,8 @@ shep-node = { path = "crates/shep-node" }
 shep-raft = { path = "crates/shep-raft" }
 shep-raft-engine = { path = "crates/shep-raft-engine", default-features = false }
 shep-rpc = { path = "crates/shep-rpc" }
+shep-rpc-client = { path = "crates/shep-rpc-client" }
+shep-rpc-server = { path = "crates/shep-rpc-server" }
 shep-smp = { path = "crates/shep-smp" }
 shep-storage = { path = "crates/shep-storage" }
 shep-version = { path = "crates/shep-version" }

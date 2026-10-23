@@ -41,7 +41,7 @@ async fn propose(
 
 /// A proposal the machine refuses appends nothing; the next one admitted
 /// gets the next index.
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "local")]
 async fn refused_proposals_append_nothing() {
     let cluster = Cluster::start(3, 1).await;
     cluster.create_group(G1).await;
@@ -60,7 +60,7 @@ async fn refused_proposals_append_nothing() {
 
 /// A key is decided once: a retry, whatever it proposes, gets the first
 /// decision, before and after the leader changes and after a full restart.
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "local")]
 async fn keys_are_decided_once() {
     let mut cluster = Cluster::start(3, 1).await;
     cluster.create_group(G1).await;
@@ -108,7 +108,7 @@ async fn keys_are_decided_once() {
 /// A replica that starts leading replays its log into its machine before
 /// admitting anything; each admission's fate comes back by its sequence
 /// number.
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "local")]
 async fn a_new_leader_replays_then_admits() {
     let cluster = Cluster::start(3, 1).await;
     cluster.create_group(G1).await;
@@ -198,7 +198,7 @@ fn assert_refused_before(calls: &[Call], seq: u64) {
 
 /// An admitted command too large to append is never appended, and the
 /// machine hears so.
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "local")]
 async fn too_large_commands_are_not_appended() {
     let cluster = Cluster::start_with(1, 1, |c| c.proposals.max_entry_bytes = 64).await;
     cluster.create_group(G1).await;
@@ -221,7 +221,7 @@ async fn too_large_commands_are_not_appended() {
 
 /// Fetching waits for committed entries and returns them decoded, with
 /// Raft's own entries marked as such.
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "local")]
 async fn fetch_long_polls_for_committed_entries() {
     let cluster = Cluster::start(1, 1).await;
     cluster.create_group(G1).await;
@@ -269,7 +269,7 @@ async fn fetch_long_polls_for_committed_entries() {
 
     // A fetch waiting for the next entry returns once it commits.
     let node = cluster.node(0).clone();
-    let waiting = tokio::spawn(async move {
+    let waiting = tokio::task::spawn_local(async move {
         node.with_group(G1, move |g| async move {
             g.fetch(from, usize::MAX, Duration::from_secs(10)).await
         })

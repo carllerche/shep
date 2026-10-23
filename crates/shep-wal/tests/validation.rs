@@ -9,7 +9,7 @@ use shep_wal_client::ProposeError;
 use shep_wal_client::api::{Dot, EntryKind, Mutation, ProposalKind, Rejection};
 use support::*;
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "local")]
 async fn a_proposal_commits_and_is_tailed() {
     let cluster = Cluster::start(3, &[P1]).await;
     let mut proposal = write(at(P1, 0), "a");
@@ -39,7 +39,7 @@ async fn a_proposal_commits_and_is_tailed() {
     cluster.shutdown().await;
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "local")]
 async fn a_write_the_read_version_lacks_conflicts() {
     let cluster = Cluster::start(3, &[P1]).await;
     let c = &cluster.client;
@@ -67,7 +67,7 @@ async fn a_write_the_read_version_lacks_conflicts() {
     cluster.shutdown().await;
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "local")]
 async fn range_reads_conflict_with_writes_inside_them() {
     let cluster = Cluster::start(3, &[P1]).await;
     let c = &cluster.client;
@@ -110,7 +110,7 @@ async fn range_reads_conflict_with_writes_inside_them() {
     cluster.shutdown().await;
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "local")]
 async fn extras_count_as_seen() {
     let cluster = Cluster::start(3, &[P1]).await;
     let c = &cluster.client;
@@ -138,7 +138,7 @@ async fn extras_count_as_seen() {
 
 /// The design's C1 counterexample: an entry appended but not committed is
 /// already in the table, so a proposal that didn't see it is rejected.
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "local")]
 async fn uncommitted_writes_are_checked() {
     // A long election timeout keeps the cut-off leader's quorum lease, so it
     // keeps accepting.
@@ -184,7 +184,7 @@ async fn uncommitted_writes_are_checked() {
     cluster.shutdown().await;
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "local")]
 async fn reads_older_than_the_window_are_too_old() {
     let cluster =
         Cluster::start_with(3, &[P1], |c| c.raft.proposals.admission_window_entries = 4).await;
@@ -212,7 +212,7 @@ async fn reads_older_than_the_window_are_too_old() {
     cluster.shutdown().await;
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "local")]
 async fn malformed_proposals_are_invalid() {
     let cluster = Cluster::start(3, &[P1]).await;
     let c = &cluster.client;
@@ -243,7 +243,7 @@ async fn malformed_proposals_are_invalid() {
     cluster.shutdown().await;
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "local")]
 async fn followers_point_to_the_leader() {
     let cluster = Cluster::start(3, &[P1]).await;
     let leader = cluster.leader(P1).await;
@@ -268,7 +268,7 @@ async fn followers_point_to_the_leader() {
 }
 
 /// Concurrent proposals on disjoint keys all commit, with no retries.
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "local")]
 async fn disjoint_proposals_all_commit() {
     let cluster = Cluster::start(3, &[P1]).await;
     let s0 = at(
@@ -285,7 +285,9 @@ async fn disjoint_proposals_all_commit() {
         .map(|i| {
             let client = cluster.client.clone();
             let s0 = s0.clone();
-            tokio::spawn(async move { client.propose(P1, &write(s0, &format!("key{i}"))).await })
+            tokio::task::spawn_local(async move {
+                client.propose(P1, &write(s0, &format!("key{i}"))).await
+            })
         })
         .collect();
     let mut dots = Vec::new();
@@ -300,7 +302,7 @@ async fn disjoint_proposals_all_commit() {
 
 /// Concurrent proposals that all read and write one key at one version:
 /// exactly one commits.
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "local")]
 async fn overlapping_proposals_one_commits() {
     let cluster = Cluster::start(3, &[P1]).await;
     let s0 = at(
@@ -317,7 +319,7 @@ async fn overlapping_proposals_one_commits() {
         .map(|_| {
             let client = cluster.client.clone();
             let s0 = s0.clone();
-            tokio::spawn(async move { client.propose(P1, &write(s0, "hot")).await })
+            tokio::task::spawn_local(async move { client.propose(P1, &write(s0, "hot")).await })
         })
         .collect();
     let mut ok = 0;

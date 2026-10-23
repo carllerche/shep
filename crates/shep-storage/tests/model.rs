@@ -179,17 +179,17 @@ async fn run(seed: u64, ops: usize) {
     check(&log, &model, &mut rng).await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn model_seed_1() {
     run(1, 400).await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn model_seed_2() {
     run(2, 400).await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn model_seed_3() {
     run(3, 400).await;
 }

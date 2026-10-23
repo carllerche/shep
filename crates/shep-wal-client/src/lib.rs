@@ -5,13 +5,18 @@
 //! proposal when the outcome is unknown (always safe: every proposal has an
 //! idempotency key), and tails the log by long-polling whichever replica
 //! answers.
+//!
+//! Like shep-rpc's client, it is single-threaded: it runs on a
+//! [`LocalRuntime`](tokio::runtime::LocalRuntime), and neither it nor its
+//! futures are `Send`.
 
+use std::cell::RefCell;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::rc::Rc;
 use std::time::Duration;
 
 use futures::Stream;
-use shep_rpc::{ConnectionCache, ReconnectConfig, RpcError};
+use shep_rpc_client::{ConnectionCache, ReconnectConfig, RpcError};
 use shep_wal_api::{
     AdminReply, CreatePartitionRequest, Decided, FetchReply, FetchRequest,
     InitializePartitionRequest, LogEntry, Member, PartitionId, PartitionStatus, Proposal,
@@ -104,6 +109,7 @@ impl Default for ClientConfig {
                 initial_backoff: Duration::from_millis(50),
                 max_backoff: Duration::from_secs(1),
                 connect_timeout: Duration::from_secs(1),
+                ..ReconnectConfig::default()
             },
         }
     }
@@ -114,7 +120,7 @@ impl Default for ClientConfig {
 pub struct NodeClient {
     addr: String,
     sock: SocketAddr,
-    cache: Arc<ConnectionCache>,
+    cache: Rc<ConnectionCache>,
     rpc_timeout: Duration,
 }
 
@@ -124,14 +130,14 @@ impl NodeClient {
         let config = ClientConfig::default();
         NodeClient::with(
             addr.into(),
-            Arc::new(ConnectionCache::new(config.reconnect)),
+            Rc::new(ConnectionCache::new(config.reconnect)),
             config.rpc_timeout,
         )
     }
 
     fn with(
         addr: String,
-        cache: Arc<ConnectionCache>,
+        cache: Rc<ConnectionCache>,
         rpc_timeout: Duration,
     ) -> Result<NodeClient, ClientError> {
         let sock = addr
@@ -286,14 +292,14 @@ pub enum ProposeError {
 /// A client for a set of WAL nodes.
 #[derive(Clone)]
 pub struct WalClient {
-    shared: Arc<Shared>,
+    shared: Rc<Shared>,
 }
 
 struct Shared {
     config: ClientConfig,
-    cache: Arc<ConnectionCache>,
-    nodes: Mutex<Vec<NodeClient>>,
-    leaders: Mutex<std::collections::HashMap<PartitionId, String>>,
+    cache: Rc<ConnectionCache>,
+    nodes: RefCell<Vec<NodeClient>>,
+    leaders: RefCell<std::collections::HashMap<PartitionId, String>>,
 }
 
 impl WalClient {
@@ -310,24 +316,24 @@ impl WalClient {
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
-        let cache = Arc::new(ConnectionCache::new(config.reconnect.clone()));
+        let cache = Rc::new(ConnectionCache::new(config.reconnect.clone()));
         let nodes = addrs
             .into_iter()
             .map(|a| NodeClient::with(a.into(), cache.clone(), config.rpc_timeout))
             .collect::<Result<Vec<_>, _>>()?;
         Ok(WalClient {
-            shared: Arc::new(Shared {
+            shared: Rc::new(Shared {
                 config,
                 cache,
-                nodes: Mutex::new(nodes),
-                leaders: Mutex::new(Default::default()),
+                nodes: RefCell::new(nodes),
+                leaders: RefCell::new(Default::default()),
             }),
         })
     }
 
     /// The client for one node, added to the set if it's new.
     pub fn node(&self, addr: &str) -> Result<NodeClient, ClientError> {
-        let mut nodes = self.shared.nodes.lock().unwrap();
+        let mut nodes = self.shared.nodes.borrow_mut();
         if let Some(n) = nodes.iter().find(|n| n.addr == addr) {
             return Ok(n.clone());
         }
@@ -346,7 +352,7 @@ impl WalClient {
     }
 
     fn nodes(&self) -> Vec<NodeClient> {
-        self.shared.nodes.lock().unwrap().clone()
+        self.shared.nodes.borrow_mut().clone()
     }
 
     /// Proposes to `partition`'s leader until a leader decides it, or it's
@@ -361,7 +367,7 @@ impl WalClient {
         let deadline = Instant::now() + config.propose_deadline;
         let nodes = self.nodes();
         let mut next = 0usize;
-        let mut target = self.shared.leaders.lock().unwrap().get(&partition).cloned();
+        let mut target = self.shared.leaders.borrow_mut().get(&partition).cloned();
         let mut last = String::from("no attempt");
         let mut unknown = 0;
         loop {
@@ -389,8 +395,7 @@ impl WalClient {
                 Ok(Ok(Ok(decided))) => {
                     self.shared
                         .leaders
-                        .lock()
-                        .unwrap()
+                        .borrow_mut()
                         .insert(partition, node.addr.clone());
                     return Ok(decided);
                 }
@@ -402,8 +407,7 @@ impl WalClient {
                     if let Some(leader) = leader.filter(|l| l.addr != node.addr) {
                         self.shared
                             .leaders
-                            .lock()
-                            .unwrap()
+                            .borrow_mut()
                             .insert(partition, leader.addr.clone());
                         target = Some(leader.addr);
                         pause = false;
@@ -418,7 +422,7 @@ impl WalClient {
                         target = Some(node.addr.clone());
                     } else {
                         unknown = 0;
-                        self.shared.leaders.lock().unwrap().remove(&partition);
+                        self.shared.leaders.borrow_mut().remove(&partition);
                     }
                 }
                 Ok(Ok(Err(r @ Rejection::UnknownPartition))) => {
@@ -446,7 +450,7 @@ impl WalClient {
     ) -> impl Stream<Item = LogEntry> + use<> {
         let (tx, rx) = mpsc::channel(256);
         let client = self.clone();
-        tokio::spawn(async move {
+        tokio::task::spawn_local(async move {
             let config = client.shared.config.clone();
             let mut next = from_index;
             let mut n = 0usize;

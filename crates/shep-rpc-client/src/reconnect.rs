@@ -1,16 +1,17 @@
 //! Connections that come back after failing, and a cache of them by peer.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::rc::Rc;
 use std::time::Duration;
 
 use bytes::Bytes;
 use tokio::time::Instant;
 
 use crate::error::RpcError;
-use crate::transport::Transport;
+use crate::transport::{Call, Reply, Transport, TransportConfig};
 
 #[derive(Clone, Debug)]
 pub struct ReconnectConfig {
@@ -20,6 +21,8 @@ pub struct ReconnectConfig {
     pub max_backoff: Duration,
     /// How long one connection attempt may take.
     pub connect_timeout: Duration,
+    /// For each connection made.
+    pub transport: TransportConfig,
 }
 
 impl Default for ReconnectConfig {
@@ -29,6 +32,7 @@ impl Default for ReconnectConfig {
             initial_backoff: Duration::from_secs(1),
             max_backoff: Duration::from_secs(15),
             connect_timeout: Duration::from_secs(1),
+            transport: TransportConfig::default(),
         }
     }
 }
@@ -43,7 +47,7 @@ impl Default for ReconnectConfig {
 pub struct ReconnectTransport {
     addr: SocketAddr,
     config: ReconnectConfig,
-    state: Mutex<ReconnectState>,
+    state: RefCell<ReconnectState>,
     /// Held while connecting, so concurrent callers share one attempt.
     connecting: tokio::sync::Mutex<()>,
 }
@@ -71,7 +75,7 @@ impl ReconnectTransport {
         ReconnectTransport {
             addr,
             config,
-            state: Mutex::new(ReconnectState {
+            state: RefCell::new(ReconnectState {
                 transport: None,
                 backoff: Duration::ZERO,
                 last_attempt: None,
@@ -87,7 +91,7 @@ impl ReconnectTransport {
     /// The current connection, connecting first if there is none.
     pub async fn get_connected(&self) -> Result<Transport, RpcError> {
         {
-            let state = self.state.lock().unwrap();
+            let state = self.state.borrow_mut();
             if let Some(t) = state.connected() {
                 return Ok(t);
             }
@@ -99,7 +103,7 @@ impl ReconnectTransport {
         let _connecting = self.connecting.lock().await;
         {
             // Someone else may have just connected, or just failed.
-            let mut state = self.state.lock().unwrap();
+            let mut state = self.state.borrow_mut();
             if let Some(t) = state.connected() {
                 return Ok(t);
             }
@@ -109,11 +113,11 @@ impl ReconnectTransport {
             state.last_attempt = Some(Instant::now());
         }
 
-        let attempt =
-            tokio::time::timeout(self.config.connect_timeout, Transport::connect(self.addr))
-                .await
-                .unwrap_or_else(|_| Err(io::ErrorKind::TimedOut.into()));
-        let mut state = self.state.lock().unwrap();
+        let connect = Transport::connect_with(self.addr, self.config.transport.clone());
+        let attempt = tokio::time::timeout(self.config.connect_timeout, connect)
+            .await
+            .unwrap_or_else(|_| Err(io::ErrorKind::TimedOut.into()));
+        let mut state = self.state.borrow_mut();
         match attempt {
             Ok(t) => {
                 tracing::debug!(addr = %self.addr, "rpc connected");
@@ -144,9 +148,15 @@ impl ReconnectTransport {
             .await
     }
 
+    /// [`Transport::call_with`] on the current connection, connecting if
+    /// needed.
+    pub async fn call_with(&self, call: Call, timeout: Duration) -> Result<Reply, RpcError> {
+        self.get_connected().await?.call_with(call, timeout).await
+    }
+
     /// Lets the next call try to connect right away.
     pub fn reset_backoff(&self) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.borrow_mut();
         state.backoff = Duration::ZERO;
         state.last_attempt = None;
     }
@@ -154,7 +164,7 @@ impl ReconnectTransport {
     /// Closes the current connection, failing its pending calls. The next
     /// call reconnects.
     pub fn disconnect(&self) {
-        if let Some(t) = self.state.lock().unwrap().transport.take() {
+        if let Some(t) = self.state.borrow_mut().transport.take() {
             t.close();
         }
     }
@@ -163,28 +173,27 @@ impl ReconnectTransport {
 /// One [`ReconnectTransport`] per peer address, created on first use.
 pub struct ConnectionCache {
     config: ReconnectConfig,
-    peers: Mutex<HashMap<SocketAddr, Arc<ReconnectTransport>>>,
+    peers: RefCell<HashMap<SocketAddr, Rc<ReconnectTransport>>>,
 }
 
 impl ConnectionCache {
     pub fn new(config: ReconnectConfig) -> ConnectionCache {
         ConnectionCache {
             config,
-            peers: Mutex::new(HashMap::new()),
+            peers: RefCell::new(HashMap::new()),
         }
     }
 
-    pub fn get(&self, addr: SocketAddr) -> Arc<ReconnectTransport> {
+    pub fn get(&self, addr: SocketAddr) -> Rc<ReconnectTransport> {
         self.peers
-            .lock()
-            .unwrap()
+            .borrow_mut()
             .entry(addr)
-            .or_insert_with(|| Arc::new(ReconnectTransport::new(addr, self.config.clone())))
+            .or_insert_with(|| Rc::new(ReconnectTransport::new(addr, self.config.clone())))
             .clone()
     }
 
     pub fn contains(&self, addr: SocketAddr) -> bool {
-        self.peers.lock().unwrap().contains_key(&addr)
+        self.peers.borrow_mut().contains_key(&addr)
     }
 
     pub async fn call(
@@ -197,17 +206,26 @@ impl ConnectionCache {
         self.get(addr).call(method, body, timeout).await
     }
 
+    pub async fn call_with(
+        &self,
+        addr: SocketAddr,
+        call: Call,
+        timeout: Duration,
+    ) -> Result<Reply, RpcError> {
+        self.get(addr).call_with(call, timeout).await
+    }
+
     /// See [`ReconnectTransport::reset_backoff`]. Does nothing for an
     /// address not in the cache.
     pub fn reset_backoff(&self, addr: SocketAddr) {
-        if let Some(peer) = self.peers.lock().unwrap().get(&addr) {
+        if let Some(peer) = self.peers.borrow_mut().get(&addr) {
             peer.reset_backoff();
         }
     }
 
     /// Forgets `addr`, closing its connection and failing its pending calls.
     pub fn remove(&self, addr: SocketAddr) {
-        if let Some(peer) = self.peers.lock().unwrap().remove(&addr) {
+        if let Some(peer) = self.peers.borrow_mut().remove(&addr) {
             peer.disconnect();
         }
     }

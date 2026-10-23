@@ -11,7 +11,7 @@ use shep_raft::{
     Admit, Decided, Entry, GroupId, GroupStatus, Machine, NodeId, ProposeError, RaftConfig,
     RaftNode, Resolution,
 };
-use shep_rpc::ReconnectConfig;
+use shep_rpc_client::ReconnectConfig;
 use shep_smp::{Smp, SmpConfig};
 use tempfile::TempDir;
 use tokio::net::TcpListener;
@@ -113,6 +113,7 @@ pub fn test_config(id: NodeId, dir: &std::path::Path) -> RaftConfig {
         initial_backoff: Duration::from_millis(50),
         max_backoff: Duration::from_millis(200),
         connect_timeout: Duration::from_millis(500),
+        ..ReconnectConfig::default()
     };
     c
 }

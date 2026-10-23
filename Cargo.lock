@@ -1034,7 +1034,7 @@ dependencies = [
 name = "shep-node"
 version = "0.1.0"
 dependencies = [
- "shep-rpc",
+ "shep-rpc-server",
  "shep-smp",
  "shep-wal",
  "shep-wal-api",
@@ -1055,6 +1055,8 @@ dependencies = [
  "shep-codec",
  "shep-raft-engine",
  "shep-rpc",
+ "shep-rpc-client",
+ "shep-rpc-server",
  "shep-smp",
  "shep-storage",
  "tempfile",
@@ -1138,13 +1140,38 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "crc32c",
+ "hegeltest",
+ "thiserror",
+ "tokio",
+ "xxhash-rust",
+]
+
+[[package]]
+name = "shep-rpc-client"
+version = "0.1.0"
+dependencies = [
+ "bytes",
  "futures",
  "rand 0.9.5",
+ "shep-rpc",
+ "shep-rpc-server",
  "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "shep-rpc-server"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "futures",
+ "rand 0.9.5",
+ "shep-rpc",
+ "shep-rpc-client",
  "tokio",
  "tokio-util",
  "tracing",
- "xxhash-rust",
 ]
 
 [[package]]
@@ -1191,7 +1218,8 @@ dependencies = [
  "rand 0.9.5",
  "shep-codec",
  "shep-raft",
- "shep-rpc",
+ "shep-rpc-client",
+ "shep-rpc-server",
  "shep-smp",
  "shep-version",
  "shep-wal-api",
@@ -1222,7 +1250,7 @@ dependencies = [
  "bytes",
  "futures",
  "shep-codec",
- "shep-rpc",
+ "shep-rpc-client",
  "shep-wal-api",
  "shep-wal-controller",
  "thiserror",

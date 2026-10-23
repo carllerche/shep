@@ -18,6 +18,21 @@ pub(crate) const PRE_VOTE: u32 = method_id(SERVICE, 4);
 pub(crate) const SNAPSHOT: u32 = method_id(SERVICE, 5);
 pub(crate) const TRANSFER_LEADER: u32 = method_id(SERVICE, 6);
 
+/// The version of the Raft service's protocol this node speaks.
+pub(crate) const VERSION: u8 = 0;
+
+/// The Raft service's statuses.
+pub mod status {
+    /// The method isn't one of the Raft service's.
+    pub const UNKNOWN_METHOD: u32 = 1000;
+    /// This node can't serve Raft right now: it is shutting down, or cut off
+    /// by a test fault.
+    pub const UNAVAILABLE: u32 = 1001;
+    /// The request is at a version this node doesn't speak, or its body
+    /// doesn't decode.
+    pub const MALFORMED: u32 = 1002;
+}
+
 /// One AppendEntries. Requests of one replication stream share a `session`
 /// and carry consecutive `seq`s from 0, so the follower applies them in order
 /// however they arrive (Redpanda's `follower_req_seq`). Heartbeats have no

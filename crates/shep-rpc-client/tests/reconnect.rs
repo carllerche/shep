@@ -1,11 +1,13 @@
 //! Reconnecting with backoff, and the per-peer connection cache.
 
+#[path = "../../shep-rpc-server/tests/support/mod.rs"]
 mod support;
 
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use shep_rpc::{ConnectionCache, ReconnectConfig, ReconnectTransport, RpcError, ServerConfig};
+use shep_rpc_client::{ConnectionCache, ReconnectConfig, ReconnectTransport, RpcError};
+use shep_rpc_server::ServerConfig;
 use support::*;
 use tokio::net::TcpListener;
 
@@ -14,6 +16,7 @@ fn config(initial_ms: u64, max_ms: u64) -> ReconnectConfig {
         initial_backoff: Duration::from_millis(initial_ms),
         max_backoff: Duration::from_millis(max_ms),
         connect_timeout: Duration::from_secs(1),
+        transport: Default::default(),
     }
 }
 
@@ -43,7 +46,7 @@ fn default_backoff_matches_redpanda() {
 
 /// The server goes down and comes back up on the same address; the
 /// transport fails, backs off, and reconnects.
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn reconnects_after_server_restart() {
     let (server, addr, _) = start(ServerConfig::default()).await;
     let peer = ReconnectTransport::new(addr, config(50, 200));
@@ -66,7 +69,7 @@ async fn reconnects_after_server_restart() {
 
 /// While backing off, calls fail fast without trying to connect; the
 /// backoff doubles per failure up to the max.
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn backoff_fails_fast_and_grows() {
     let addr = dead_addr().await;
     let peer = ReconnectTransport::new(addr, config(100, 200));
@@ -99,7 +102,7 @@ async fn backoff_fails_fast_and_grows() {
 }
 
 /// `reset_backoff` lets the next call try right away.
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn reset_backoff_retries_immediately() {
     let addr = dead_addr().await;
     let peer = ReconnectTransport::new(addr, config(60_000, 60_000));
@@ -117,7 +120,7 @@ async fn reset_backoff_retries_immediately() {
 }
 
 /// Concurrent callers share one connection.
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn concurrent_callers_share_a_connection() {
     let (_server, addr, _) = start(ServerConfig::default()).await;
     let peer = ReconnectTransport::new(addr, config(50, 200));
@@ -138,7 +141,7 @@ async fn concurrent_callers_share_a_connection() {
 }
 
 /// `disconnect` fails pending calls; the next call reconnects.
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn disconnect_then_reconnect() {
     let (_server, addr, state) = start(ServerConfig::default()).await;
     let peer = ReconnectTransport::new(addr, config(50, 200));
@@ -158,7 +161,7 @@ async fn disconnect_then_reconnect() {
 /// Adapted from Redpanda src/v/rpc/test/rpc_gen_cycling_test.cc
 /// (echo_from_cache, basic_cache_ops): connections from the cache work, one
 /// per peer, and removing a peer drops it.
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn connection_cache() {
     let (_a, addr_a, _) = start(ServerConfig::default()).await;
     let (_b, addr_b, _) = start(ServerConfig::default()).await;
@@ -173,10 +176,7 @@ async fn connection_cache() {
             "b"
         );
     }
-    assert!(std::sync::Arc::ptr_eq(
-        &cache.get(addr_a),
-        &cache.get(addr_a)
-    ));
+    assert!(std::rc::Rc::ptr_eq(&cache.get(addr_a), &cache.get(addr_a)));
     assert!(cache.contains(addr_a));
 
     cache.remove(addr_a);
@@ -191,7 +191,7 @@ async fn connection_cache() {
 
 /// Adapted from Redpanda src/v/rpc/test/rpc_gen_cycling_test.cc
 /// (rpc_abort_from_cache): removing a peer fails its outstanding calls.
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn cache_remove_fails_pending_calls() {
     let (_server, addr, state) = start(ServerConfig::default()).await;
     let cache = ConnectionCache::new(config(1, 1));
@@ -205,7 +205,7 @@ async fn cache_remove_fails_pending_calls() {
     assert!(!cache.contains(addr));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn cache_reset_backoff() {
     let addr = dead_addr().await;
     let cache = ConnectionCache::new(config(60_000, 60_000));

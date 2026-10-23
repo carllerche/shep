@@ -14,7 +14,7 @@ fn smp(cores: usize) -> Smp {
     .unwrap()
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn work_runs_on_the_core_it_was_sent_to() {
     let smp = smp(4);
     assert_eq!(current_core(), None);
@@ -37,7 +37,7 @@ async fn work_runs_on_the_core_it_was_sent_to() {
     smp.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn a_cores_futures_need_not_be_send() {
     let smp = smp(2);
     let n = smp
@@ -55,7 +55,7 @@ async fn a_cores_futures_need_not_be_send() {
     smp.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn zero_cores_means_one() {
     let smp = smp(0);
     assert_eq!(smp.cores(), 1);
@@ -67,7 +67,7 @@ async fn zero_cores_means_one() {
     smp.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn submit_to_all_answers_in_core_order() {
     let smp = smp(5);
     let cores = smp
@@ -83,7 +83,7 @@ async fn submit_to_all_answers_in_core_order() {
 }
 
 /// One sender's messages to one core start in the order they were sent.
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn messages_from_one_sender_start_in_order() {
     let smp = smp(2);
     let seen = Arc::new(Mutex::new(Vec::new()));
@@ -102,7 +102,7 @@ async fn messages_from_one_sender_start_in_order() {
     smp.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn cores_call_each_other() {
     let smp = smp(3);
     let inner = smp.clone();
@@ -130,7 +130,7 @@ async fn cores_call_each_other() {
 
 /// Many concurrent calls across all pairs of cores, through small mailboxes,
 /// all complete: a core waiting to send never stops draining its own mailbox.
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn concurrent_calls_between_all_cores_complete() {
     let smp = Smp::start(SmpConfig {
         pin: false,
@@ -171,7 +171,7 @@ async fn concurrent_calls_between_all_cores_complete() {
 }
 
 /// A full mailbox makes senders wait instead of queueing without bound.
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn a_full_mailbox_pushes_back() {
     let smp = Smp::start(SmpConfig {
         pin: false,
@@ -206,7 +206,7 @@ async fn a_full_mailbox_pushes_back() {
     smp.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn a_panic_fails_that_call_and_the_core_survives() {
     let smp = smp(2);
     let r = smp.submit_to(CoreId(1), || async { panic!("boom") }).await;
@@ -215,12 +215,12 @@ async fn a_panic_fails_that_call_and_the_core_survives() {
     smp.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn shutdown_fails_pending_and_later_work() {
     let smp = smp(2);
     let started = Arc::new(tokio::sync::Notify::new());
     let s = started.clone();
-    let pending = tokio::spawn({
+    let pending = tokio::task::spawn_local({
         let smp = smp.clone();
         async move {
             smp.submit_to(CoreId(1), move || async move {
@@ -242,7 +242,7 @@ async fn shutdown_fails_pending_and_later_work() {
 }
 
 /// Each core has its own instance; `local` reaches it without a hop.
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn sharded_services_have_one_instance_per_core() {
     let smp = smp(3);
     let counters = Sharded::start(&smp, |core| async move { RefCell::new(core.0 * 100) })
@@ -275,7 +275,7 @@ async fn sharded_services_have_one_instance_per_core() {
     smp.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn independent_services_dont_collide() {
     let smp = smp(2);
     let a = Sharded::start(&smp, |_| async { RefCell::new("a") })
@@ -296,7 +296,7 @@ async fn independent_services_dont_collide() {
 }
 
 /// Instances are built and dropped on their own cores.
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn sharded_instances_live_and_die_on_their_cores() {
     /// Where each instance was built, and where it was dropped.
     type Seen = Arc<Mutex<Vec<(Option<CoreId>, Option<CoreId>)>>>;
@@ -345,7 +345,7 @@ async fn sharded_instances_live_and_die_on_their_cores() {
 }
 
 /// Shutting down drops every service's instances, on their cores.
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn shutdown_drops_services() {
     struct Probe(Arc<AtomicUsize>);
     impl Drop for Probe {

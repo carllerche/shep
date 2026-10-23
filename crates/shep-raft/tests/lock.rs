@@ -18,7 +18,7 @@ async fn start(dir: &std::path::Path) -> (Result<RaftNode<Recorder>, RaftNodeErr
 
 /// A second node on a directory in use is refused; once the first shuts
 /// down, the directory is free.
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "local")]
 async fn a_data_directory_has_one_node() {
     let dir = tempfile::tempdir().unwrap();
     let (first, smp1) = start(dir.path()).await;

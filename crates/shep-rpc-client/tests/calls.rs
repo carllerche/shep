@@ -1,6 +1,7 @@
 //! Calls through a `Transport` against a real `Server` (or a fake one) over
 //! loopback TCP.
 
+#[path = "../../shep-rpc-server/tests/support/mod.rs"]
 mod support;
 
 use std::time::Duration;
@@ -9,13 +10,15 @@ use bytes::Bytes;
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
 use rand::seq::SliceRandom;
-use shep_rpc::wire::Header;
-use shep_rpc::{RpcError, ServerConfig, Status, Transport, method_id};
+use shep_rpc::wire::{Header, payload_checksum};
+use shep_rpc::{MetadataBuilder, SERVICE_STATUS_MIN, method_id};
+use shep_rpc_client::{Call, RpcError, Transport};
+use shep_rpc_server::ServerConfig;
 use support::*;
 
 /// Adapted from Redpanda src/v/rpc/test/rpc_gen_cycling_test.cc
 /// (echo_round_trip).
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn echo_round_trip() {
     let (_server, addr, _) = start(ServerConfig::default()).await;
     let t = Transport::connect(addr).await.unwrap();
@@ -29,7 +32,7 @@ async fn echo_round_trip() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn large_bodies_round_trip() {
     let (_server, addr, _) = start(ServerConfig::default()).await;
     let t = Transport::connect(addr).await.unwrap();
@@ -43,7 +46,7 @@ async fn large_bodies_round_trip() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn many_pipelined_calls() {
     let (_server, addr, state) = start(ServerConfig::default()).await;
     let t = Transport::connect(addr).await.unwrap();
@@ -61,14 +64,14 @@ async fn many_pipelined_calls() {
 }
 
 /// Pipelining on a multi-threaded runtime, with calls from many tasks.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "local")]
 async fn concurrent_calls_from_many_tasks() {
     let (_server, addr, _) = start(ServerConfig::default()).await;
     let t = Transport::connect(addr).await.unwrap();
     let tasks: Vec<_> = (0..16u32)
         .map(|task| {
             let t = t.clone();
-            tokio::spawn(async move {
+            tokio::task::spawn_local(async move {
                 for i in 0..200u32 {
                     let body = Bytes::from(format!("{task}/{i}"));
                     assert_eq!(t.call(ECHO, body.clone(), LONG).await.unwrap(), body);
@@ -82,7 +85,7 @@ async fn concurrent_calls_from_many_tasks() {
 }
 
 /// Handlers finishing in reverse order still answer the right calls.
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn out_of_order_responses() {
     let (_server, addr, _) = start(ServerConfig::default()).await;
     let t = Transport::connect(addr).await.unwrap();
@@ -103,7 +106,7 @@ async fn out_of_order_responses() {
 /// Adapted from Redpanda src/v/rpc/test/rpc_gen_cycling_test.cc
 /// (ordering_test): the server sees requests in the order they were called,
 /// here even though their futures are polled in a shuffled order.
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn requests_are_written_in_call_order() {
     let (_server, addr, state) = start(ServerConfig::default()).await;
     let t = Transport::connect(addr).await.unwrap();
@@ -122,7 +125,7 @@ async fn requests_are_written_in_call_order() {
 
 /// Adapted from Redpanda src/v/rpc/test/rpc_gen_cycling_test.cc
 /// (timeout_test).
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn timeout() {
     let (_server, addr, _) = start(ServerConfig::default()).await;
     let t = Transport::connect(addr).await.unwrap();
@@ -134,7 +137,7 @@ async fn timeout() {
 
 /// The late response to a timed-out call is read and dropped; the connection
 /// carries on.
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn late_response_is_skipped() {
     let (_server, addr, state) = start(ServerConfig::default()).await;
     let t = Transport::connect(addr).await.unwrap();
@@ -154,7 +157,7 @@ async fn late_response_is_skipped() {
 /// Adapted from Redpanda src/v/rpc/test/rpc_gen_cycling_test.cc
 /// (test_cleanup_on_timeout_before_sending): calls that time out before they
 /// could even be sent leave the connection healthy.
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn zero_timeouts_leave_connection_healthy() {
     let (_server, addr, _) = start(ServerConfig::default()).await;
     let t = Transport::connect(addr).await.unwrap();
@@ -170,7 +173,7 @@ async fn zero_timeouts_leave_connection_healthy() {
 }
 
 /// A call dropped before completion is forgotten; its response is skipped.
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn dropped_call_is_abandoned() {
     let (_server, addr, _) = start(ServerConfig::default()).await;
     let t = Transport::connect(addr).await.unwrap();
@@ -183,9 +186,9 @@ async fn dropped_call_is_abandoned() {
 }
 
 /// Adapted from Redpanda src/v/rpc/test/rpc_gen_cycling_test.cc
-/// (missing_method_test): 404s interleaved with successes, and the
-/// connection stays healthy.
-#[tokio::test]
+/// (missing_method_test): the service's "unknown method" status interleaved
+/// with successes, and the connection stays healthy.
+#[tokio::test(flavor = "local")]
 async fn unknown_method() {
     let (_server, addr, _) = start(ServerConfig::default()).await;
     let t = Transport::connect(addr).await.unwrap();
@@ -205,7 +208,8 @@ async fn unknown_method() {
         .collect();
     for (missing, reply) in futures::future::join_all(calls).await {
         if missing {
-            assert!(matches!(reply, Err(RpcError::MethodNotFound)), "{reply:?}");
+            let status = reply.unwrap_err().service_status();
+            assert_eq!(status, Some(UNKNOWN_METHOD));
         } else {
             assert_eq!(reply.unwrap(), "testing...");
         }
@@ -214,43 +218,50 @@ async fn unknown_method() {
 }
 
 /// Adapted from Redpanda src/v/rpc/test/rpc_gen_cycling_test.cc
-/// (server_exception_test).
-#[tokio::test]
+/// (server_exception_test): a service's own failure status, and a panic.
+#[tokio::test(flavor = "local")]
 async fn handler_error() {
     let (_server, addr, _) = start(ServerConfig::default()).await;
     let t = Transport::connect(addr).await.unwrap();
     let reply = t.call(FAIL, Bytes::new(), LONG).await;
-    assert!(matches!(reply, Err(RpcError::ServerError)), "{reply:?}");
+    assert_eq!(reply.unwrap_err().service_status(), Some(FAILED));
     let reply = t.call(PANIC, Bytes::new(), LONG).await;
     assert!(matches!(reply, Err(RpcError::ServerError)), "{reply:?}");
     assert_eq!(t.call(ECHO, "ok".into(), LONG).await.unwrap(), "ok");
 }
 
 /// Error responses have empty bodies, whatever the handler returned.
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn error_responses_are_empty() {
     let (_server, addr, _) = start(ServerConfig::default()).await;
     let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-    write_frame(&mut stream, &Header::new(FAIL, 9, b""), b"").await;
-    let (header, body) = read_frame(&mut stream).await.unwrap();
-    assert!(header.checksum_ok());
-    assert_eq!(header.meta, Status::ServerError.as_u32());
+    write_frame(&mut stream, &header(FAIL, 9, b""), b"", b"").await;
+    let (header, _, body) = read_frame(&mut stream).await.unwrap();
+    assert!(header.checksum_ok(b""));
+    assert_eq!(header.method_or_status, FAILED);
     assert_eq!(header.correlation_id, 9);
     assert_eq!(header.payload_size, 0);
     assert!(body.is_empty());
 }
 
-/// Every status maps to its typed error.
-#[tokio::test]
+/// Every transport status maps to its typed error, a service's status comes
+/// back with its metadata, and an unknown transport status is reported as
+/// such.
+#[tokio::test(flavor = "local")]
 async fn statuses_map_to_errors() {
-    let codes = [404, 408, 500, 503, 505, 599];
-    let addr = fake_server(move |mut stream| async move {
-        for code in codes {
-            let (req, _) = read_frame(&mut stream).await.unwrap();
-            let header = Header::new(code, req.correlation_id, b"");
-            write_frame(&mut stream, &header, b"").await;
+    let metadata = MetadataBuilder::new().insert(7, "leader").build().unwrap();
+    let codes = [400, 408, 413, 415, 500, 599, SERVICE_STATUS_MIN + 5];
+    let addr = fake_server({
+        let metadata = metadata.clone();
+        move |mut stream| async move {
+            for code in codes {
+                let (req, _, _) = read_frame(&mut stream).await.unwrap();
+                let m = metadata.as_bytes();
+                let header = Header::new(0, code, req.correlation_id, m, 0, payload_checksum(b""));
+                write_frame(&mut stream, &header, m, b"").await;
+            }
+            let _ = read_frame(&mut stream).await;
         }
-        let _ = read_frame(&mut stream).await;
     })
     .await;
     let t = Transport::connect(addr).await.unwrap();
@@ -258,57 +269,90 @@ async fn statuses_map_to_errors() {
     for _ in codes {
         errors.push(t.call(ECHO, Bytes::new(), LONG).await.unwrap_err());
     }
-    assert!(matches!(
-        errors[..],
+    match &errors[..] {
         [
-            RpcError::MethodNotFound,
-            RpcError::RequestTimeout,
+            RpcError::BadRequest,
+            RpcError::Abandoned,
+            RpcError::PayloadTooLarge,
+            RpcError::UnsupportedCompression,
             RpcError::ServerError,
-            RpcError::ServiceUnavailable,
-            RpcError::VersionNotSupported,
             RpcError::UnknownStatus(599),
-        ]
-    ));
+            RpcError::Status {
+                status,
+                metadata: m,
+            },
+        ] => {
+            assert_eq!(*status, SERVICE_STATUS_MIN + 5);
+            assert_eq!(m, &metadata);
+        }
+        other => panic!("{other:?}"),
+    }
 }
 
-/// Adapted from Redpanda src/v/rpc/test/rpc_gen_cycling_test.cc
-/// (version_not_supported): the server answers a request at another version
-/// with 505 at its own version, and the connection stays usable.
-#[tokio::test]
-async fn version_not_supported() {
-    let (_server, addr, state) = start(ServerConfig::default()).await;
-    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-    for i in 0..20u32 {
-        let mut header = Header::new(ECHO, i, b"testing...");
-        if i % 2 == 0 {
-            header.version = 2;
-            header.header_checksum = header.compute_checksum();
-        }
-        write_frame(&mut stream, &header, b"testing...").await;
+/// The version and metadata are the service's: they reach the handler as
+/// sent, and the response's metadata reaches the caller.
+#[tokio::test(flavor = "local")]
+async fn version_and_metadata_pass_through() {
+    let (_server, addr, _) = start(ServerConfig::default()).await;
+    let t = Transport::connect(addr).await.unwrap();
+    for version in [0, 1, 7, 255] {
+        let metadata = MetadataBuilder::new()
+            .insert_u64(2, 5_000_000)
+            .insert(1, &b"route"[..])
+            .insert(0xffff, Bytes::new())
+            .build()
+            .unwrap();
+        let call = Call::new(METADATA, Bytes::new())
+            .with_version(version)
+            .with_metadata(metadata.clone());
+        let reply = t.call_with(call, LONG).await.unwrap();
+        assert_eq!(reply.body, vec![version]);
+        assert_eq!(reply.metadata, metadata);
+        assert_eq!(reply.metadata.get(1), Some(&b"route"[..]));
+        assert_eq!(reply.metadata.get(2), Some(&5_000_000u64.to_le_bytes()[..]));
+        assert_eq!(reply.metadata.get(0xffff), Some(&b""[..]));
+        assert_eq!(reply.metadata.get(3), None);
     }
-    let mut replies = Vec::new();
-    for _ in 0..20 {
-        let (header, body) = read_frame(&mut stream).await.unwrap();
-        assert!(header.checksum_ok());
-        assert_eq!(header.version, shep_rpc::wire::VERSION);
-        replies.push((header.correlation_id, header.meta, body));
-    }
-    replies.sort_by_key(|r| r.0);
-    for (id, meta, body) in replies {
-        if id % 2 == 0 {
-            assert_eq!(meta, Status::VersionNotSupported.as_u32());
-            assert!(body.is_empty());
-        } else {
-            assert_eq!(meta, Status::Success.as_u32());
-            assert_eq!(body, "testing...");
-        }
-    }
-    assert_eq!(state.started(), 10);
+}
+
+/// A response whose metadata is malformed fails its call; the connection
+/// carries on, since the checksum vouched for the sizes.
+#[tokio::test(flavor = "local")]
+async fn malformed_response_metadata_fails_the_call() {
+    let addr = fake_server(|mut stream| async move {
+        let (first, _, _) = read_frame(&mut stream).await.unwrap();
+        // A key whose value runs past the section.
+        let bad = [1, 0, 9, 0, 0];
+        let h = Header::new(
+            0,
+            200,
+            first.correlation_id,
+            &bad,
+            2,
+            payload_checksum(b"hi"),
+        );
+        write_frame(&mut stream, &h, &bad, b"hi").await;
+        let (second, _, _) = read_frame(&mut stream).await.unwrap();
+        write_frame(
+            &mut stream,
+            &header(200, second.correlation_id, b"ok"),
+            b"",
+            b"ok",
+        )
+        .await;
+        let _ = read_frame(&mut stream).await;
+    })
+    .await;
+    let t = Transport::connect(addr).await.unwrap();
+    let reply = t.call(ECHO, "a".into(), LONG).await;
+    assert!(matches!(reply, Err(RpcError::BadResponse(_))), "{reply:?}");
+    assert_eq!(t.call(ECHO, "b".into(), LONG).await.unwrap(), "ok");
+    assert!(!t.is_closed());
 }
 
 /// The server going away fails every pending call, and later calls fail
 /// fast.
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn server_drop_fails_pending_calls() {
     let addr = fake_server(|mut stream| async move {
         for _ in 0..5 {
@@ -329,7 +373,7 @@ async fn server_drop_fails_pending_calls() {
 
 /// Adapted from Redpanda src/v/rpc/test/rpc_gen_cycling_test.cc
 /// (rpc_abort_from_cache): closing the transport fails outstanding calls.
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn close_fails_pending_calls() {
     let (_server, addr, state) = start(ServerConfig::default()).await;
     let t = Transport::connect(addr).await.unwrap();
@@ -345,14 +389,14 @@ async fn close_fails_pending_calls() {
 /// Adapted from Redpanda src/v/rpc/test/rpc_gen_cycling_test.cc
 /// (corrupted_header_at_client_test): a response with a bad header checksum
 /// closes the connection and fails everything on it.
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn corrupted_response_header_closes_connection() {
     let addr = fake_server(|mut stream| async move {
-        let (first, _) = read_frame(&mut stream).await.unwrap();
+        let (first, _, _) = read_frame(&mut stream).await.unwrap();
         read_frame(&mut stream).await.unwrap();
-        let mut header = Header::new(200, first.correlation_id, b"hi");
+        let mut header = header(200, first.correlation_id, b"hi");
         header.header_checksum ^= 1;
-        write_frame(&mut stream, &header, b"hi").await;
+        write_frame(&mut stream, &header, b"", b"hi").await;
         let _ = read_frame(&mut stream).await;
     })
     .await;
@@ -365,12 +409,12 @@ async fn corrupted_response_header_closes_connection() {
 }
 
 /// A response body that fails its checksum also closes the connection.
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn corrupted_response_body_closes_connection() {
     let addr = fake_server(|mut stream| async move {
-        let (req, _) = read_frame(&mut stream).await.unwrap();
-        let header = Header::new(200, req.correlation_id, b"hi");
-        write_frame(&mut stream, &header, b"ho").await;
+        let (req, _, _) = read_frame(&mut stream).await.unwrap();
+        let header = header(200, req.correlation_id, b"hi");
+        write_frame(&mut stream, &header, b"", b"ho").await;
         let _ = read_frame(&mut stream).await;
     })
     .await;
@@ -384,14 +428,14 @@ async fn corrupted_response_body_closes_connection() {
 
 /// A response for an id nobody is waiting on is skipped, body and all, and
 /// the stream stays in step.
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn response_for_unknown_id_is_skipped() {
     let addr = fake_server(|mut stream| async move {
-        let (req, _) = read_frame(&mut stream).await.unwrap();
-        let stray = Header::new(200, req.correlation_id + 1000, b"stray body");
-        write_frame(&mut stream, &stray, b"stray body").await;
-        let reply = Header::new(200, req.correlation_id, b"real");
-        write_frame(&mut stream, &reply, b"real").await;
+        let (req, _, _) = read_frame(&mut stream).await.unwrap();
+        let stray = header(200, req.correlation_id + 1000, b"stray body");
+        write_frame(&mut stream, &stray, b"", b"stray body").await;
+        let reply = header(200, req.correlation_id, b"real");
+        write_frame(&mut stream, &reply, b"", b"real").await;
         let _ = read_frame(&mut stream).await;
     })
     .await;
@@ -401,15 +445,15 @@ async fn response_for_unknown_id_is_skipped() {
 }
 
 /// Correlation ids start at 1 and count up, one per call.
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn correlation_ids_are_monotonic() {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let addr = fake_server(|mut stream| async move {
-        while let Some((req, _)) = read_frame(&mut stream).await {
-            assert!(req.checksum_ok());
+        while let Some((req, _, _)) = read_frame(&mut stream).await {
+            assert!(req.checksum_ok(b""));
             tx.send(req.correlation_id).unwrap();
-            let reply = Header::new(200, req.correlation_id, b"");
-            write_frame(&mut stream, &reply, b"").await;
+            let reply = header(200, req.correlation_id, b"");
+            write_frame(&mut stream, &reply, b"", b"").await;
         }
     })
     .await;

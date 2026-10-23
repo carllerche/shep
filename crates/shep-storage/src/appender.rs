@@ -12,11 +12,14 @@
 //! dispatched chunk is simply handed off, and the next append starts a new
 //! one.
 //!
-//! The state sits behind a mutex only because the idle timer is a tokio task;
-//! everything else touches it from the core's thread.
+//! The state lives on the core's thread, shared with the idle timer, a local
+//! task. Only completion of writes crosses to the disk worker, through an
+//! atomic.
 
+use std::cell::RefCell;
+use std::rc::{Rc, Weak};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use tokio::sync::{Notify, OwnedSemaphorePermit};
@@ -25,8 +28,8 @@ use tokio::time::Instant;
 use crate::disk::{Disk, DiskFile, WritePool};
 
 pub(crate) struct Appender {
-    state: Arc<Mutex<WriteState>>,
-    timer: Arc<Notify>,
+    state: Rc<RefCell<WriteState>>,
+    timer: Rc<Notify>,
     pool: WritePool,
 }
 
@@ -81,7 +84,7 @@ impl Appender {
         config: AppenderConfig,
         written: Arc<AtomicU64>,
     ) -> Appender {
-        let state = Arc::new(Mutex::new(WriteState {
+        let state = Rc::new(RefCell::new(WriteState {
             disk,
             chunk_size: config.chunk_size.clamp(1, pool.capacity()),
             prealloc_step: config.prealloc_step,
@@ -91,9 +94,9 @@ impl Appender {
             timer_armed: false,
             closed: false,
         }));
-        let timer = Arc::new(Notify::new());
-        tokio::spawn(idle_timer(
-            Arc::downgrade(&state),
+        let timer = Rc::new(Notify::new());
+        tokio::task::spawn_local(idle_timer(
+            Rc::downgrade(&state),
             timer.clone(),
             config.idle,
         ));
@@ -102,7 +105,7 @@ impl Appender {
 
     /// Starts appending to a new, empty file whose first record is `next`.
     pub(crate) fn activate(&self, file: Arc<DiskFile>, next: u64) {
-        let mut ws = self.state.lock().unwrap();
+        let mut ws = self.state.borrow_mut();
         debug_assert!(ws.active.is_none());
         ws.active = Some(Active {
             file,
@@ -114,7 +117,7 @@ impl Appender {
     }
 
     pub(crate) fn is_active(&self) -> bool {
-        self.state.lock().unwrap().active.is_some()
+        self.state.borrow_mut().active.is_some()
     }
 
     /// Buffers one record, whose index is `index`, waiting for pool space
@@ -124,7 +127,7 @@ impl Appender {
         let mut part = 0;
         loop {
             {
-                let mut guard = self.state.lock().unwrap();
+                let mut guard = self.state.borrow_mut();
                 let ws = &mut *guard;
                 let active = ws
                     .active
@@ -169,9 +172,9 @@ impl Appender {
                     return;
                 }
             }
-            let chunk_size = self.state.lock().unwrap().chunk_size;
+            let chunk_size = self.state.borrow_mut().chunk_size;
             let permit = self.pool.acquire(chunk_size).await;
-            let mut ws = self.state.lock().unwrap();
+            let mut ws = self.state.borrow_mut();
             let active = ws
                 .active
                 .as_mut()
@@ -190,7 +193,7 @@ impl Appender {
     /// it. Returns the sync and one past the last record it covers, or `None`
     /// if no segment is active.
     pub(crate) fn sync(&self) -> Option<(impl Future<Output = std::io::Result<()>> + use<>, u64)> {
-        let mut ws = self.state.lock().unwrap();
+        let mut ws = self.state.borrow_mut();
         dispatch(&mut ws);
         let active = ws.active.as_ref()?;
         Some((ws.disk.sync(&active.file), active.dispatched))
@@ -198,19 +201,19 @@ impl Appender {
 
     /// Hands the head chunk off so a read can see it; reads queue behind it.
     pub(crate) fn dispatch(&self) {
-        dispatch(&mut self.state.lock().unwrap());
+        dispatch(&mut self.state.borrow_mut());
     }
 
     /// Bytes handed to the worker in the active file.
     pub(crate) fn dispatched_bytes(&self) -> u64 {
-        let ws = self.state.lock().unwrap();
+        let ws = self.state.borrow_mut();
         ws.active.as_ref().map_or(0, |a| a.pos)
     }
 
     /// Stops appending to the active file: writes out the head, trims the
     /// preallocated tail and submits a sync of both.
     pub(crate) fn close(&self) -> Option<Closed> {
-        let mut ws = self.state.lock().unwrap();
+        let mut ws = self.state.borrow_mut();
         dispatch(&mut ws);
         let active = ws.active.take()?;
         ws.disk.set_len(&active.file, active.pos);
@@ -222,7 +225,7 @@ impl Appender {
 
     /// Stops the idle timer.
     pub(crate) fn shutdown(&self) {
-        let mut ws = self.state.lock().unwrap();
+        let mut ws = self.state.borrow_mut();
         ws.closed = true;
         self.timer.notify_one();
     }
@@ -257,13 +260,13 @@ fn dispatch(ws: &mut WriteState) {
 }
 
 /// Writes out a head chunk that has sat unwritten for the idle timeout.
-async fn idle_timer(state: Weak<Mutex<WriteState>>, wake: Arc<Notify>, idle: Duration) {
+async fn idle_timer(state: Weak<RefCell<WriteState>>, wake: Rc<Notify>, idle: Duration) {
     loop {
         wake.notified().await;
         loop {
             let deadline = {
                 let Some(state) = state.upgrade() else { return };
-                let mut ws = state.lock().unwrap();
+                let mut ws = state.borrow_mut();
                 if ws.closed {
                     return;
                 }
@@ -275,7 +278,7 @@ async fn idle_timer(state: Weak<Mutex<WriteState>>, wake: Arc<Notify>, idle: Dur
             };
             tokio::time::sleep_until(deadline).await;
             let Some(state) = state.upgrade() else { return };
-            let mut ws = state.lock().unwrap();
+            let mut ws = state.borrow_mut();
             if ws.closed {
                 return;
             }

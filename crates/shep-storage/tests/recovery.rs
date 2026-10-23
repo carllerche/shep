@@ -44,7 +44,7 @@ async fn reopen_err(env: &mut Env) -> Error {
 
 // Adapted from storage_e2e_test.cc: committed_offset_updates. Only flushed
 // data is promised; whatever else survives is a prefix of what was appended.
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn crash_keeps_flushed_and_a_prefix_of_the_rest() {
     let mut env = Env::new().await;
     let log = env.open(small()).await;
@@ -69,7 +69,7 @@ async fn crash_keeps_flushed_and_a_prefix_of_the_rest() {
 
 // Adapted from storage_e2e_test.cc: empty_segment_recovery (a preallocated,
 // never-written tail reads as zeros).
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn zeroed_preallocated_tail_is_trimmed() {
     let mut env = Env::new().await;
     let files = crashed_log(&mut env, 40).await;
@@ -84,7 +84,7 @@ async fn zeroed_preallocated_tail_is_trimmed() {
 }
 
 // Adapted from log_replayer_test.cc: test_unrecovered_single_batch.
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn torn_header_is_truncated() {
     // Partly written: the rest of the header still zeros.
     let mut env = Env::new().await;
@@ -103,7 +103,7 @@ async fn torn_header_is_truncated() {
 }
 
 // Adapted from log_replayer_test.cc: test_malformed_segment.
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn torn_payload_is_truncated() {
     let mut env = Env::new().await;
     let files = crashed_log(&mut env, 40).await;
@@ -119,7 +119,7 @@ async fn torn_payload_is_truncated() {
 }
 
 // Adapted from log_replayer_test.cc: test_unrecovered_multiple_batches.
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn corruption_in_the_last_segment_drops_the_rest() {
     for at in [pos(35) + 3, pos(35) + 60] {
         // Header, then payload.
@@ -136,7 +136,7 @@ async fn corruption_in_the_last_segment_drops_the_rest() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn index_discontinuity_ends_the_log() {
     // A well-formed record with the wrong index, as if a stale write
     // survived where a newer one was lost.
@@ -151,7 +151,7 @@ async fn index_discontinuity_ends_the_log() {
 
 // Adapted from segment_set_test.cc: recovery. Only the last segment can be
 // torn by a crash; damage anywhere else is reported, not repaired.
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn corruption_in_a_closed_segment_is_an_error() {
     let mut env = Env::new().await;
     let files = crashed_log(&mut env, 100).await;
@@ -171,7 +171,7 @@ async fn corruption_in_a_closed_segment_is_an_error() {
     assert!(matches!(reopen_err(&mut env).await, Error::Corrupt { .. }));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn bytes_appended_to_a_closed_segment_are_an_error() {
     let mut env = Env::new().await;
     let files = crashed_log(&mut env, 100).await;
@@ -182,7 +182,7 @@ async fn bytes_appended_to_a_closed_segment_are_an_error() {
     assert!(matches!(reopen_err(&mut env).await, Error::Corrupt { .. }));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn missing_segment_is_an_error() {
     let mut env = Env::new().await;
     let files = crashed_log(&mut env, 100).await;
@@ -196,7 +196,7 @@ async fn missing_segment_is_an_error() {
 }
 
 // Adapted from storage_e2e_test.cc: empty_segment_recovery.
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn empty_last_segment_is_removed() {
     for contents in [vec![], vec![0; 1024]] {
         // A crash right after rolling, which closes the previous segment
@@ -218,7 +218,7 @@ async fn empty_last_segment_is_removed() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn whole_tail_segment_torn_away() {
     // The crash came right after rolling: the new segment's only record is
     // torn, which leaves it empty.
@@ -231,7 +231,7 @@ async fn whole_tail_segment_torn_away() {
     assert_eq!(env.segment_files(), files[..1]);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn stray_files_are_cleaned_up() {
     let mut env = Env::new().await;
     crashed_log(&mut env, 10).await;
@@ -246,7 +246,7 @@ async fn stray_files_are_cleaned_up() {
 }
 
 // Adapted from log_truncate_test.cc: truncated_segment_recovery.
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn reopen_after_each_operation_yields_the_same_state() {
     enum Op {
         Append(std::ops::Range<u64>, u64),

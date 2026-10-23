@@ -20,7 +20,8 @@ use shep_raft_engine::errors::{ClientWriteError, InitializeError, RaftError};
 use shep_raft_engine::impls::BasicNode;
 use shep_raft_engine::raft::{AppendEntriesRequest, TransferLeaderRequest, VoteRequest};
 use shep_raft_engine::{Config, Raft, ServerState, SnapshotPolicy};
-use shep_rpc::{ReconnectConfig, Request, Response, Server, ServerConfig, Status};
+use shep_rpc_client::ReconnectConfig;
+use shep_rpc_server::{Request, Response, Server, ServerConfig, service_fn};
 use shep_smp::{CoreId, Sharded, Smp, SmpError};
 use shep_storage::{KeySpace, Log, Storage, StorageConfig};
 use tokio::net::TcpListener;
@@ -51,7 +52,7 @@ pub struct RaftConfig {
     /// AppendEntries in flight per follower per group.
     pub append_window: usize,
     /// About the most entry bytes one AppendEntries carries; a larger entry
-    /// goes alone. Peers' `server.max_memory` must exceed the largest entry.
+    /// goes alone. Peers' `server.max_payload` must exceed the largest entry.
     pub max_append_bytes: usize,
     /// How long a core gathers heartbeats for one peer before sending them.
     pub heartbeat_linger: Duration,
@@ -340,20 +341,23 @@ impl<M: Machine> RaftNode<M> {
         }
     }
 
-    /// Serves peers on `listener` until [`RaftNode::shutdown`].
+    /// Serves peers on `listener` until [`RaftNode::shutdown`], from a task
+    /// on the calling thread, which must run a
+    /// [`LocalRuntime`](tokio::runtime::LocalRuntime).
     pub fn serve(&self, listener: TcpListener) {
         let weak = Arc::downgrade(&self.shared);
-        let server = Server::new(self.shared.config.server.clone(), move |req: Request| {
+        let service = service_fn(move |req: Request| {
             let shared = weak.upgrade();
             async move {
                 match shared {
                     Some(s) => s.dispatch(req).await,
-                    None => Response::error(Status::ServiceUnavailable),
+                    None => Response::error(wire::status::UNAVAILABLE),
                 }
             }
         });
+        let server = Server::new(self.shared.config.server.clone(), service);
         let mut shutdown = self.shared.shutdown.subscribe();
-        let task = tokio::spawn(async move {
+        let task = tokio::task::spawn_local(async move {
             tokio::select! {
                 _ = server.serve(listener) => {}
                 _ = async { let _ = shutdown.wait_for(|s| *s).await; } => {
@@ -590,12 +594,15 @@ impl<M: Machine> Shared<M> {
     /// Serves one peer RPC, on the core that owns its group.
     async fn dispatch(&self, req: Request) -> Response {
         if self.faults.is_partitioned() {
-            return Response::error(Status::ServiceUnavailable);
+            return Response::error(wire::status::UNAVAILABLE);
+        }
+        if req.version != wire::VERSION {
+            return Response::error(wire::status::MALFORMED);
         }
         match req.method {
             wire::APPEND => {
                 let Ok(r) = shep_codec::from_bytes::<AppendRequest>(req.body) else {
-                    return Response::error(Status::ServerError);
+                    return Response::error(wire::status::MALFORMED);
                 };
                 let reply = self
                     .on_group(r.group, move |c| async move { c.append(r).await })
@@ -606,13 +613,13 @@ impl<M: Machine> Shared<M> {
             }
             wire::HEARTBEATS => {
                 let Ok(batch) = shep_codec::from_bytes::<wire::Heartbeats>(req.body) else {
-                    return Response::error(Status::ServerError);
+                    return Response::error(wire::status::MALFORMED);
                 };
                 Response::ok(shep_codec::to_bytes(&self.heartbeats(batch).await))
             }
             wire::VOTE | wire::PRE_VOTE => {
                 let Ok(r) = shep_codec::from_bytes::<wire::VoteRequest>(req.body) else {
-                    return Response::error(Status::ServerError);
+                    return Response::error(wire::status::MALFORMED);
                 };
                 let pre = req.method == wire::PRE_VOTE;
                 let reply = self
@@ -624,7 +631,7 @@ impl<M: Machine> Shared<M> {
             }
             wire::SNAPSHOT => {
                 let Ok(r) = shep_codec::from_bytes::<wire::SnapshotRequest>(req.body) else {
-                    return Response::error(Status::ServerError);
+                    return Response::error(wire::status::MALFORMED);
                 };
                 let reply = self
                     .on_group(r.group, move |c| async move { Ok(c.snapshot(r).await) })
@@ -635,7 +642,7 @@ impl<M: Machine> Shared<M> {
             }
             wire::TRANSFER_LEADER => {
                 let Ok(r) = shep_codec::from_bytes::<wire::TransferLeaderRequest>(req.body) else {
-                    return Response::error(Status::ServerError);
+                    return Response::error(wire::status::MALFORMED);
                 };
                 let reply = self
                     .on_group(
@@ -647,7 +654,7 @@ impl<M: Machine> Shared<M> {
                     &reply.unwrap_or_else(wire::TransferLeaderReply::Rejected),
                 ))
             }
-            _ => Response::error(Status::MethodNotFound),
+            _ => Response::error(wire::status::UNKNOWN_METHOD),
         }
     }
 

@@ -28,7 +28,7 @@ fn same_prefix(a: &[LogEntry], b: &[LogEntry], through: u64) {
     assert_eq!(a, b);
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "local")]
 async fn the_log_survives_a_full_restart() {
     let mut cluster = Cluster::start(3, &[P1]).await;
     let committed = commit_n(&cluster, 40).await;
@@ -59,7 +59,7 @@ async fn the_log_survives_a_full_restart() {
     cluster.shutdown().await;
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "local")]
 async fn a_lagging_replica_catches_up() {
     let mut cluster = Cluster::start(3, &[P1]).await;
     commit_n(&cluster, 5).await;
@@ -79,7 +79,7 @@ async fn a_lagging_replica_catches_up() {
     cluster.shutdown().await;
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "local")]
 async fn a_torn_write_is_truncated_on_recovery() {
     let mut cluster = Cluster::start(3, &[P1]).await;
     let committed = commit_n(&cluster, 20).await;
@@ -118,7 +118,7 @@ async fn a_torn_write_is_truncated_on_recovery() {
     cluster.shutdown().await;
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "local")]
 async fn segments_roll_over() {
     let mut cluster =
         Cluster::start_with(3, &[P1], |c| c.raft.storage.log.segment_size = 512).await;

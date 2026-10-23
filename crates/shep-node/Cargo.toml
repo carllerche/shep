@@ -11,7 +11,7 @@ name = "shep-node"
 path = "src/main.rs"
 
 [dependencies]
-shep-rpc.workspace = true
+shep-rpc-server.workspace = true
 shep-smp.workspace = true
 shep-wal.workspace = true
 shep-wal-api.workspace = true

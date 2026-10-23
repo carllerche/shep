@@ -9,7 +9,7 @@ use util::*;
 const PER_SEGMENT: u64 = 32;
 
 // Adapted from log_truncate_test.cc: test_truncate_in_the_middle_of_segment.
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn truncate_suffix_inside_the_last_segment() {
     let mut env = Env::new().await;
     let log = env.open(small()).await;
@@ -32,7 +32,7 @@ async fn truncate_suffix_inside_the_last_segment() {
 }
 
 // Adapted from log_truncate_test.cc: test_truncate_middle_of_old_segment.
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn truncate_suffix_inside_an_older_segment() {
     let mut env = Env::new().await;
     let log = env.open(small()).await;
@@ -48,7 +48,7 @@ async fn truncate_suffix_inside_an_older_segment() {
     assert_eq!(state(&log).await, before);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn truncate_suffix_at_a_segment_boundary() {
     let mut env = Env::new().await;
     let log = env.open(small()).await;
@@ -67,7 +67,7 @@ async fn truncate_suffix_at_a_segment_boundary() {
 
 // Adapted from log_truncate_test.cc: test_truncate_whole and
 // truncate_whole_log_and_then_again.
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn truncate_suffix_to_zero() {
     let mut env = Env::new().await;
     let log = env.open(small()).await;
@@ -92,7 +92,7 @@ async fn truncate_suffix_to_zero() {
 
 // Adapted from log_truncate_test.cc: test_truncate_empty_log and
 // test_truncate_last_single_record_batch.
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn truncate_suffix_edges() {
     let env = Env::new().await;
     let log = env.open(small()).await;
@@ -108,7 +108,7 @@ async fn truncate_suffix_edges() {
 }
 
 // Adapted from storage_e2e_test.cc: test_truncation_with_write_caching.
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn truncate_suffix_of_unwritten_appends() {
     let mut env = Env::new().await;
     let config = LogConfig {
@@ -129,7 +129,7 @@ async fn truncate_suffix_of_unwritten_appends() {
 }
 
 // Adapted from log_truncate_test.cc: truncate_before_read.
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn reads_after_truncation_see_the_new_suffix() {
     let env = Env::new().await;
     let log = env.open(small()).await;
@@ -143,7 +143,7 @@ async fn reads_after_truncation_see_the_new_suffix() {
     assert_eq!(log.read(30..50, usize::MAX).await.unwrap(), expect);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn prefix_truncate_inside_a_segment() {
     let mut env = Env::new().await;
     let log = env.open(small()).await;
@@ -179,7 +179,7 @@ async fn prefix_truncate_inside_a_segment() {
     ));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn prefix_truncate_at_a_segment_boundary() {
     let mut env = Env::new().await;
     let log = env.open(small()).await;
@@ -191,7 +191,7 @@ async fn prefix_truncate_at_a_segment_boundary() {
     assert_eq!(read_all(&log).await, recs(64..100, 1));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn prefix_truncate_past_the_end_empties_the_log() {
     let mut env = Env::new().await;
     let log = env.open(small()).await;
@@ -213,7 +213,7 @@ async fn prefix_truncate_past_the_end_empties_the_log() {
     assert_eq!(log.segments()[0].base, 70);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn prefix_truncate_an_empty_log_sets_where_it_starts() {
     let mut env = Env::new().await;
     let log = env.open(small()).await;
@@ -225,7 +225,7 @@ async fn prefix_truncate_an_empty_log_sets_where_it_starts() {
 }
 
 // Adapted from log_truncate_test.cc: test_prefix_truncate_then_truncate_all.
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn prefix_truncate_then_truncate_all() {
     let mut env = Env::new().await;
     let log = env.open(small()).await;
@@ -240,7 +240,7 @@ async fn prefix_truncate_then_truncate_all() {
     assert_eq!(log.start_index(), 50);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn prefix_truncate_flushes_what_it_keeps() {
     let mut env = Env::new().await;
     let log = env.open(LogConfig::default()).await;
@@ -253,7 +253,7 @@ async fn prefix_truncate_flushes_what_it_keeps() {
     assert_eq!(read_all(&log).await, recs(5..next, 1));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn crash_mid_prefix_truncation_finishes_on_open() {
     // The start was persisted but the segments below it survived.
     let mut env = Env::new().await;
@@ -283,7 +283,7 @@ async fn crash_mid_prefix_truncation_finishes_on_open() {
 /// A read of retained entries never fails because a suffix truncation is
 /// under way: the segment's file shrinks before its size in memory does, so
 /// readers wait for the whole truncation.
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn reads_of_retained_entries_race_suffix_truncation() {
     for _ in 0..20 {
         let env = Env::new().await;

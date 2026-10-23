@@ -10,8 +10,9 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use futures::future::BoxFuture;
-use shep_rpc::wire::{HEADER_SIZE, Header, MAX_PAYLOAD};
-use shep_rpc::{Request, Response, Server, ServerConfig, Status, method_id};
+use shep_rpc::wire::{DEFAULT_MAX_PAYLOAD, HEADER_SIZE, Header, payload_checksum};
+use shep_rpc::{Metadata, method_id};
+use shep_rpc_server::{Request, Response, Server, ServerConfig, Service, service_fn};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -20,7 +21,7 @@ pub const SERVICE: u16 = 7;
 pub const ECHO: u32 = method_id(SERVICE, 1);
 /// Sleeps for the milliseconds in the body (u64 LE), then returns the body.
 pub const SLEEP: u32 = method_id(SERVICE, 2);
-/// Answers `ServerError`.
+/// Answers the service's `FAILED` status, with a body that isn't sent.
 pub const FAIL: u32 = method_id(SERVICE, 3);
 /// Panics.
 pub const PANIC: u32 = method_id(SERVICE, 4);
@@ -29,8 +30,14 @@ pub const PANIC: u32 = method_id(SERVICE, 4);
 pub const RECORD: u32 = method_id(SERVICE, 5);
 /// Waits for a permit from `State::release`, then returns the body.
 pub const BLOCK: u32 = method_id(SERVICE, 6);
-/// Returns a body one byte over `MAX_PAYLOAD`.
+/// Returns a body one byte over the default limit.
 pub const OVERSIZED: u32 = method_id(SERVICE, 7);
+/// Returns the request's metadata as its own, and its version as the body.
+pub const METADATA: u32 = method_id(SERVICE, 8);
+
+/// The test service's statuses.
+pub const UNKNOWN_METHOD: u32 = 1000;
+pub const FAILED: u32 = 1001;
 
 pub const LONG: Duration = Duration::from_secs(10);
 
@@ -76,7 +83,8 @@ pub fn handler(
                     Response::ok(req.body)
                 }
                 FAIL => Response {
-                    status: Status::ServerError,
+                    status: FAILED,
+                    metadata: Metadata::empty(),
                     body: Bytes::from_static(b"dropped: errors have empty bodies"),
                 },
                 PANIC => panic!("handler panic (expected by the test)"),
@@ -88,8 +96,9 @@ pub fn handler(
                     state.release.acquire().await.unwrap().forget();
                     Response::ok(req.body)
                 }
-                OVERSIZED => Response::ok(Bytes::from(vec![0; MAX_PAYLOAD + 1])),
-                _ => Response::error(Status::MethodNotFound),
+                OVERSIZED => Response::ok(Bytes::from(vec![0; DEFAULT_MAX_PAYLOAD + 1])),
+                METADATA => Response::ok(vec![req.version]).with_metadata(req.metadata),
+                _ => Response::error(UNKNOWN_METHOD),
             }
         }) as BoxFuture<'static, Response>
     }
@@ -100,13 +109,7 @@ pub fn sleep_body(ms: u64) -> Bytes {
 }
 
 /// A server for the test service, accepting on a fresh loopback port.
-pub async fn start(
-    config: ServerConfig,
-) -> (
-    Server<impl Fn(Request) -> BoxFuture<'static, Response> + Clone + Send + Sync + 'static>,
-    SocketAddr,
-    Arc<State>,
-) {
+pub async fn start(config: ServerConfig) -> (Server<impl Service>, SocketAddr, Arc<State>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (server, state) = start_on(config, listener);
@@ -114,34 +117,43 @@ pub async fn start(
 }
 
 /// Like `start`, on `listener`.
-pub fn start_on(
-    config: ServerConfig,
-    listener: TcpListener,
-) -> (
-    Server<impl Fn(Request) -> BoxFuture<'static, Response> + Clone + Send + Sync + 'static>,
-    Arc<State>,
-) {
+pub fn start_on(config: ServerConfig, listener: TcpListener) -> (Server<impl Service>, Arc<State>) {
     let state = Arc::new(State::default());
-    let server = Server::new(config, handler(state.clone()));
+    let server = Server::new(config, service_fn(handler(state.clone())));
     let serving = server.clone();
-    tokio::spawn(async move { serving.serve(listener).await });
+    tokio::task::spawn_local(async move { serving.serve(listener).await });
     (server, state)
 }
 
+/// A good header for a frame with no metadata: `meta` is the method on a
+/// request, the status on a response.
+pub fn header(meta: u32, id: u32, body: &[u8]) -> Header {
+    Header::new(0, meta, id, &[], body.len(), payload_checksum(body))
+}
+
+/// A good header for a request frame of `metadata` and `body`.
+pub fn request(method: u32, id: u32, metadata: &[u8], body: &[u8]) -> Header {
+    Header::new(0, method, id, metadata, body.len(), payload_checksum(body))
+}
+
 /// Writes one frame as given, checksums and all.
-pub async fn write_frame(stream: &mut TcpStream, header: &Header, body: &[u8]) {
+pub async fn write_frame(stream: &mut TcpStream, header: &Header, metadata: &[u8], body: &[u8]) {
     stream.write_all(&header.encode()).await.unwrap();
+    stream.write_all(metadata).await.unwrap();
     stream.write_all(body).await.unwrap();
 }
 
-/// The next frame, or `None` if the peer closed the connection.
-pub async fn read_frame(stream: &mut TcpStream) -> Option<(Header, Bytes)> {
+/// The next frame (header, metadata, body), or `None` if the peer closed the
+/// connection.
+pub async fn read_frame(stream: &mut TcpStream) -> Option<(Header, Bytes, Bytes)> {
     let mut buf = [0; HEADER_SIZE];
     stream.read_exact(&mut buf).await.ok()?;
     let header = Header::decode(&buf);
+    let mut metadata = vec![0; header.metadata_size as usize];
+    stream.read_exact(&mut metadata).await.ok()?;
     let mut body = vec![0; header.payload_size as usize];
     stream.read_exact(&mut body).await.ok()?;
-    Some((header, body.into()))
+    Some((header, metadata.into(), body.into()))
 }
 
 /// Waits for the peer to close the connection, failing if it sends anything
@@ -166,7 +178,7 @@ where
 {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
+    tokio::task::spawn_local(async move {
         let (stream, _) = listener.accept().await.unwrap();
         f(stream).await;
     });

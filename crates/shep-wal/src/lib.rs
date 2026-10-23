@@ -20,21 +20,23 @@ mod state_machine;
 #[doc(hidden)]
 pub mod table;
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Duration;
 
 use shep_raft::{
     Entry, Fetched, GroupId, LogRecord, ProposeError, RaftConfig, RaftNode, RaftNodeError,
     RecordKind,
 };
-use shep_rpc::{Request, Response, Server, Status};
+use shep_rpc_server::{Request, Response, Server, service_fn};
 use shep_smp::{Smp, SmpError};
 use shep_wal_api::{
     AdminReply, CreatePartitionRequest, Decided, DecidedStatus, Dot, EntryKind, FetchReply,
     FetchRequest, InitializePartitionRequest, LogEntry, Member, MutationEntry, PartitionId,
     PartitionStatus, ProposalKind, ProposeReply, ProposeRequest, Rejection, StatusReply,
-    StatusRequest, method,
+    StatusRequest, method, status,
 };
 use tokio::net::TcpListener;
 use tokio::sync::watch;
@@ -88,21 +90,23 @@ pub enum WalError {
 }
 
 /// A WAL node: replicas of some partitions on its cores, and the services for
-/// them. Cheap to clone; usable from any thread.
+/// them. Cheap to clone. Its own tasks (serving, founding, reconciling) run on
+/// the thread that starts it, which must run a
+/// [`LocalRuntime`](tokio::runtime::LocalRuntime).
 #[derive(Clone)]
 pub struct WalNode {
-    shared: Arc<Shared>,
+    shared: Rc<Shared>,
 }
 
 struct Shared {
     config: Arc<WalConfig>,
     raft: RaftNode<GroupSm>,
     shutdown: watch::Sender<bool>,
-    servers: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    servers: RefCell<Vec<tokio::task::JoinHandle<()>>>,
     /// The controller's founding and reconciling.
-    background: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    background: RefCell<Vec<tokio::task::JoinHandle<()>>>,
     /// For calls to peers outside Raft, like founding's hellos.
-    peers: shep_rpc::ConnectionCache,
+    peers: shep_rpc_client::ConnectionCache,
 }
 
 fn group(p: PartitionId) -> GroupId {
@@ -115,13 +119,13 @@ impl WalNode {
     pub async fn start(config: WalConfig, smp: Smp) -> Result<WalNode, WalError> {
         let raft = RaftNode::start(config.raft.clone(), smp, GroupSm::for_group).await?;
         let node = WalNode {
-            shared: Arc::new(Shared {
-                peers: shep_rpc::ConnectionCache::new(config.raft.reconnect.clone()),
+            shared: Rc::new(Shared {
+                peers: shep_rpc_client::ConnectionCache::new(config.raft.reconnect.clone()),
                 config: Arc::new(config),
                 raft,
                 shutdown: watch::channel(false).0,
-                servers: Mutex::new(Vec::new()),
-                background: Mutex::new(Vec::new()),
+                servers: RefCell::new(Vec::new()),
+                background: RefCell::new(Vec::new()),
             }),
         };
         if !node.config().seeds.is_empty() {
@@ -134,23 +138,20 @@ impl WalNode {
         &self.shared.config
     }
 
-    pub(crate) fn peers(&self) -> &shep_rpc::ConnectionCache {
+    pub(crate) fn peers(&self) -> &shep_rpc_client::ConnectionCache {
         &self.shared.peers
     }
 
     /// Runs `f` until shutdown.
-    pub(crate) fn spawn_background(
-        &self,
-        f: impl std::future::Future<Output = ()> + Send + 'static,
-    ) {
+    pub(crate) fn spawn_background(&self, f: impl std::future::Future<Output = ()> + 'static) {
         let mut shutdown = self.shared.shutdown.subscribe();
-        let task = tokio::spawn(async move {
+        let task = tokio::task::spawn_local(async move {
             tokio::select! {
                 _ = f => {}
                 _ = async { let _ = shutdown.wait_for(|s| *s).await; } => {}
             }
         });
-        self.shared.background.lock().unwrap().push(task);
+        self.shared.background.borrow_mut().push(task);
     }
 
     pub fn node_id(&self) -> u64 {
@@ -171,13 +172,13 @@ impl WalNode {
         let node = self.clone();
         let server = Server::new(
             self.shared.config.raft.server.clone(),
-            move |req: Request| {
+            service_fn(move |req: Request| {
                 let node = node.clone();
                 async move { node.handle(req).await }
-            },
+            }),
         );
         let mut shutdown = self.shared.shutdown.subscribe();
-        let task = tokio::spawn(async move {
+        let task = tokio::task::spawn_local(async move {
             tokio::select! {
                 _ = server.serve(listener) => {}
                 _ = async { let _ = shutdown.wait_for(|s| *s).await; } => {
@@ -185,13 +186,16 @@ impl WalNode {
                 }
             }
         });
-        self.shared.servers.lock().unwrap().push(task);
+        self.shared.servers.borrow_mut().push(task);
     }
 
     /// Serves one request of either service; for a server hosting more.
     pub async fn handle(&self, req: Request) -> Response {
         if RaftNode::<GroupSm>::handles(req.method) {
             return self.shared.raft.handle(req).await;
+        }
+        if req.version != shep_wal_api::VERSION {
+            return Response::error(status::MALFORMED);
         }
         if shep_wal_controller::method::is_controller(req.method) {
             return self.handle_controller(req).await;
@@ -204,18 +208,18 @@ impl WalNode {
                 Ok(r) => reply(&ProposeReply::from(
                     self.propose(r.partition, r.proposal).await,
                 )),
-                Err(_) => Response::error(Status::ServerError),
+                Err(_) => Response::error(status::MALFORMED),
             },
             method::FETCH => match shep_codec::from_bytes::<FetchRequest>(req.body) {
                 Ok(r) => reply(&self.fetch(r).await),
-                Err(_) => Response::error(Status::ServerError),
+                Err(_) => Response::error(status::MALFORMED),
             },
             method::STATUS => match shep_codec::from_bytes::<StatusRequest>(req.body) {
                 Ok(r) => reply(&match self.status(r.partition).await {
                     Some(s) => StatusReply::Status(s),
                     None => StatusReply::UnknownPartition,
                 }),
-                Err(_) => Response::error(Status::ServerError),
+                Err(_) => Response::error(status::MALFORMED),
             },
             method::CREATE_PARTITION => {
                 match shep_codec::from_bytes::<CreatePartitionRequest>(req.body) {
@@ -223,7 +227,7 @@ impl WalNode {
                         Ok(()) => AdminReply::Ok,
                         Err(e) => AdminReply::Failed(e.to_string()),
                     }),
-                    Err(_) => Response::error(Status::ServerError),
+                    Err(_) => Response::error(status::MALFORMED),
                 }
             }
             method::INITIALIZE_PARTITION => {
@@ -241,10 +245,10 @@ impl WalNode {
                             Err(e) => AdminReply::Failed(e.to_string()),
                         },
                     ),
-                    Err(_) => Response::error(Status::ServerError),
+                    Err(_) => Response::error(status::MALFORMED),
                 }
             }
-            _ => Response::error(Status::MethodNotFound),
+            _ => Response::error(status::UNKNOWN_METHOD),
         }
     }
 
@@ -261,17 +265,17 @@ impl WalNode {
                     Some(s) => StateReply::State(s),
                     None => StateReply::NoController,
                 }),
-                Err(_) => Response::error(Status::ServerError),
+                Err(_) => Response::error(status::MALFORMED),
             },
             cm::CREATE_LOG_SET => match shep_codec::from_bytes::<CreateLogSetRequest>(req.body) {
                 Ok(r) => reply(&self.create_log_set(r).await),
-                Err(_) => Response::error(Status::ServerError),
+                Err(_) => Response::error(status::MALFORMED),
             },
             cm::HELLO => match shep_codec::from_bytes::<HelloRequest>(req.body) {
                 Ok(_) => reply(&self.hello().await),
-                Err(_) => Response::error(Status::ServerError),
+                Err(_) => Response::error(status::MALFORMED),
             },
-            _ => Response::error(Status::MethodNotFound),
+            _ => Response::error(status::UNKNOWN_METHOD),
         }
     }
 
@@ -451,9 +455,9 @@ impl WalNode {
     /// it's the caller's.
     pub async fn shutdown(&self) {
         self.shared.shutdown.send_replace(true);
-        let tasks: Vec<_> = std::mem::take(&mut *self.shared.servers.lock().unwrap())
+        let tasks: Vec<_> = std::mem::take(&mut *self.shared.servers.borrow_mut())
             .into_iter()
-            .chain(std::mem::take(&mut *self.shared.background.lock().unwrap()))
+            .chain(std::mem::take(&mut *self.shared.background.borrow_mut()))
             .collect();
         for t in tasks {
             let _ = t.await;

@@ -47,7 +47,7 @@ async fn write(node: &RaftNode<Recorder>, payload: &'static str) {
 
 /// Groups live in their core's directory, so a node can't drop a core that
 /// hosts any: it refuses to start rather than come up without them.
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "local")]
 async fn fewer_cores_than_host_groups_is_refused() {
     init_tracing();
     let dir = tempfile::tempdir().unwrap();

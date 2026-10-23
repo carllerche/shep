@@ -27,7 +27,7 @@ async fn write_to(cluster: &Cluster, p: PartitionId, k: &str) -> u64 {
         .index
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "local")]
 async fn a_single_server_founds_itself_and_serves_universes() {
     let cluster = Cluster::start_controlled(1).await;
     cluster.founded().await;
@@ -66,7 +66,7 @@ async fn a_single_server_founds_itself_and_serves_universes() {
     cluster.shutdown().await;
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "local")]
 async fn three_seeds_found_one_cluster() {
     let cluster = Cluster::start_controlled(3).await;
     let id = cluster.founded().await;
@@ -90,7 +90,7 @@ async fn three_seeds_found_one_cluster() {
 }
 
 /// Replicas spread over nodes by count.
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "local")]
 async fn partitions_spread_over_nodes() {
     let cluster = Cluster::start_controlled(3).await;
     cluster.founded().await;
@@ -110,7 +110,7 @@ async fn partitions_spread_over_nodes() {
 }
 
 /// The controller's state and every partition survive a full restart.
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "local")]
 async fn a_restarted_cluster_keeps_its_universes() {
     let mut cluster = Cluster::start_controlled(3).await;
     let id = cluster.founded().await;
@@ -134,7 +134,7 @@ async fn a_restarted_cluster_keeps_its_universes() {
 }
 
 /// A cluster is founded only once every seed is reachable.
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "local")]
 async fn founding_waits_for_every_seed() {
     let mut cluster = Cluster::start_controlled_some(3, 2).await;
     tokio::time::sleep(Duration::from_secs(1)).await;
@@ -151,7 +151,7 @@ async fn founding_waits_for_every_seed() {
 
 /// Seeds whose lists differ don't found a cluster together: only nodes that
 /// agree on the list do.
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "local")]
 async fn seeds_with_different_lists_dont_found_together() {
     // Node 1 lists {1, 2, 3}; nodes 2 and 3 list {2, 3}.
     let cluster = Cluster::start_controlled_with(3, 3, |i, c| {
@@ -192,7 +192,7 @@ async fn seeds_with_different_lists_dont_found_together() {
 
 /// On a node with seeds, partitions come only from the controller: one made
 /// by hand could take the id a new universe is given, data and all.
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "local")]
 async fn controlled_nodes_refuse_partitions_made_by_hand() {
     let cluster = Cluster::start_controlled(1).await;
     cluster.founded().await;

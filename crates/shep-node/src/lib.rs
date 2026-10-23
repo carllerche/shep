@@ -10,7 +10,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use shep_rpc::{Request, Response, Server, Status};
+use shep_rpc_server::{Request, Response, Server, service_fn};
 use shep_smp::{Smp, SmpConfig};
 use shep_wal::{WalConfig, WalNode};
 use shep_wal_api::Member;
@@ -94,18 +94,18 @@ impl Node {
         let wal = WalNode::start(wal_config.clone(), smp.clone()).await?;
         let server = Server::new(wal_config.raft.server.clone(), {
             let wal = wal.clone();
-            move |req: Request| {
+            service_fn(move |req: Request| {
                 let wal = wal.clone();
                 async move {
                     match Service::of(req.method) {
                         Some(Service::Wal) => wal.handle(req).await,
-                        None => Response::error(Status::MethodNotFound),
+                        None => Response::error(shep_wal_api::status::UNKNOWN_METHOD),
                     }
                 }
-            }
+            })
         });
         let (shutdown, mut stop) = watch::channel(false);
-        let task = tokio::spawn(async move {
+        let task = tokio::task::spawn_local(async move {
             tokio::select! {
                 _ = server.serve(listener) => {}
                 _ = async { let _ = stop.wait_for(|s| *s).await; } => {

@@ -491,7 +491,7 @@ pub mod method {
     pub const HELLO: u32 = shep_rpc::method_id(SERVICE, 3);
 
     pub fn is_controller(method: u32) -> bool {
-        (method >> 16) as u16 == SERVICE
+        shep_rpc::service_of(method) == SERVICE
     }
 }
 

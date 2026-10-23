@@ -36,3 +36,4 @@ pub use node::{
     RaftNodeError, RaftStats,
 };
 pub use types::{GroupId, NodeId};
+pub use wire::status;

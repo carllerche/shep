@@ -13,13 +13,13 @@ use support::*;
 const LIMIT: usize = 64 << 10;
 
 /// Entries that each fit in a request, but not many to one, replicate in
-/// AppendEntries bounded by bytes: a peer closes any connection that sends a
-/// request over its memory budget, so an unbounded catch-up batch would never
-/// get through. Fetches are bounded by bytes too.
-#[tokio::test(flavor = "multi_thread")]
+/// AppendEntries bounded by bytes: a peer refuses any request over its
+/// payload limit, so an unbounded catch-up batch would never get through.
+/// Fetches are bounded by bytes too, and so fit in a response.
+#[tokio::test(flavor = "local")]
 async fn batches_respect_the_message_limit() {
     let mut cluster = Cluster::start_with(3, &[P1], |c| {
-        c.raft.server.max_memory = LIMIT;
+        c.raft.server.max_payload = LIMIT;
         c.raft.max_append_bytes = LIMIT / 2;
         c.raft.proposals.max_entry_bytes = LIMIT / 2;
     })
@@ -49,7 +49,7 @@ async fn batches_respect_the_message_limit() {
     assert_eq!(big.count(), 30);
     // Every replica got them.
     for i in 0..3 {
-        read_node_log(&cluster, i, P1, last).await;
+        read_node_log_in(&cluster, i, P1, last, (LIMIT / 2) as u32).await;
     }
 
     // An entry over the leader's limit is refused.
@@ -68,7 +68,7 @@ async fn batches_respect_the_message_limit() {
 
 /// A tail reading a follower that's cut off from its leader moves to a
 /// replica that has the newer entries.
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "local")]
 async fn a_tail_leaves_a_replica_that_fell_behind() {
     let cluster = Cluster::start(3, &[P1]).await;
     let first = cluster

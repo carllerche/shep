@@ -40,7 +40,7 @@ async fn payloads(
 
 /// One server is a complete deployment: it founds itself, serves a
 /// universe, survives a crash, and stops cleanly.
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "local")]
 async fn a_single_server_is_a_real_deployment() {
     let node = spec(1);
     let process = Process::start(&node, &[], 2);
@@ -77,7 +77,7 @@ async fn a_single_server_is_a_real_deployment() {
 
 /// Three processes found one cluster; a universe replicated on all three
 /// keeps committing while one is down, and the returning node catches up.
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "local")]
 async fn a_three_process_cluster_survives_a_crash() {
     let nodes: Vec<_> = (1..=3).map(spec).collect();
     let seeds: Vec<_> = nodes.iter().map(|n| (n.id, n.addr)).collect();
@@ -131,7 +131,7 @@ async fn a_three_process_cluster_survives_a_crash() {
 /// A process can't start on a data directory another one is using, so a
 /// running node's predecessor on the directory is gone; once that one dies,
 /// even by SIGKILL, the directory is free.
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "local")]
 async fn one_process_per_data_directory() {
     let node = spec(1);
     let first = Process::start(&node, &[], 1);

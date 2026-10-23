@@ -1,0 +1,19 @@
+[package]
+name = "shep-rpc-client"
+description = "Calling shep-rpc servers: pipelined calls over one connection, reconnecting, a connection cache"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+bytes.workspace = true
+shep-rpc.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+futures.workspace = true
+rand.workspace = true
+shep-rpc-server.workspace = true

@@ -49,10 +49,11 @@ pub struct Cluster {
 pub fn test_config(config: &mut WalConfig) {
     config.raft.heartbeat_interval = Duration::from_millis(100);
     config.raft.election_timeout = Duration::from_millis(600)..Duration::from_millis(1200);
-    config.raft.reconnect = shep_rpc::ReconnectConfig {
+    config.raft.reconnect = shep_rpc_client::ReconnectConfig {
         initial_backoff: Duration::from_millis(50),
         max_backoff: Duration::from_millis(200),
         connect_timeout: Duration::from_millis(500),
+        transport: Default::default(),
     };
     config.raft.proposals.commit_timeout = Duration::from_secs(2);
 }
@@ -419,6 +420,17 @@ pub async fn read_node_log(
     p: PartitionId,
     through: u64,
 ) -> Vec<LogEntry> {
+    read_node_log_in(cluster, i, p, through, 1 << 20).await
+}
+
+/// Like `read_node_log`, fetching about `max_bytes` at a time.
+pub async fn read_node_log_in(
+    cluster: &Cluster,
+    i: usize,
+    p: PartitionId,
+    through: u64,
+    max_bytes: u32,
+) -> Vec<LogEntry> {
     let node = cluster.node_client(i);
     let mut out: Vec<LogEntry> = Vec::new();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
@@ -429,7 +441,7 @@ pub async fn read_node_log(
         );
         let next = out.last().map_or(0, |e| e.dot.index + 1);
         match node
-            .fetch(p, next, 1 << 20, Duration::from_millis(200))
+            .fetch(p, next, max_bytes, Duration::from_millis(200))
             .await
         {
             Ok((entries, _)) => out.extend(entries),
@@ -481,7 +493,7 @@ impl Registers {
         let (tx, applied) = watch::channel(0);
         let stream = client.tail(p, 0);
         let st = state.clone();
-        tokio::spawn(async move {
+        tokio::task::spawn_local(async move {
             futures::pin_mut!(stream);
             while let Some(e) = stream.next().await {
                 let mut st = st.lock().unwrap();

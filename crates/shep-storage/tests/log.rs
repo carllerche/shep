@@ -9,7 +9,7 @@ use shep_storage::{Error, LogConfig, Record};
 use util::*;
 
 // Adapted from storage_e2e_test.cc: test_assigning_offsets_in_single_segment_log.
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn append_and_read_back() {
     let mut env = Env::new().await;
     let log = env.open(LogConfig::default()).await;
@@ -35,7 +35,7 @@ async fn append_and_read_back() {
 
 // Adapted from storage_e2e_test.cc: append_twice_to_same_segment and
 // test_reading_range_from_a_log.
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn append_and_read_from_disk_across_segments() {
     let mut env = Env::new().await;
     // No cache, so every read goes to disk.
@@ -52,7 +52,7 @@ async fn append_and_read_from_disk_across_segments() {
     assert_eq!(read_all(&log).await, recs(0..100, 1));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn out_of_order_appends_fail() {
     let env = Env::new().await;
     let log = env.open(LogConfig::default()).await;
@@ -79,7 +79,7 @@ async fn out_of_order_appends_fail() {
 
 // Adapted from storage_e2e_test.cc: test_segment_rolling and
 // check_max_segment_size.
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn rolls_on_size() {
     let mut env = Env::new().await;
     let config = small();
@@ -103,7 +103,7 @@ async fn rolls_on_size() {
 
 // Adapted from storage_e2e_test.cc: test_rolling_term and
 // test_append_batches_from_multiple_terms.
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn rolls_on_term_and_answers_term_at() {
     let mut env = Env::new().await;
     let log = env.open(LogConfig::default()).await;
@@ -148,7 +148,7 @@ async fn rolls_on_term_and_answers_term_at() {
     assert_eq!((0..11).map(|i| log.term_at(i)).collect::<Vec<_>>(), expect);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn first_append_after_open_starts_a_segment() {
     let mut env = Env::new().await;
     let log = env.open(LogConfig::default()).await;
@@ -160,7 +160,7 @@ async fn first_append_after_open_starts_a_segment() {
     assert_eq!(read_all(&log).await, recs(0..8, 1));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn read_limits_bytes_but_returns_at_least_one() {
     let env = Env::new().await;
     for config in [LogConfig::default(), small()] {
@@ -178,7 +178,7 @@ async fn read_limits_bytes_but_returns_at_least_one() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn large_records_span_chunks_and_reads() {
     let mut env = Env::new().await;
     let log = env.open(small()).await;
@@ -201,7 +201,7 @@ async fn large_records_span_chunks_and_reads() {
 }
 
 // Adapted from storage_e2e_test.cc: test_reading_range_from_a_log_with_write_caching.
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn appends_are_readable_before_they_are_written() {
     let env = Env::new().await;
     for cache_bytes in [0, 1 << 20] {
@@ -227,7 +227,7 @@ async fn appends_are_readable_before_they_are_written() {
 
 // Adapted from segment_appender_test.cc: TestFlushesAreMerged and
 // TestConcurrentFlushes.
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn concurrent_flushes_share_one_sync() {
     let env = Env::new().await;
     let log = env.open(LogConfig::default()).await;
@@ -244,7 +244,7 @@ async fn concurrent_flushes_share_one_sync() {
     assert_eq!(env.disk.stats().fsyncs - before, 1);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn flush_after_a_sync_starts_waits_for_another() {
     let env = Env::new().await;
     let log = env.open(LogConfig::default()).await;
@@ -265,7 +265,7 @@ async fn flush_after_a_sync_starts_waits_for_another() {
     assert_eq!(log.offsets().flushed, 20);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn flushed_watch_follows_flushes() {
     let env = Env::new().await;
     let log = env.open(LogConfig::default()).await;
@@ -281,7 +281,7 @@ async fn flushed_watch_follows_flushes() {
 }
 
 // Adapted from segment_appender_test.cc's inactive-timer behaviour.
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn idle_buffers_are_written_without_syncing() {
     let env = Env::new().await;
     let config = LogConfig {
@@ -300,7 +300,7 @@ async fn idle_buffers_are_written_without_syncing() {
     assert!(env.disk.stats().writes > before.writes);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn full_chunks_are_written_without_flushing() {
     let env = Env::new().await;
     let log = env.open(small()).await;
@@ -314,7 +314,7 @@ async fn full_chunks_are_written_without_flushing() {
 }
 
 // Adapted from log_segment_appender_test.cc: test_fallocate_size.
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn segments_are_preallocated_and_trimmed_on_close() {
     let env = Env::new().await;
     let config = LogConfig {
@@ -330,7 +330,7 @@ async fn segments_are_preallocated_and_trimmed_on_close() {
     assert_eq!(file_len(&path), 10 * REC_LEN);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn closed_log_rejects_operations() {
     let env = Env::new().await;
     let log = env.open(LogConfig::default()).await;
@@ -345,7 +345,7 @@ async fn closed_log_rejects_operations() {
 // Adapted from index_state_test.cc (SerdeBasic, SerdeCrc): the index is
 // written with a checksum when a segment closes, reloaded on open, and
 // rebuilt when it's damaged or stale.
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn index_files_are_written_and_reloaded() {
     let mut env = Env::new().await;
     let config = LogConfig {
@@ -383,7 +383,7 @@ async fn index_files_are_written_and_reloaded() {
 }
 
 // Adapted from storage_e2e_test.cc: the clean_segment_key handling.
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn clean_close_skips_rescanning_the_last_segment() {
     let mut env = Env::new().await;
     let log = env.open(small()).await;
@@ -418,7 +418,7 @@ async fn clean_close_skips_rescanning_the_last_segment() {
     assert_eq!(read_all(&log).await, recs(0..29, 1));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn crash_without_close_rescans() {
     let mut env = Env::new().await;
     let log = env.open(small()).await;
@@ -431,7 +431,7 @@ async fn crash_without_close_rescans() {
     assert_eq!(read_all(&log).await, recs(0..30, 1));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn per_core_storage_bundle() {
     let tmp = tempfile::tempdir().unwrap();
     let storage = shep_storage::Storage::open(tmp.path(), Default::default())

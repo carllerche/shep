@@ -9,7 +9,7 @@ publish.workspace = true
 [dependencies]
 futures.workspace = true
 shep-codec.workspace = true
-shep-rpc.workspace = true
+shep-rpc-client.workspace = true
 shep-wal-api.workspace = true
 shep-wal-controller.workspace = true
 thiserror.workspace = true

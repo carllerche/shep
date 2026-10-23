@@ -56,7 +56,7 @@ fn len(p: &Path) -> u64 {
 }
 
 // Adapted from kvstore_test.cc: kvstore_empty.
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn empty() {
     let env = Env::new();
     let kv = env.open(KvConfig::default()).await;
@@ -70,7 +70,7 @@ async fn empty() {
 }
 
 // Adapted from kvstore_test.cc: kvstore.
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn put_get_delete_and_reopen() {
     let env = Env::new();
     let kv = env.open(immediate()).await;
@@ -100,7 +100,7 @@ async fn put_get_delete_and_reopen() {
 }
 
 // Adapted from kvstore_test.cc: key_space.
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn key_spaces_are_separate() {
     let env = Env::new();
     let kv = env.open(immediate()).await;
@@ -129,7 +129,7 @@ async fn key_spaces_are_separate() {
     assert!(kv.scan(KeySpace(101)).is_empty());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn writes_are_visible_only_once_durable() {
     let env = Env::new();
     let kv = env
@@ -145,7 +145,7 @@ async fn writes_are_visible_only_once_durable() {
     assert_eq!(kv.get(KeySpace::TESTING, b"k"), Some(b("v")));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn group_commit_batches_a_window_into_one_sync() {
     let env = Env::new();
     let kv = env
@@ -167,7 +167,7 @@ async fn group_commit_batches_a_window_into_one_sync() {
     assert_eq!(kv.scan(KeySpace::TESTING).len(), 100);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn commits_while_one_is_in_flight_share_the_next() {
     let env = Env::new();
     let kv = env.open(immediate()).await;
@@ -181,7 +181,7 @@ async fn commits_while_one_is_in_flight_share_the_next() {
     assert_eq!(kv.stats().batches, 2);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn dropped_waiters_still_commit() {
     let env = Env::new();
     let kv = env.open(immediate()).await;
@@ -198,7 +198,7 @@ async fn dropped_waiters_still_commit() {
     assert_eq!(kv.get(KeySpace::TESTING, b"b"), Some(b("2")));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn snapshot_rollover_resets_the_log() {
     let env = Env::new();
     let config = KvConfig {
@@ -231,7 +231,7 @@ async fn snapshot_rollover_resets_the_log() {
     assert_eq!(kv.get(KeySpace::TESTING, b"k6"), Some(b("v191")));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn replay_skips_batches_the_snapshot_covers() {
     // A crash between writing the snapshot and emptying the log.
     let env = Env::new();
@@ -266,7 +266,7 @@ async fn replay_skips_batches_the_snapshot_covers() {
 
 // Adapted from kvstore_test.cc: persist_pre_start_survives_crash_before_start
 // (a torn final batch was never acknowledged, so it is dropped).
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn torn_last_batch_is_dropped() {
     for tear in [5u64, 40] {
         let env = Env::new();
@@ -293,7 +293,7 @@ async fn torn_last_batch_is_dropped() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn corrupt_snapshot_is_an_error() {
     let env = Env::new();
     let config = KvConfig {

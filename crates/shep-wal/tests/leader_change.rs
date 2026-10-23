@@ -11,7 +11,7 @@ use support::*;
 
 /// A write committed under one leader conflicts, under the next, with a
 /// proposal that didn't see it.
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "local")]
 async fn the_new_leader_checks_the_old_leaders_writes() {
     let mut cluster = Cluster::start(3, &[P1]).await;
     let c = cluster.client.clone();
@@ -44,7 +44,7 @@ async fn the_new_leader_checks_the_old_leaders_writes() {
 /// A node that leads again in a later term rebuilds its table: the entries a
 /// leader in between committed are in it, though this node never validated
 /// them (`WalValidate_norebuild`).
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "local")]
 async fn a_returning_leader_rebuilds_its_table() {
     // Node 0 times out first, so it wins any election it can. The elections
     // are slow, so the window is long, or `s0` would be too old.
@@ -92,7 +92,7 @@ async fn a_returning_leader_rebuilds_its_table() {
 
 /// Proposals in flight across a leader change all commit exactly once, with
 /// no conflicts among disjoint keys.
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "local")]
 async fn proposals_survive_a_leader_change() {
     let mut cluster = Cluster::start(3, &[P1]).await;
     let s0 = at(
@@ -113,7 +113,7 @@ async fn proposals_survive_a_leader_change() {
         .cloned()
         .map(|p| {
             let client = cluster.client.clone();
-            tokio::spawn(async move {
+            tokio::task::spawn_local(async move {
                 tokio::time::sleep(Duration::from_millis(rand::random_range(0..400))).await;
                 retry_at_newer_versions(&client, p).await
             })
@@ -147,7 +147,7 @@ async fn proposals_survive_a_leader_change() {
 /// commit them; the majority elects a new leader. Once the partition heals,
 /// the old leader's appended entries are overwritten and nothing it appended
 /// alone is ever committed, while a re-sent proposal is decided once.
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "local")]
 async fn a_deposed_leader_commits_nothing() {
     let cluster = Cluster::start_with(3, &[P1], |c| {
         c.raft.proposals.commit_timeout = Duration::from_millis(500)

@@ -23,7 +23,7 @@ const COUNTERS: usize = 4;
 const WORKERS: usize = 6;
 const INCREMENTS: usize = 20;
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "local")]
 async fn chaos_keeps_the_log_serializable() {
     let mut cluster = Cluster::start_with(3, &[P1], |c| {
         c.raft.proposals.commit_timeout = Duration::from_millis(800)
@@ -36,7 +36,7 @@ async fn chaos_keeps_the_log_serializable() {
         .map(|_| {
             let client = cluster.client.clone();
             let regs = regs.clone();
-            tokio::spawn(async move {
+            tokio::task::spawn_local(async move {
                 let mut acked: Vec<(Bytes, Decided)> = Vec::new();
                 for _ in 0..INCREMENTS {
                     let key = unique_key();
@@ -84,7 +84,7 @@ async fn chaos_keeps_the_log_serializable() {
             (cluster, rounds)
         }
     };
-    let chaos = tokio::spawn(chaos);
+    let chaos = tokio::task::spawn_local(chaos);
 
     let mut acked = Vec::new();
     for w in workers {

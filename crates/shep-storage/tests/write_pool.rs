@@ -27,7 +27,7 @@ fn config() -> LogConfig {
 
 // Adapted from segment_appender_test.cc's chunk-cache exhaustion and
 // storage_resources.cc's write-buffer accounting.
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn appends_wait_for_pool_space() {
     let env = Env::with_pool(2048).await;
     let log = env.open(config()).await;
@@ -53,7 +53,7 @@ async fn appends_wait_for_pool_space() {
     assert_eq!(read_all(&log).await, recs(0..30, 1));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn logs_on_a_core_share_the_pool() {
     let env = Env::with_pool(2048).await;
     let a = env.open(config()).await;
@@ -85,7 +85,7 @@ async fn logs_on_a_core_share_the_pool() {
     assert_eq!(env.pool.available(), 2048);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn records_larger_than_the_pool_still_go_through() {
     let env = Env::with_pool(1024).await;
     let log = env.open(config()).await;

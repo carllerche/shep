@@ -55,7 +55,7 @@ fn parse(args: impl Iterator<Item = String>) -> Result<NodeConfig, String> {
     })
 }
 
-#[tokio::main(flavor = "current_thread")]
+#[tokio::main(flavor = "local")]
 async fn main() -> ExitCode {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(

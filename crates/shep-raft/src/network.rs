@@ -29,7 +29,7 @@ use shep_raft_engine::raft::{
     AppendEntriesRequest, SnapshotResponse, StreamAppendResult, TransferLeaderError,
     TransferLeaderRequest, TransferLeaderResponse, VoteRequest, VoteResponse,
 };
-use shep_rpc::{ConnectionCache, ReconnectConfig, RpcError};
+use shep_rpc_client::{ConnectionCache, ReconnectConfig, RpcError};
 use tokio::sync::oneshot;
 
 use crate::types::{
@@ -307,7 +307,7 @@ struct Pipeline<S> {
     input_done: bool,
     inflight: InFlight,
     stopped: bool,
-    transport: shep_rpc::Transport,
+    transport: shep_rpc_client::Transport,
     group: GroupId,
     session: u64,
     next_seq: u64,
