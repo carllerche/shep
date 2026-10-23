@@ -6,8 +6,9 @@
 //! [`timeout`], [`timeout_at`], and [`interval`] use the selected timer.
 //! Timers and their owner are `!Send`.
 //!
-//! This extraction preserves upstream's millisecond resolution, intrusive
-//! pinned entries, and lazy registration and reset. The reactor owns execution,
+//! This extraction preserves upstream's millisecond resolution and lazy
+//! registration and reset. The wheel owns entries in a safe indexed slab.
+//! The reactor owns execution,
 //! waiting, and timer advancement; this crate supplies the timer functions.
 //! See `FORK.md` for the exact source revision and adaptation details.
 //!
@@ -50,7 +51,7 @@
 // Copyright (c) 2021 ihciah, dyxushuai and other Monoio Contributors.
 // Portions Copyright (c) 2021 Tokio Contributors. Licensed under MIT.
 
-#![deny(unsafe_op_in_unsafe_fn, unused_unsafe)]
+#![forbid(unsafe_code)]
 // Retain the upstream wheel's formatting and control flow.
 #![allow(clippy::collapsible_if)]
 

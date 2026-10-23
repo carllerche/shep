@@ -4,11 +4,11 @@
 
 use crate::{
     error::InsertError,
-    timer::{TimerHandle, TimerShared},
+    timer::{Entry, EntryId},
 };
 
 mod level;
-use std::ptr::NonNull;
+use shep_util_slab::Slab;
 
 pub(crate) use self::level::Expiration;
 use self::level::Level;
@@ -16,9 +16,9 @@ use super::EntryList;
 
 /// Timing wheel implementation.
 ///
-/// Buckets contain non-owning handles to pinned timer entries. An entry is
-/// detached before its deadline or list membership changes, then transferred
-/// to a new bucket or the pending queue while the owner borrows the wheel.
+/// Buckets contain IDs into the owner's slab. A slot stays occupied until its
+/// Sleep is dropped, and is unlinked before reuse. No IDs leave a transition
+/// across user callbacks after their owner could be destroyed.
 #[derive(Debug)]
 pub(crate) struct Wheel {
     /// The number of milliseconds elapsed since the wheel started.
@@ -45,7 +45,7 @@ pub(crate) struct Wheel {
 /// precision of 1 millisecond.
 const NUM_LEVELS: usize = 6;
 
-/// The maximum duration of a `Sleep`
+/// One rotation of the hierarchy; longer deadlines wrap through the top level.
 pub(super) const MAX_DURATION: u64 = (1 << (6 * NUM_LEVELS)) - 1;
 
 impl Wheel {
@@ -73,89 +73,54 @@ impl Wheel {
         self.elapsed
     }
 
-    /// Insert an entry into the timing wheel.
-    ///
-    /// # Arguments
-    ///
-    /// * `item`: The item to insert into the wheel.
-    ///
-    /// # Return
-    ///
-    /// Returns `Ok` when the item is successfully inserted, `Err` otherwise.
-    ///
-    /// `Err(Elapsed)` indicates that `when` represents an instant that has
-    /// already passed. In this case, the caller should fire the timeout
-    /// immediately.
-    ///
-    /// `Err(Invalid)` indicates an invalid `when` argument as been supplied.
-    ///
-    /// # Safety
-    ///
-    /// This function registers item into an intrusive linked list. The caller
-    /// must ensure that `item` is pinned and will not be dropped without first
-    /// being deregistered.
-    pub(crate) unsafe fn insert(
+    /// Insert a live, detached entry from the owner's slab.
+    pub(crate) fn insert(
         &mut self,
-        item: TimerHandle,
-    ) -> Result<u64, (TimerHandle, InsertError)> {
-        // SAFETY: The caller supplies a live pinned entry detached from lists.
-        let when = unsafe { item.sync_when() };
-
+        entries: &mut Slab<Entry>,
+        key: EntryId,
+    ) -> Result<u64, (EntryId, InsertError)> {
+        let when = entries[key.index()].sync_when();
         if when <= self.elapsed {
-            return Err((item, InsertError::Elapsed));
+            return Err((key, InsertError::Elapsed));
         }
-
-        // Get the level at which the entry should be stored
         let level = self.level_for(when);
-
-        // SAFETY: The caller supplies a live pinned entry, still detached here.
-        unsafe {
-            self.levels[level].add_entry(item);
-        }
-
+        self.levels[level].add_entry(entries, key);
         debug_assert!({
             self.levels[level]
                 .next_expiration(self.elapsed)
                 .map(|e| e.deadline >= self.elapsed)
                 .unwrap_or(true)
         });
-
         Ok(when)
     }
 
-    /// Remove `item` from the timing wheel.
-    pub(crate) unsafe fn remove(&mut self, item: NonNull<TimerShared>) {
-        // SAFETY: The caller guarantees liveness and membership in this wheel.
-        // Cached deadlines change only after detaching from a bucket.
-        unsafe {
-            let when = item.as_ref().cached_when();
-            if when == u64::MAX {
-                self.pending.remove(item);
-            } else {
-                debug_assert!(
-                    self.elapsed <= when,
-                    "elapsed={}; when={}",
-                    self.elapsed,
-                    when
-                );
-
-                let level = self.level_for(when);
-
-                self.levels[level].remove_entry(item);
-            }
+    /// Remove a registered or pending entry without releasing its slab slot.
+    pub(crate) fn remove(&mut self, entries: &mut Slab<Entry>, key: EntryId) {
+        if entries[key.index()].is_pending() {
+            self.pending.remove(entries, key);
+        } else {
+            let when = entries[key.index()].cached_when();
+            debug_assert!(
+                self.elapsed <= when,
+                "elapsed={}; when={}",
+                self.elapsed,
+                when
+            );
+            let level = self.level_for(when);
+            self.levels[level].remove_entry(entries, key);
         }
     }
 
     /// Advances the timer up to the instant represented by `now`.
-    pub(crate) fn poll(&mut self, now: u64) -> Option<TimerHandle> {
+    pub(crate) fn poll(&mut self, entries: &mut Slab<Entry>, now: u64) -> Option<EntryId> {
         loop {
-            if let Some(handle) = self.pending.pop_back() {
+            if let Some(handle) = self.pending.pop_back(entries) {
                 return Some(handle);
             }
 
             match self.next_expiration() {
                 Some(ref expiration) if expiration.deadline <= now => {
-                    self.process_expiration(expiration);
+                    self.process_expiration(entries, expiration);
 
                     self.set_elapsed(expiration.deadline);
                 }
@@ -170,7 +135,7 @@ impl Wheel {
             }
         }
 
-        self.pending.pop_back()
+        self.pending.pop_back(entries)
     }
 
     /// Returns the instant at which the next timeout expires.
@@ -223,41 +188,23 @@ impl Wheel {
     /// time and the expiration time.  for each in that population either
     /// queue it for notification (in the case of the last level) or tier
     /// it down to the next level (in all other cases).
-    pub(crate) fn process_expiration(&mut self, expiration: &Expiration) {
-        // Note that we need to take _all_ of the entries off the list before
-        // processing any of them. This is important because it's possible that
-        // those entries might need to be reinserted into the same slot.
-        //
-        // This happens only on the highest level, when an entry is inserted
-        // more than MAX_DURATION into the future. When this happens, we wrap
-        // around, and process some entries a multiple of MAX_DURATION before
-        // they actually need to be dropped down a level. We then reinsert them
-        // back into the same position; we must make sure we don't then process
-        // those entries again or we'll end up in an infinite loop.
-        let mut entries = self.take_entries(expiration);
-
-        while let Some(item) = entries.pop_back() {
+    pub(crate) fn process_expiration(
+        &mut self,
+        entries: &mut Slab<Entry>,
+        expiration: &Expiration,
+    ) {
+        // Detach the whole bucket before reinsertion. At the top level a
+        // far-future entry can return to the same bucket on another rotation.
+        let mut bucket = self.take_entries(expiration);
+        while let Some(key) = bucket.pop_back(entries) {
             if expiration.level == 0 {
-                // SAFETY: The owner keeps this detached entry alive and pinned.
-                debug_assert_eq!(unsafe { item.cached_when() }, expiration.deadline);
+                debug_assert_eq!(entries[key.index()].cached_when(), expiration.deadline);
             }
-
-            // SAFETY: Taking the slot detached every entry. Their pinned owners
-            // remain alive; callbacks cannot run while the wheel is borrowed.
-            match unsafe { item.mark_pending(expiration.deadline) } {
-                Ok(()) => {
-                    // Item was expired
-                    // SAFETY: The entry was detached from the expired bucket.
-                    // Its pinned owner remains alive until it is unlinked.
-                    unsafe { self.pending.push_front(item) };
-                }
-                Err(expiration_tick) => {
-                    let level = level_for(expiration.deadline, expiration_tick);
-                    // SAFETY: The entry remains detached and pinned, and its
-                    // cached deadline now identifies this destination bucket.
-                    unsafe {
-                        self.levels[level].add_entry(item);
-                    }
+            match entries[key.index()].mark_pending(expiration.deadline) {
+                Ok(()) => self.pending.push_front(entries, key),
+                Err(tick) => {
+                    let level = level_for(expiration.deadline, tick);
+                    self.levels[level].add_entry(entries, key);
                 }
             }
         }

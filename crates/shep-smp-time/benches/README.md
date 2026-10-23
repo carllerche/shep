@@ -1,167 +1,138 @@
 # Timer performance comparisons
 
-The `timers` benchmark uses the public API, explicit time advancement, and
-Criterion 0.8. It performs no I/O or wall-clock sleeps. Criterion is a dev-only
-dependency, with plotting and parallel analysis disabled. The benchmark source
-forbids unsafe code. The initial baseline predates the outer-cell removal and
-timer-list specialization now applied in the workspace.
-The initial run's environment and representative measurements are recorded in
-[BASELINE.md](BASELINE.md).
+The timer now uses slab-owned entries and forbids unsafe code. The benchmark
+uses only public APIs, explicit advancement, and Criterion 0.8 with plotting
+and parallel analysis disabled. It performs no I/O or wall-clock sleeps.
+Historical measurements are in [BASELINE.md](BASELINE.md); the ownership
+migration's timing and heap measurements are in [ARENA.md](ARENA.md).
+Instruction, memory-reference, inlining, and page-fault attribution is in
+[ATTRIBUTION.md](ATTRIBUTION.md), with a fixed-work probe and gated perf runner.
+Applied optimizations and their measurements are in
+[OPPORTUNITIES.md](OPPORTUNITIES.md).
 
 ## Running
 
-The original `intrusive-b0a64f3` baseline and the applied cleanup's
-`specialized-entry-list` baseline are already captured on this VM. Preserve
-those names. From the workspace root, save a new baseline before the next
-implementation change:
+Save a fresh baseline before another implementation change:
 
 ```sh
 taskset -c 0 cargo bench -p shep-smp-time --bench timers -- \
-  --save-baseline before-arena --noplot
+  --save-baseline before-next-change --noplot
 ```
 
-After a change, compare with the saved baseline without replacing it:
+Then compare without replacing it:
 
 ```sh
 taskset -c 0 cargo bench -p shep-smp-time --bench timers -- \
-  --baseline before-arena --noplot
+  --baseline before-next-change --noplot
 ```
 
-The default is 50 samples, one second of warm-up and three seconds of
-measurement per case. There are 46 cases. Criterion writes estimates and raw
-samples under `target/criterion/`; retain that directory between builds. Named
-baselines and comparison options are described in the
-[Criterion guide](https://criterion-rs.github.io/book/user_guide/command_line_options.html#baselines).
-Use different names for each implementation you want to retain. Separate
-worktrees need the same Criterion output directory to share baselines; keep
-their compiled Cargo targets separate so stale binaries cannot enter a run.
-Set `CRITERION_HOME` to an absolute directory to share only results:
+There are 56 cases, with 50 samples, one second of warm-up, and three seconds
+target measurement per case. Results and samples live under `target/criterion`.
+Keep source, compiler, flags, CPU affinity, sample settings, and background load
+fixed. Affinity within this VM does not isolate the host CPU. Unchanged-binary
+repeats previously drifted substantially; confirm small differences on a stable
+machine or with additional instruction/cache evidence.
+
+Preserve named historical baselines: `intrusive-b0a64f3` predates the entry
+cleanup; `specialized-entry-list` captures the pointer-based implementation
+after that cleanup; `slab-owned-arena` captures the initial ownership change;
+`slab-owned-optimized` captures the subsequent three hot-path optimizations.
+The new rearm cases and selected hot paths also have a focused
+`before-arena-matched` baseline from an isolated copy of commit b5b9a22.
+
+To replay a comparison without new timing, filter to cases present in both:
 
 ```sh
-CRITERION_HOME=/home/exedev/shep/target/criterion \
-  taskset -c 0 cargo bench -p shep-smp-time --bench timers -- \
-  --baseline before-arena --noplot
+cargo bench -p shep-smp-time --bench timers -- \
+  '^(register|cancel|reset_extend|reset_shorten|churn|poll_pending|is_elapsed)/' \
+  --load-baseline slab-owned-arena --baseline specialized-entry-list --noplot
 ```
 
-Run the same source against itself first to establish noise. Keep the CPU,
-toolchain, optimization flags, benchmark source, sample settings, and background
-load the same. CPU affinity prevents migration within the VM; it does not
-isolate the host CPU. Confirm changes with repeated baseline/candidate runs,
-including reversing their order, before accepting small differences.
+[Criterion's guide](https://criterion-rs.github.io/book/user_guide/command_line_options.html#baselines)
+describes baseline options. Separate worktrees should keep compiled Cargo targets
+separate and set `CRITERION_HOME` to the same absolute results directory.
 
-Useful shorter runs:
+Useful shorter checks:
 
 ```sh
-# Execute fixtures and all cases once, including correctness checks; no statistics.
 cargo test -p shep-smp-time --bench timers
-
-# Filter cases and shorten sampling for exploration, not acceptance decisions.
 taskset -c 0 cargo bench -p shep-smp-time --bench timers -- \
   '^(churn|reset_extend|expire_spread)/1024$' --quick --noplot
 ```
 
-Criterion reports **time per batch** and **timers per second** for the scaled
-cases. Divide batch time by the count for average time per timer. Its confidence
-intervals describe throughput estimates, not individual timer p99 latency.
+Quick mode is exploratory. Reported time is per batch; divide by the count for
+average time per timer. Confidence intervals are not individual p99 latencies.
 
-## What each case measures
+## Timing boundaries
 
-Scaled cases run with 1, 1,024, and 32,768 live timers. Fixtures use pinned boxes
-so moving the harness's containers cannot move registered entries. The inline
-lifecycle case and executor tasks also exercise sleeps without a per-sleep Box.
+The common scaled cases use 1, 1,024, and 32,768 consumers. Pinned boxes keep
+the historical fixtures comparable; inline lifecycles and executor tasks also
+exercise sleeps without a per-sleep Box.
 
-| Cases | Measured work | Excluded work |
+| Cases | Measured | Excluded |
 |---|---|---|
-| `lifecycle/timer_create_drop` | Allocate, initialize, and drop a wheel | Clock read |
-| `lifecycle/lazy_inline` | Construct/drop an unpolled inline sleep | Wheel construction and entering the timer scope |
-| `lifecycle/register_cancel_inline` | Construct, pin on the stack, register, cancel | Wheel construction, timer scope entry; no per-sleep heap allocation |
-| `lifecycle/register_cancel_boxed` | The same lifecycle with a Box allocation/free | Wheel construction, timer scope entry |
-| `register/N` | First poll of previously unregistered sleeps | Sleep/Box/fixture construction and cleanup |
-| `cancel/N` | Drop registered sleeps in shuffled order, including Box frees | Registration, shuffle preparation, remaining fixture cleanup |
-| `reset_extend/N` | Extend deadlines lazily, leaving cached bucket membership | Fixture setup, later cascading, cleanup |
-| `reset_shorten/N` | Shorten deadlines, unlink, and insert in an earlier bucket | Fixture setup and cleanup |
-| `expire_dense/N` | Advance through one shared deadline | Registration, subsequent polling and freeing sleeps |
-| `expire_spread/N` | Advance through deadlines spread over 4,096 ticks | Same |
-| `expire_levels/N` | Advance through deadlines spanning all six levels at larger counts | Same |
-| `expire_extended/N` | Advance through old cached buckets and extended deadlines | Registration and initial lazy resets |
-| `expire_waker/N` | Spread expiration plus real Arc-backed wake/drop work | Waker construction, registration, sleep cleanup |
-| `churn/N` | Allocate/register/extend/cancel all sleeps; reuse wheel and Vec capacity | Wheel, Vec capacity and deadline preparation |
-| `next_wake/N` | Query a populated wheel; time is per query | Fixture setup/cleanup |
-| `poll_pending/N` | Repeated polling of registered, pending sleeps with the same waker | Fixture setup/cleanup |
-| `is_elapsed/N` | Read readiness of registered sleeps | Fixture setup/cleanup |
-| `executor_expire/N` | Expire timers, deliver task wakes, run tasks to completion, release finished futures | Task spawning and first pending poll |
+| `lifecycle/timer_create_drop` | Allocate/initialize/drop a wheel and its default slot reservation | Clock read |
+| `lifecycle/lazy_inline` | Construct/drop an unpolled inline sleep | Wheel and scope setup |
+| `lifecycle/register_cancel_inline` | Stack-pin, register, cancel | Wheel and scope setup; no per-sleep heap allocation |
+| `lifecycle/register_cancel_boxed` | Same lifecycle with Box allocation/free | Wheel and scope setup |
+| `register/N` | First pending poll, including arena growth if needed | Sleep/Box/fixture setup and cleanup |
+| `cancel/N` | Shuffled cancellation, including Box frees | Registration, shuffle, remaining cleanup |
+| `reset_extend/N` | Lazy extension | Setup, later cascading, cleanup |
+| `reset_shorten/N` | Unlink and reinsert an earlier deadline | Setup/cleanup |
+| `expire_dense/N` | Advance through one shared deadline | Registration, subsequent polls, Box frees |
+| `expire_spread/N` | Advance through deadlines over 4,096 ticks | Same |
+| `expire_levels/N` | Advance through all levels at larger counts | Same |
+| `expire_extended/N` | Visit cached buckets and extended deadlines | Registration and initial resets |
+| `expire_waker/N` | Spread expiration plus Arc-backed wake/drop | Waker construction, registration, cleanup |
+| `churn/N` | Box allocation, registration, extension, cancellation | Reused wheel and Vec capacity; prepared deadlines |
+| `next_wake/N` | One query of a populated wheel | Setup/cleanup |
+| `poll_pending/N` | Repeated pending polls with the same waker | Setup/cleanup |
+| `is_elapsed/N` | Read readiness | Setup/cleanup |
+| `executor_expire/N` | Expire, deliver task wakes, finish/drop tasks | Spawning and first pending poll |
+| `rearm_elapsed/N` | Reset already elapsed/observed sleeps to future deadlines | Registration, initial expiration/observation, cleanup |
+| `arena_registration/C/N` | First registration at or above reserved capacity | C-slot reservation, Sleep/Box construction, cleanup |
 
-The main wheel-only cases use a noop waker. `expire_waker` includes an atomic
-counter and Arc lifetime work; it is a separate measurement rather than an
-estimate of every executor's wake cost. `executor_expire` uses `shep-smp-exec`'s
-actual task wakers and wake queue. This is still component integration, without
-an io_uring reactor or OS scheduling-delay measurement.
+Reservation cases use capacities 0, 256, 1,024, and 4,096, filling the reservation
+and crossing it by one (zero has one registration case). The other cases use
+the default reservation. Cold registration and steady churn must both be
+considered: the latter reuses arena slots after warm-up.
 
-Operation fixtures create a fresh wheel. A future arena implementation's first
-registration can include capacity growth in `register`; `churn` also exercises
-steady-state slot reuse after warm-up. Use both before judging an arena's cost.
+Wheel-only cases use a noop waker. The Arc counter case measures real wake
+lifetime work separately; executor cases use shep-smp-exec's actual wakers and
+queue. This is component integration without reactor I/O or OS wake latency.
+Preflight assertions and benchmark smoke runs check fixture behavior.
 
-## Memory and correctness
+## Retained heap snapshots
 
-The harness prints `size_of::<Sleep>()` and `size_of::<Timer>()`. At the current
-baseline these are 120 and 24 bytes on x86_64. These are inline sizes, **not**
-total allocated memory. An arena may shrink Sleep while retaining peak arena
-capacity, so neither a smaller future nor quicker cancellation is sufficient
-evidence of lower memory use. Before accepting that design, profile allocation
-counts/bytes and retained capacity through grow/shrink/reuse workloads as well.
-The Criterion process also allocates fixtures and samples, so process-wide peak
-RSS is not an isolated timer memory measurement.
+The source-safe example `arena_memory` prepares an empty, live, expired, or
+freed-consumer phase. It deliberately forgets the selected owners so DHAT's
+end-of-process live heap represents that phase instead of normal teardown.
+The leak is confined to this one-shot profiling fixture.
 
-Validate changes with the existing timer integration tests and Miri in addition
-to these measurements. The benchmark's preflight checks verify registration,
-reset, cancellation, completion, exact wake counts, and executor drain outside
-the timed sections; each case is also exercised by `cargo test --bench timers`.
+```sh
+cargo build -p shep-smp-time --release --example arena_memory
+valgrind --tool=dhat --dhat-out-file=/tmp/timer-live.json \
+  target/release/examples/arena_memory live 32768 1024
+valgrind --tool=dhat --dhat-out-file=/tmp/timer-freed.json \
+  target/release/examples/arena_memory freed 32768 1024
+```
 
-## Implemented changes and remaining candidates
+Arguments are phase, consumer count, and initial capacity. The fixture uses
+boxed sleeps plus a Vec of owners; it is not an estimate of every executor's
+task layout. Sum DHAT point fields `eb` and `ebk` for retained requested bytes
+and allocation blocks. Figures include common process bookkeeping, not RSS,
+allocator rounding, or transient growth peaks. The before/after run used the
+same example against the old source, substituting its capacity-less constructor.
 
-1. **Remove the outer entry `UnsafeCell` after an aliasing review.** All actual
-   mutations now use the inner `Cell`/`RefCell` fields. An isolated probe changed
-   `UnsafeCell<TimerShared>` to `TimerShared` and returned `&self.inner` directly;
-   all 42 unit/integration tests passed under Miri. This removes one unsafe
-   dereference without changing allocation strategy or layout. Miri passing is
-   evidence for the change, not an exhaustive proof of the pointer invariants.
-   This change is now applied; the shared-state access remains shared and all
-   mutations stay inside `Cell`/`RefCell`.
-2. **Specialize the intrusive list for timer entries.** Remove the generic
-   unsafe `Link` trait and raw pointer-to-link conversion hooks. Keep direct
-   next/previous pointers and existing allocation behavior. This reduces the
-   unsafe abstraction surface, but retains lifetime and membership obligations.
-   Monomorphization already removes generic dispatch, so expect little timing
-   change; verify code size and throughput rather than claiming a speedup.
-   This change is now applied as the private `timer/entry/list.rs` module, with
-   explicit unsafe insertion/removal contracts and the upstream tests adapted
-   to concrete timer entries.
-3. **Own entries in a safe indexed arena.** Keep the wheel's six-level structure
-   and constant-time doubly linked removal, using indices for buckets, pending
-   entries, and links. Sleep keeps its owning handle and an entry key. This can
-   remove the timer's raw pointers and dependence on the future's address.
-   Compare bounds-checked lookups, slot reuse/growth, generation checks if keys
-   can outlive a slot, cache locality, future size, and retained capacity.
-   Extract wakers before releasing entries and invoke/drop them after releasing
-   the arena borrow, preserving callback reentrancy.
-4. **Use vectors of arena keys per bucket.** Store each entry's bucket and
-   position, then `swap_remove` and update the moved entry to retain constant-time
-   cancellation. This may improve cascade locality, but adds bucket capacities,
-   growth allocations, and position bookkeeping. Compare it against indexed
-   links separately so the cost of arena ownership is distinguishable.
-5. **Use separately allocated Rc-owned entries.** Owning handles can make
-   liveness safe without pinning the future, but ownership alone does not make
-   raw intrusive links safe. Fully safe containers still require indices or
-   ownership-bearing links, with cycle avoidance. Extra allocations, reference
-   counts, and cache misses make this a less attractive first experiment.
+`size_of::<Sleep>()` is now 48 bytes, while each reserved slot uses 56 bytes on
+this x86_64 build. The full arena can reduce total live bytes, but reservations
+and the high-water capacity remain allocated after consumers disappear. See
+[the measured table](ARENA.md) before interpreting future size as total savings.
 
-An explicit entry-state enum can also remove sentinel-value and result-state
-invariants. It does not independently eliminate raw-pointer unsafe code; check
-its layout and reset/expiration performance before changing the packed state.
-The outer-cell probe also needs an ownership/aliasing argument: mutable pin
-projections still interact with aliases held by the wheel. Removing that wrapper
-does not resolve the wheel's non-owning pointers or cancellation obligations.
+## Correctness
 
-The outer-cell cleanup and list specialization are applied. The indexed arena
-remains a proposal; [ARENA.md](../ARENA.md) describes the ownership, slot lifetime,
-reentrancy, and performance decisions to discuss before prototyping it.
+Run the integration tests, docs, and Miri in addition to timing. The library,
+benchmarks, and profiling example forbid unsafe code. The integration test for
+custom waker Clone reentrancy contains one documented raw-waker construction;
+the runtime does not. Production-sized reservation boundaries run natively,
+with smaller equivalent transitions under Miri to bound slice-retagging costs.

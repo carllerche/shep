@@ -11,6 +11,7 @@ workspace = true
 
 [dependencies]
 pin-project-lite.workspace = true
+shep-util-slab.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true

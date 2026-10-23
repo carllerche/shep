@@ -5,7 +5,7 @@
 //! Reactor-owned timer wheel
 
 mod entry;
-use self::entry::{EntryList, TimerEntry, TimerHandle, TimerShared};
+use self::entry::{Entry, EntryId, EntryList, TimerEntry};
 
 mod handle;
 pub(crate) use self::handle::Handle;
@@ -14,7 +14,9 @@ mod wheel;
 
 pub mod sleep;
 
-use std::{cell::RefCell, fmt, ptr::NonNull, rc::Rc};
+use std::{cell::RefCell, fmt, rc::Rc};
+
+use shep_util_slab::Slab;
 
 use crate::{Duration, Instant};
 
@@ -101,20 +103,37 @@ struct Inner {
 
 struct InnerState {
     wheel: wheel::Wheel,
+    entries: Slab<Entry>,
 }
 
 impl Timer {
-    /// Create an empty wheel with `now` as its epoch. The reactor supplies the
-    /// same monotonic clock for subsequent calls to [`advance`](Self::advance).
+    /// Create an empty wheel with `now` as its epoch, reserving 1,024 entry
+    /// slots. The reactor supplies the same monotonic clock for subsequent
+    /// calls to [`advance`](Self::advance).
     pub fn new(now: Instant) -> Self {
+        Self::with_capacity(now, 1024)
+    }
+
+    /// Create a wheel reserving space for at least `capacity` entries.
+    /// Sleeps occupy slots on first poll/reset and retain them until Drop,
+    /// including after expiration. This is a reservation, not a limit; the
+    /// arena grows as needed and retains its capacity for reuse.
+    pub fn with_capacity(now: Instant, capacity: usize) -> Self {
         let inner = Inner {
             state: RefCell::new(InnerState {
                 wheel: wheel::Wheel::new(),
+                entries: Slab::with_capacity(capacity),
             }),
         };
         Self {
             handle: Handle::new(Rc::new(inner), ClockTime { start_time: now }),
         }
+    }
+
+    /// The number of entry slots available without growing the arena.
+    /// This includes occupied slots retained by elapsed sleeps.
+    pub fn capacity(&self) -> usize {
+        self.handle.get().state.borrow().entries.capacity()
     }
 
     /// Select this timer for a closure, restoring the previous selection on
@@ -132,12 +151,13 @@ impl Timer {
             let waker = {
                 let mut state = self.handle.get().state.borrow_mut();
                 let now = now.max(state.wheel.elapsed());
-                let Some(entry) = state.wheel.poll(now) else {
+                let InnerState { wheel, entries } = &mut *state;
+                let Some(key) = wheel.poll(entries, now) else {
                     break;
                 };
-                // The entry is unlinked before it is fired, and only the
-                // owning thread accesses the timer's intrusive lists.
-                unsafe { entry.fire(Ok(())) }
+                // Finish the transition and consume the key before callbacks
+                // can cancel an owner and reuse its slot.
+                entries[key.index()].fire()
             };
             // A wake can reset or drop another timer. Release the wheel borrow
             // before invoking arbitrary user wakeup code.
@@ -159,68 +179,6 @@ impl Timer {
             .wheel
             .next_expiration_time()
             .map(|tick| self.handle.time_source().tick_to_instant(tick))
-    }
-}
-
-impl Handle {
-    /// Unlink an entry and mark it cancelled without waking its task.
-    ///
-    /// The timer will be moved to the cancelled state. Wakers will _not_ be
-    /// invoked. If the timer is already completed, this function is a no-op.
-    ///
-    /// # Safety
-    ///
-    /// `entry` must point to a live, immovable entry belonging to this timer.
-    /// It must remain valid until cancellation returns. All list mutations
-    /// happen on this thread while the wheel is mutably borrowed.
-    pub(self) unsafe fn clear_entry(&self, entry: NonNull<TimerShared>) {
-        // SAFETY: The caller keeps the entry alive and immovable. Removal uses
-        // its cached membership before fire marks it unregistered.
-        let waker = unsafe {
-            let mut state = self.get().state.borrow_mut();
-            if entry.as_ref().might_be_registered() {
-                state.wheel.remove(entry);
-            }
-            entry.as_ref().handle().fire(Ok(()))
-        };
-        // A waker's destructor can drop another sleep. Release the wheel
-        // borrow before dropping it so that sleep can unlink its own entry.
-        drop(waker);
-    }
-
-    /// Remove and re-add an entry at its new deadline.
-    ///
-    /// # Safety
-    ///
-    /// `entry` must be live and pinned, and either unregistered or registered
-    /// with this timer. Its owner must keep it pinned until cancellation.
-    pub(self) unsafe fn reregister(&self, new_tick: u64, entry: NonNull<TimerShared>) {
-        // SAFETY: The caller keeps the entry alive and pinned. The wheel is
-        // borrowed for the entire remove/update/insert transition.
-        let waker = unsafe {
-            let mut state = self.get().state.borrow_mut();
-
-            if entry.as_ref().might_be_registered() {
-                state.wheel.remove(entry);
-            }
-
-            // The entry is detached; its handle can now update membership.
-            let entry = entry.as_ref().handle();
-
-            entry.set_expiration(new_tick);
-
-            match state.wheel.insert(entry) {
-                Ok(_) => None,
-                Err((entry, super::error::InsertError::Elapsed)) => entry.fire(Ok(())),
-            }
-        };
-
-        // The timer was fired synchronously as a result of the reregistration.
-        // Wake the waker; this is needed because we might reset _after_ a poll,
-        // and otherwise the task won't be awoken to poll again.
-        if let Some(waker) = waker {
-            waker.wake();
-        }
     }
 }
 

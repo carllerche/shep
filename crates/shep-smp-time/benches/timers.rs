@@ -284,6 +284,66 @@ fn pending(c: &mut Criterion) {
     }
 }
 
+fn rearm(c: &mut Criterion) {
+    let mut group = c.benchmark_group("rearm_elapsed");
+    for count in COUNTS {
+        group.throughput(Throughput::Elements(count as u64));
+        group.bench_with_input(BenchmarkId::from_parameter(count), &count, |b, &count| {
+            b.iter_batched_ref(
+                || {
+                    let mut timers =
+                        Timers::registered(count, Deadlines::Spread, Waker::noop().clone());
+                    timers.expire();
+                    timers.register(); // Observe completion, like an interval's tick.
+                    for (index, target) in timers.targets.iter_mut().enumerate() {
+                        *target = timers.finish + Duration::from_millis(1 + index as u64 % 64);
+                    }
+                    timers
+                },
+                Timers::reset,
+                BatchSize::LargeInput,
+            );
+        });
+    }
+    group.finish();
+}
+
+fn capacity_cases(c: &mut Criterion) {
+    let mut group = c.benchmark_group("arena_registration");
+    for capacity in [0, 256, 1024, 4096] {
+        let counts = if capacity == 0 {
+            vec![1]
+        } else {
+            vec![capacity, capacity + 1]
+        };
+        for count in counts {
+            group.throughput(Throughput::Elements(count as u64));
+            group.bench_function(BenchmarkId::new(capacity.to_string(), count), |b| {
+                b.iter_batched_ref(
+                    || {
+                        let epoch = Instant::now();
+                        let timer = Timer::with_capacity(epoch, capacity);
+                        let sleeps: Vec<_> = timer.with(|| {
+                            (0..count)
+                                .map(|_| Box::pin(sleep_until(epoch + Duration::from_millis(1))))
+                                .collect()
+                        });
+                        (timer, sleeps)
+                    },
+                    |(_, sleeps)| {
+                        let mut cx = Context::from_waker(Waker::noop());
+                        for sleep in sleeps {
+                            let _ = black_box(sleep.as_mut().poll(&mut cx));
+                        }
+                    },
+                    BatchSize::LargeInput,
+                );
+            });
+        }
+    }
+    group.finish();
+}
+
 struct Tasks {
     timer: Timer,
     executor: Executor,
@@ -378,5 +438,7 @@ fn main() {
     next_wake(&mut c);
     pending(&mut c);
     executor(&mut c);
+    rearm(&mut c);
+    capacity_cases(&mut c);
     c.final_summary();
 }

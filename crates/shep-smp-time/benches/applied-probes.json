@@ -1,0 +1,512 @@
+[
+  {
+    "version": "before",
+    "mode": "readiness",
+    "count": 1024,
+    "rounds": 32768,
+    "capacity": 1024,
+    "trial": 0,
+    "per_operation": {
+      "cycles:u": 9.388723462820053,
+      "instructions:u": 36.007863223552704,
+      "branches:u": 9.002945274114609,
+      "branch-misses:u": 0.0009982585906982422,
+      "page-faults:u": 0.0
+    },
+    "summary": "mode=readiness count=1024 rounds=32768 capacity=1024 ns_per_op=3.2182",
+    "raw_csv": "# started on Fri Oct 23 23:51:34 2026\n\n315033283;;cycles:u;127064773;100.00;;\n1208223398;;instructions:u;127064773;100.00;3.84;insn per cycle\n302088715;;branches:u;127064773;100.00;;\n33496;;branch-misses:u;127064773;100.00;0.01;of all branches\n0;;page-faults:u;127064773;100.00;;\n"
+  },
+  {
+    "version": "after",
+    "mode": "readiness",
+    "count": 1024,
+    "rounds": 32768,
+    "capacity": 1024,
+    "trial": 0,
+    "per_operation": {
+      "cycles:u": 6.774562507867813,
+      "instructions:u": 31.007860481739044,
+      "branches:u": 7.002942621707916,
+      "branch-misses:u": 0.000987321138381958,
+      "page-faults:u": 0.0
+    },
+    "summary": "mode=readiness count=1024 rounds=32768 capacity=1024 ns_per_op=1.9245",
+    "raw_csv": "# started on Fri Oct 23 23:51:34 2026\n\n227316597;;cycles:u;63296782;100.00;;\n1040451146;;instructions:u;63296782;100.00;4.58;insn per cycle\n234979762;;branches:u;63296782;100.00;;\n33129;;branch-misses:u;63296782;100.00;0.01;of all branches\n0;;page-faults:u;63296782;100.00;;\n"
+  },
+  {
+    "version": "before",
+    "mode": "pending",
+    "count": 1024,
+    "rounds": 16384,
+    "capacity": 1024,
+    "trial": 0,
+    "per_operation": {
+      "cycles:u": 11.970712780952454,
+      "instructions:u": 50.01278954744339,
+      "branches:u": 9.002953946590424,
+      "branch-misses:u": 0.0010055899620056152,
+      "page-faults:u": 0.0
+    },
+    "summary": "mode=pending count=1024 rounds=16384 capacity=1024 ns_per_op=3.4099",
+    "raw_csv": "# started on Fri Oct 23 23:51:34 2026\n\n200835234;;cycles:u;56673691;100.00;;\n839075373;;instructions:u;56673691;100.00;4.18;insn per cycle\n151044503;;branches:u;56673691;100.00;;\n16871;;branch-misses:u;56673691;100.00;0.01;of all branches\n0;;page-faults:u;56673691;100.00;;\n"
+  },
+  {
+    "version": "after",
+    "mode": "pending",
+    "count": 1024,
+    "rounds": 16384,
+    "capacity": 1024,
+    "trial": 0,
+    "per_operation": {
+      "cycles:u": 8.783074617385864,
+      "instructions:u": 39.01278734207153,
+      "branches:u": 9.002951323986053,
+      "branch-misses:u": 0.0009887218475341797,
+      "page-faults:u": 0.0
+    },
+    "summary": "mode=pending count=1024 rounds=16384 capacity=1024 ns_per_op=2.3628",
+    "raw_csv": "# started on Fri Oct 23 23:51:34 2026\n\n147355540;;cycles:u;39728571;100.00;;\n654525960;;instructions:u;39728571;100.00;4.44;insn per cycle\n151044459;;branches:u;39728571;100.00;;\n16588;;branch-misses:u;39728571;100.00;0.01;of all branches\n0;;page-faults:u;39728571;100.00;;\n"
+  },
+  {
+    "version": "before",
+    "mode": "register_reused",
+    "count": 32768,
+    "rounds": 32,
+    "capacity": 1024,
+    "trial": 0,
+    "per_operation": {
+      "cycles:u": 69.9586296081543,
+      "instructions:u": 301.9738531112671,
+      "branches:u": 50.9936408996582,
+      "branch-misses:u": 0.003368377685546875,
+      "page-faults:u": 0.0
+    },
+    "summary": "mode=register_reused count=32768 rounds=32 capacity=1024 ns_per_op=19.0620",
+    "raw_csv": "# started on Fri Oct 23 23:51:34 2026\n\n73356940;;cycles:u;20082804;100.00;;\n316642535;;instructions:u;20082804;100.00;4.32;insn per cycle\n53470708;;branches:u;20082804;100.00;;\n3532;;branch-misses:u;20082804;100.00;0.01;of all branches\n0;;page-faults:u;20082804;100.00;;\n"
+  },
+  {
+    "version": "after",
+    "mode": "register_reused",
+    "count": 32768,
+    "rounds": 32,
+    "capacity": 1024,
+    "trial": 0,
+    "per_operation": {
+      "cycles:u": 66.1587905883789,
+      "instructions:u": 280.9750728607178,
+      "branches:u": 45.99400043487549,
+      "branch-misses:u": 0.004169464111328125,
+      "page-faults:u": 0.0
+    },
+    "summary": "mode=register_reused count=32768 rounds=32 capacity=1024 ns_per_op=18.4853",
+    "raw_csv": "# started on Fri Oct 23 23:51:34 2026\n\n69372520;;cycles:u;19437006;100.00;;\n294623718;;instructions:u;19437006;100.00;4.25;insn per cycle\n48228205;;branches:u;19437006;100.00;;\n4372;;branch-misses:u;19437006;100.00;0.01;of all branches\n0;;page-faults:u;19437006;100.00;;\n"
+  },
+  {
+    "version": "after",
+    "mode": "readiness",
+    "count": 1024,
+    "rounds": 32768,
+    "capacity": 1024,
+    "trial": 1,
+    "per_operation": {
+      "cycles:u": 6.762495011091232,
+      "instructions:u": 31.007860749959946,
+      "branches:u": 7.002942889928818,
+      "branch-misses:u": 0.0009866654872894287,
+      "page-faults:u": 0.0
+    },
+    "summary": "mode=readiness count=1024 rounds=32768 capacity=1024 ns_per_op=1.8782",
+    "raw_csv": "# started on Fri Oct 23 23:51:34 2026\n\n226911679;;cycles:u;63107302;100.00;;\n1040451155;;instructions:u;63107302;100.00;4.59;insn per cycle\n234979771;;branches:u;63107302;100.00;;\n33107;;branch-misses:u;63107302;100.00;0.01;of all branches\n0;;page-faults:u;63107302;100.00;;\n"
+  },
+  {
+    "version": "before",
+    "mode": "readiness",
+    "count": 1024,
+    "rounds": 32768,
+    "capacity": 1024,
+    "trial": 1,
+    "per_operation": {
+      "cycles:u": 8.159396946430206,
+      "instructions:u": 36.00786119699478,
+      "branches:u": 9.002943396568298,
+      "branch-misses:u": 0.0009900033473968506,
+      "page-faults:u": 0.0
+    },
+    "summary": "mode=readiness count=1024 rounds=32768 capacity=1024 ns_per_op=2.2603",
+    "raw_csv": "# started on Fri Oct 23 23:51:34 2026\n\n273783930;;cycles:u;75893740;100.00;;\n1208223330;;instructions:u;75893740;100.00;4.41;insn per cycle\n302088652;;branches:u;75893740;100.00;;\n33219;;branch-misses:u;75893740;100.00;0.01;of all branches\n0;;page-faults:u;75893740;100.00;;\n"
+  },
+  {
+    "version": "after",
+    "mode": "pending",
+    "count": 1024,
+    "rounds": 16384,
+    "capacity": 1024,
+    "trial": 1,
+    "per_operation": {
+      "cycles:u": 8.785823941230774,
+      "instructions:u": 39.01279026269913,
+      "branches:u": 9.002954244613647,
+      "branch-misses:u": 0.0010016560554504395,
+      "page-faults:u": 0.0
+    },
+    "summary": "mode=pending count=1024 rounds=16384 capacity=1024 ns_per_op=2.4814",
+    "raw_csv": "# started on Fri Oct 23 23:51:35 2026\n\n147401666;;cycles:u;41669894;100.00;;\n654526009;;instructions:u;41669894;100.00;4.44;insn per cycle\n151044508;;branches:u;41669894;100.00;;\n16805;;branch-misses:u;41669894;100.00;0.01;of all branches\n0;;page-faults:u;41669894;100.00;;\n"
+  },
+  {
+    "version": "before",
+    "mode": "pending",
+    "count": 1024,
+    "rounds": 16384,
+    "capacity": 1024,
+    "trial": 1,
+    "per_operation": {
+      "cycles:u": 11.90425705909729,
+      "instructions:u": 50.01277381181717,
+      "branches:u": 9.002951741218567,
+      "branch-misses:u": 0.001015007495880127,
+      "page-faults:u": 0.0
+    },
+    "summary": "mode=pending count=1024 rounds=16384 capacity=1024 ns_per_op=3.4694",
+    "raw_csv": "# started on Fri Oct 23 23:51:35 2026\n\n199720292;;cycles:u;58115485;100.00;;\n839075109;;instructions:u;58115485;100.00;4.20;insn per cycle\n151044466;;branches:u;58115485;100.00;;\n17029;;branch-misses:u;58115485;100.00;0.01;of all branches\n0;;page-faults:u;58115485;100.00;;\n"
+  },
+  {
+    "version": "after",
+    "mode": "register_reused",
+    "count": 32768,
+    "rounds": 32,
+    "capacity": 1024,
+    "trial": 1,
+    "per_operation": {
+      "cycles:u": 65.78201961517334,
+      "instructions:u": 280.973858833313,
+      "branches:u": 45.99363994598389,
+      "branch-misses:u": 0.0040493011474609375,
+      "page-faults:u": 0.0
+    },
+    "summary": "mode=register_reused count=32768 rounds=32 capacity=1024 ns_per_op=17.9787",
+    "raw_csv": "# started on Fri Oct 23 23:51:35 2026\n\n68977447;;cycles:u;18943911;100.00;;\n294622445;;instructions:u;18943911;100.00;4.27;insn per cycle\n48227827;;branches:u;18943911;100.00;;\n4246;;branch-misses:u;18943911;100.00;0.01;of all branches\n0;;page-faults:u;18943911;100.00;;\n"
+  },
+  {
+    "version": "before",
+    "mode": "register_reused",
+    "count": 32768,
+    "rounds": 32,
+    "capacity": 1024,
+    "trial": 1,
+    "per_operation": {
+      "cycles:u": 70.54212284088135,
+      "instructions:u": 301.9738531112671,
+      "branches:u": 50.9936408996582,
+      "branch-misses:u": 0.00362396240234375,
+      "page-faults:u": 0.0
+    },
+    "summary": "mode=register_reused count=32768 rounds=32 capacity=1024 ns_per_op=19.2709",
+    "raw_csv": "# started on Fri Oct 23 23:51:35 2026\n\n73968777;;cycles:u;40663573;100.00;;\n316642535;;instructions:u;40663573;100.00;4.28;insn per cycle\n53470708;;branches:u;40663573;100.00;;\n3800;;branch-misses:u;40663573;100.00;0.01;of all branches\n0;;page-faults:u;40663573;100.00;;\n"
+  },
+  {
+    "version": "before",
+    "mode": "readiness",
+    "count": 1024,
+    "rounds": 32768,
+    "capacity": 1024,
+    "trial": 2,
+    "per_operation": {
+      "cycles:u": 8.130806654691696,
+      "instructions:u": 36.007860630750656,
+      "branches:u": 9.002942830324173,
+      "branch-misses:u": 0.0009896159172058105,
+      "page-faults:u": 0.0
+    },
+    "summary": "mode=readiness count=1024 rounds=32768 capacity=1024 ns_per_op=2.2691",
+    "raw_csv": "# started on Fri Oct 23 23:51:35 2026\n\n272824599;;cycles:u;76224886;100.00;;\n1208223311;;instructions:u;76224886;100.00;4.43;insn per cycle\n302088633;;branches:u;76224886;100.00;;\n33206;;branch-misses:u;76224886;100.00;0.01;of all branches\n0;;page-faults:u;76224886;100.00;;\n"
+  },
+  {
+    "version": "after",
+    "mode": "readiness",
+    "count": 1024,
+    "rounds": 32768,
+    "capacity": 1024,
+    "trial": 2,
+    "per_operation": {
+      "cycles:u": 6.764959156513214,
+      "instructions:u": 31.007860332727432,
+      "branches:u": 7.002942472696304,
+      "branch-misses:u": 0.0009861886501312256,
+      "page-faults:u": 0.0
+    },
+    "summary": "mode=readiness count=1024 rounds=32768 capacity=1024 ns_per_op=1.9216",
+    "raw_csv": "# started on Fri Oct 23 23:51:35 2026\n\n226994362;;cycles:u;64565050;100.00;;\n1040451141;;instructions:u;64565050;100.00;4.58;insn per cycle\n234979757;;branches:u;64565050;100.00;;\n33091;;branch-misses:u;64565050;100.00;0.01;of all branches\n0;;page-faults:u;64565050;100.00;;\n"
+  },
+  {
+    "version": "before",
+    "mode": "pending",
+    "count": 1024,
+    "rounds": 16384,
+    "capacity": 1024,
+    "trial": 2,
+    "per_operation": {
+      "cycles:u": 14.47275298833847,
+      "instructions:u": 50.012790620326996,
+      "branches:u": 9.002953946590424,
+      "branch-misses:u": 0.0010122060775756836,
+      "page-faults:u": 0.0
+    },
+    "summary": "mode=pending count=1024 rounds=16384 capacity=1024 ns_per_op=3.9711",
+    "raw_csv": "# started on Fri Oct 23 23:51:35 2026\n\n242812503;;cycles:u;66693974;100.00;;\n839075391;;instructions:u;66693974;100.00;3.46;insn per cycle\n151044503;;branches:u;66693974;100.00;;\n16982;;branch-misses:u;66693974;100.00;0.01;of all branches\n0;;page-faults:u;66693974;100.00;;\n"
+  },
+  {
+    "version": "after",
+    "mode": "pending",
+    "count": 1024,
+    "rounds": 16384,
+    "capacity": 1024,
+    "trial": 2,
+    "per_operation": {
+      "cycles:u": 9.324787318706512,
+      "instructions:u": 39.01278930902481,
+      "branches:u": 9.002952694892883,
+      "branch-misses:u": 0.0009968876838684082,
+      "page-faults:u": 5.960464477539063e-08
+    },
+    "summary": "mode=pending count=1024 rounds=16384 capacity=1024 ns_per_op=2.5763",
+    "raw_csv": "# started on Fri Oct 23 23:51:35 2026\n\n156443971;;cycles:u;43339493;100.00;;\n654525993;;instructions:u;43339493;100.00;4.18;insn per cycle\n151044482;;branches:u;43339493;100.00;;\n16725;;branch-misses:u;43339493;100.00;0.01;of all branches\n1;;page-faults:u;43339493;100.00;;\n"
+  },
+  {
+    "version": "before",
+    "mode": "register_reused",
+    "count": 32768,
+    "rounds": 32,
+    "capacity": 1024,
+    "trial": 2,
+    "per_operation": {
+      "cycles:u": 70.08823680877686,
+      "instructions:u": 301.9738655090332,
+      "branches:u": 50.993653297424316,
+      "branch-misses:u": 0.0037136077880859375,
+      "page-faults:u": 0.0
+    },
+    "summary": "mode=register_reused count=32768 rounds=32 capacity=1024 ns_per_op=21.0086",
+    "raw_csv": "# started on Fri Oct 23 23:51:35 2026\n\n73492843;;cycles:u;22085817;100.00;;\n316642548;;instructions:u;22085817;100.00;4.31;insn per cycle\n53470721;;branches:u;22085817;100.00;;\n3894;;branch-misses:u;22085817;100.00;0.01;of all branches\n0;;page-faults:u;22085817;100.00;;\n"
+  },
+  {
+    "version": "after",
+    "mode": "register_reused",
+    "count": 32768,
+    "rounds": 32,
+    "capacity": 1024,
+    "trial": 2,
+    "per_operation": {
+      "cycles:u": 66.19814777374268,
+      "instructions:u": 280.9738597869873,
+      "branches:u": 45.9936408996582,
+      "branch-misses:u": 0.003985404968261719,
+      "page-faults:u": 0.0
+    },
+    "summary": "mode=register_reused count=32768 rounds=32 capacity=1024 ns_per_op=17.9974",
+    "raw_csv": "# started on Fri Oct 23 23:51:36 2026\n\n69413789;;cycles:u;18972330;100.00;;\n294622446;;instructions:u;18972330;100.00;4.24;insn per cycle\n48227828;;branches:u;18972330;100.00;;\n4179;;branch-misses:u;18972330;100.00;0.01;of all branches\n0;;page-faults:u;18972330;100.00;;\n"
+  },
+  {
+    "version": "after",
+    "mode": "readiness",
+    "count": 1024,
+    "rounds": 32768,
+    "capacity": 1024,
+    "trial": 3,
+    "per_operation": {
+      "cycles:u": 6.988205164670944,
+      "instructions:u": 31.00785940885544,
+      "branches:u": 7.00294154882431,
+      "branch-misses:u": 0.000983506441116333,
+      "page-faults:u": 0.0
+    },
+    "summary": "mode=readiness count=1024 rounds=32768 capacity=1024 ns_per_op=1.8928",
+    "raw_csv": "# started on Fri Oct 23 23:51:36 2026\n\n234485255;;cycles:u;63527049;100.00;;\n1040451110;;instructions:u;63527049;100.00;4.44;insn per cycle\n234979726;;branches:u;63527049;100.00;;\n33001;;branch-misses:u;63527049;100.00;0.01;of all branches\n0;;page-faults:u;63527049;100.00;;\n"
+  },
+  {
+    "version": "before",
+    "mode": "readiness",
+    "count": 1024,
+    "rounds": 32768,
+    "capacity": 1024,
+    "trial": 3,
+    "per_operation": {
+      "cycles:u": 8.20646870136261,
+      "instructions:u": 36.007861107587814,
+      "branches:u": 9.002943307161331,
+      "branch-misses:u": 0.0009926259517669678,
+      "page-faults:u": 0.0
+    },
+    "summary": "mode=readiness count=1024 rounds=32768 capacity=1024 ns_per_op=2.3386",
+    "raw_csv": "# started on Fri Oct 23 23:51:36 2026\n\n275363396;;cycles:u;78535922;100.00;;\n1208223327;;instructions:u;78535922;100.00;4.39;insn per cycle\n302088649;;branches:u;78535922;100.00;;\n33307;;branch-misses:u;78535922;100.00;0.01;of all branches\n0;;page-faults:u;78535922;100.00;;\n"
+  },
+  {
+    "version": "after",
+    "mode": "pending",
+    "count": 1024,
+    "rounds": 16384,
+    "capacity": 1024,
+    "trial": 3,
+    "per_operation": {
+      "cycles:u": 8.765567004680634,
+      "instructions:u": 39.012788355350494,
+      "branches:u": 9.002952337265015,
+      "branch-misses:u": 0.0009943246841430664,
+      "page-faults:u": 0.0
+    },
+    "summary": "mode=pending count=1024 rounds=16384 capacity=1024 ns_per_op=2.7534",
+    "raw_csv": "# started on Fri Oct 23 23:51:36 2026\n\n147061811;;cycles:u;40851425;100.00;;\n654525977;;instructions:u;40851425;100.00;4.45;insn per cycle\n151044476;;branches:u;40851425;100.00;;\n16682;;branch-misses:u;40851425;100.00;0.01;of all branches\n0;;page-faults:u;40851425;100.00;;\n"
+  },
+  {
+    "version": "before",
+    "mode": "pending",
+    "count": 1024,
+    "rounds": 16384,
+    "capacity": 1024,
+    "trial": 3,
+    "per_operation": {
+      "cycles:u": 11.90205329656601,
+      "instructions:u": 50.012790977954865,
+      "branches:u": 9.002955377101898,
+      "branch-misses:u": 0.0010098814964294434,
+      "page-faults:u": 0.0
+    },
+    "summary": "mode=pending count=1024 rounds=16384 capacity=1024 ns_per_op=3.5940",
+    "raw_csv": "# started on Fri Oct 23 23:51:36 2026\n\n199683319;;cycles:u;60347011;100.00;;\n839075397;;instructions:u;60347011;100.00;4.20;insn per cycle\n151044527;;branches:u;60347011;100.00;;\n16943;;branch-misses:u;60347011;100.00;0.01;of all branches\n0;;page-faults:u;60347011;100.00;;\n"
+  },
+  {
+    "version": "after",
+    "mode": "register_reused",
+    "count": 32768,
+    "rounds": 32,
+    "capacity": 1024,
+    "trial": 3,
+    "per_operation": {
+      "cycles:u": 66.08876609802246,
+      "instructions:u": 280.97386264801025,
+      "branches:u": 45.99364376068115,
+      "branch-misses:u": 0.004006385803222656,
+      "page-faults:u": 0.0
+    },
+    "summary": "mode=register_reused count=32768 rounds=32 capacity=1024 ns_per_op=18.7757",
+    "raw_csv": "# started on Fri Oct 23 23:51:36 2026\n\n69299094;;cycles:u;39256645;100.00;;\n294622449;;instructions:u;39256645;100.00;4.25;insn per cycle\n48227831;;branches:u;39256645;100.00;;\n4201;;branch-misses:u;39256645;100.00;0.01;of all branches\n0;;page-faults:u;39256645;100.00;;\n"
+  },
+  {
+    "version": "before",
+    "mode": "register_reused",
+    "count": 32768,
+    "rounds": 32,
+    "capacity": 1024,
+    "trial": 3,
+    "per_operation": {
+      "cycles:u": 70.65820980072021,
+      "instructions:u": 301.9739475250244,
+      "branches:u": 50.99367427825928,
+      "branch-misses:u": 0.0035562515258789062,
+      "page-faults:u": 0.0
+    },
+    "summary": "mode=register_reused count=32768 rounds=32 capacity=1024 ns_per_op=19.5976",
+    "raw_csv": "# started on Fri Oct 23 23:51:36 2026\n\n74090503;;cycles:u;20647980;100.00;;\n316642634;;instructions:u;20647980;100.00;4.27;insn per cycle\n53470743;;branches:u;20647980;100.00;;\n3729;;branch-misses:u;20647980;100.00;0.01;of all branches\n0;;page-faults:u;20647980;100.00;;\n"
+  },
+  {
+    "version": "before",
+    "mode": "readiness",
+    "count": 1024,
+    "rounds": 32768,
+    "capacity": 1024,
+    "trial": 4,
+    "per_operation": {
+      "cycles:u": 8.365405023097992,
+      "instructions:u": 36.007860988378525,
+      "branches:u": 9.002943187952042,
+      "branch-misses:u": 0.0009913444519042969,
+      "page-faults:u": 0.0
+    },
+    "summary": "mode=readiness count=1024 rounds=32768 capacity=1024 ns_per_op=2.3159",
+    "raw_csv": "# started on Fri Oct 23 23:51:36 2026\n\n280696414;;cycles:u;77694123;100.00;;\n1208223323;;instructions:u;77694123;100.00;4.30;insn per cycle\n302088645;;branches:u;77694123;100.00;;\n33264;;branch-misses:u;77694123;100.00;0.01;of all branches\n0;;page-faults:u;77694123;100.00;;\n"
+  },
+  {
+    "version": "after",
+    "mode": "readiness",
+    "count": 1024,
+    "rounds": 32768,
+    "capacity": 1024,
+    "trial": 4,
+    "per_operation": {
+      "cycles:u": 7.048509329557419,
+      "instructions:u": 31.007859736680984,
+      "branches:u": 7.002941876649857,
+      "branch-misses:u": 0.000985562801361084,
+      "page-faults:u": 0.0
+    },
+    "summary": "mode=readiness count=1024 rounds=32768 capacity=1024 ns_per_op=1.9217",
+    "raw_csv": "# started on Fri Oct 23 23:51:37 2026\n\n236508727;;cycles:u;64569470;100.00;;\n1040451121;;instructions:u;64569470;100.00;4.40;insn per cycle\n234979737;;branches:u;64569470;100.00;;\n33070;;branch-misses:u;64569470;100.00;0.01;of all branches\n0;;page-faults:u;64569470;100.00;;\n"
+  },
+  {
+    "version": "before",
+    "mode": "pending",
+    "count": 1024,
+    "rounds": 16384,
+    "capacity": 1024,
+    "trial": 4,
+    "per_operation": {
+      "cycles:u": 11.937335193157196,
+      "instructions:u": 50.012788236141205,
+      "branches:u": 9.002952635288239,
+      "branch-misses:u": 0.001003563404083252,
+      "page-faults:u": 0.0
+    },
+    "summary": "mode=pending count=1024 rounds=16384 capacity=1024 ns_per_op=3.2264",
+    "raw_csv": "# started on Fri Oct 23 23:51:37 2026\n\n200275251;;cycles:u;54216579;100.00;;\n839075351;;instructions:u;54216579;100.00;4.19;insn per cycle\n151044481;;branches:u;54216579;100.00;;\n16837;;branch-misses:u;54216579;100.00;0.01;of all branches\n0;;page-faults:u;54216579;100.00;;\n"
+  },
+  {
+    "version": "after",
+    "mode": "pending",
+    "count": 1024,
+    "rounds": 16384,
+    "capacity": 1024,
+    "trial": 4,
+    "per_operation": {
+      "cycles:u": 11.636287689208984,
+      "instructions:u": 39.01279014348984,
+      "branches:u": 9.002954125404358,
+      "branch-misses:u": 0.0010025501251220703,
+      "page-faults:u": 0.0
+    },
+    "summary": "mode=pending count=1024 rounds=16384 capacity=1024 ns_per_op=3.2947",
+    "raw_csv": "# started on Fri Oct 23 23:51:37 2026\n\n195224512;;cycles:u;55290822;100.00;;\n654526007;;instructions:u;55290822;100.00;3.35;insn per cycle\n151044506;;branches:u;55290822;100.00;;\n16820;;branch-misses:u;55290822;100.00;0.01;of all branches\n0;;page-faults:u;55290822;100.00;;\n"
+  },
+  {
+    "version": "before",
+    "mode": "register_reused",
+    "count": 32768,
+    "rounds": 32,
+    "capacity": 1024,
+    "trial": 4,
+    "per_operation": {
+      "cycles:u": 70.45178985595703,
+      "instructions:u": 301.97385597229004,
+      "branches:u": 50.99364376068115,
+      "branch-misses:u": 0.0035123825073242188,
+      "page-faults:u": 0.0
+    },
+    "summary": "mode=register_reused count=32768 rounds=32 capacity=1024 ns_per_op=19.3878",
+    "raw_csv": "# started on Fri Oct 23 23:51:37 2026\n\n73874056;;cycles:u;20326126;100.00;;\n316642538;;instructions:u;20326126;100.00;4.29;insn per cycle\n53470711;;branches:u;20326126;100.00;;\n3683;;branch-misses:u;20326126;100.00;0.01;of all branches\n0;;page-faults:u;20326126;100.00;;\n"
+  },
+  {
+    "version": "after",
+    "mode": "register_reused",
+    "count": 32768,
+    "rounds": 32,
+    "capacity": 1024,
+    "trial": 4,
+    "per_operation": {
+      "cycles:u": 68.97356033325195,
+      "instructions:u": 280.97387504577637,
+      "branches:u": 45.99365520477295,
+      "branch-misses:u": 0.004669189453125,
+      "page-faults:u": 0.0
+    },
+    "summary": "mode=register_reused count=32768 rounds=32 capacity=1024 ns_per_op=21.0145",
+    "raw_csv": "# started on Fri Oct 23 23:51:37 2026\n\n72324020;;cycles:u;21999486;100.00;;\n294622462;;instructions:u;21999486;100.00;4.07;insn per cycle\n48227843;;branches:u;21999486;100.00;;\n4896;;branch-misses:u;21999486;100.00;0.01;of all branches\n0;;page-faults:u;21999486;100.00;;\n"
+  }
+]

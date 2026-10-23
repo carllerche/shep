@@ -195,7 +195,7 @@ pin_project! {
 impl Sleep {
     pub(crate) fn new_timeout(deadline: Instant) -> Sleep {
         let handle = Handle::current();
-        let entry = TimerEntry::new(&handle, deadline);
+        let entry = TimerEntry::new(&handle);
 
         Sleep { deadline, entry }
     }
@@ -212,6 +212,7 @@ impl Sleep {
     /// Returns `true` if `Sleep` has elapsed.
     ///
     /// A `Sleep` instance is elapsed when the requested duration has elapsed.
+    #[inline]
     pub fn is_elapsed(&self) -> bool {
         self.entry.is_elapsed()
     }
@@ -254,7 +255,7 @@ impl Sleep {
 
     fn poll_elapsed(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Result<(), Error>> {
         let me = self.project();
-        me.entry.poll_elapsed(cx)
+        me.entry.poll_elapsed(*me.deadline, cx)
     }
 }
 

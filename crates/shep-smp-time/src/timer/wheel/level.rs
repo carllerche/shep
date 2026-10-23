@@ -2,9 +2,11 @@
 // Copyright (c) 2021 ihciah, dyxushuai and other Monoio Contributors.
 // Portions Copyright (c) 2021 Tokio Contributors. Licensed under MIT.
 
-use std::{fmt, ptr::NonNull};
+use std::fmt;
 
-use crate::timer::{EntryList, TimerHandle, TimerShared};
+use shep_util_slab::Slab;
+
+use crate::timer::{Entry, EntryId, EntryList};
 
 /// Wheel for a single level in the timer. This wheel contains 64 slots.
 pub(crate) struct Level {
@@ -205,28 +207,17 @@ impl Level {
         Some(slot)
     }
 
-    pub(crate) unsafe fn add_entry(&mut self, item: TimerHandle) {
-        // SAFETY: The caller transfers a live pinned entry into this bucket.
-        let slot = slot_for(unsafe { item.cached_when() }, self.level);
-
-        // SAFETY: The caller retains the pinned owner and transfers detached
-        // membership to this bucket, keeping the entry live until removal.
-        unsafe { self.slot[slot].push_front(item) };
-
+    pub(crate) fn add_entry(&mut self, entries: &mut Slab<Entry>, key: EntryId) {
+        let slot = slot_for(entries[key.index()].cached_when(), self.level);
+        self.slot[slot].push_front(entries, key);
         self.occupied |= occupied_bit(slot);
     }
 
-    pub(crate) unsafe fn remove_entry(&mut self, item: NonNull<TimerShared>) {
-        // SAFETY: The caller guarantees a live pinned node in this level's
-        // cached bucket. The cached deadline changes only after unlinking.
-        let slot = slot_for(unsafe { item.as_ref().cached_when() }, self.level);
-
-        unsafe { self.slot[slot].remove(item) };
+    pub(crate) fn remove_entry(&mut self, entries: &mut Slab<Entry>, key: EntryId) {
+        let slot = slot_for(entries[key.index()].cached_when(), self.level);
+        self.slot[slot].remove(entries, key);
         if self.slot[slot].is_empty() {
-            // The bit is currently set
             debug_assert!(self.occupied & occupied_bit(slot) != 0);
-
-            // Unset the bit
             self.occupied ^= occupied_bit(slot);
         }
     }

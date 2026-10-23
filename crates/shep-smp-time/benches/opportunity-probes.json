@@ -1,0 +1,1150 @@
+{
+  "readiness_inline": [
+    {
+      "version": "arena",
+      "mode": "readiness",
+      "count": 1024,
+      "rounds": 32768,
+      "capacity": 1024,
+      "trial": 0,
+      "counters": {
+        "cycles:u": 8.167968153953552,
+        "instructions:u": 36.007861852645874,
+        "branches:u": 9.00294405221939,
+        "branch-misses:u": 0.0009978115558624268,
+        "L1-dcache-loads": 13.008841961622238,
+        "L1-dcache-load-misses": 0.0,
+        "page-faults:u": 0.0,
+        "context-switches:u": 0.0
+      },
+      "summary": "mode=readiness count=1024 rounds=32768 capacity=1024 ns_per_op=2.9365"
+    },
+    {
+      "version": "inline-both",
+      "mode": "readiness",
+      "count": 1024,
+      "rounds": 32768,
+      "capacity": 1024,
+      "trial": 0,
+      "counters": {
+        "cycles:u": 6.860320329666138,
+        "instructions:u": 31.007860839366913,
+        "branches:u": 7.002943158149719,
+        "branch-misses:u": 0.0009891092777252197,
+        "L1-dcache-loads": 11.004806518554688,
+        "L1-dcache-load-misses": 0.0,
+        "page-faults:u": 0.0,
+        "context-switches:u": 0.0
+      },
+      "summary": "mode=readiness count=1024 rounds=32768 capacity=1024 ns_per_op=1.9544"
+    },
+    {
+      "version": "inline-both",
+      "mode": "readiness",
+      "count": 1024,
+      "rounds": 32768,
+      "capacity": 1024,
+      "trial": 1,
+      "counters": {
+        "cycles:u": 6.857585787773132,
+        "instructions:u": 31.00786057114601,
+        "branches:u": 7.002942889928818,
+        "branch-misses:u": 0.0009875893592834473,
+        "L1-dcache-loads": 11.0050288438797,
+        "L1-dcache-load-misses": 0.0,
+        "page-faults:u": 0.0,
+        "context-switches:u": 0.0
+      },
+      "summary": "mode=readiness count=1024 rounds=32768 capacity=1024 ns_per_op=1.9491"
+    },
+    {
+      "version": "arena",
+      "mode": "readiness",
+      "count": 1024,
+      "rounds": 32768,
+      "capacity": 1024,
+      "trial": 1,
+      "counters": {
+        "cycles:u": 8.148885190486908,
+        "instructions:u": 36.007860869169235,
+        "branches:u": 9.002943068742752,
+        "branch-misses:u": 0.0009922385215759277,
+        "L1-dcache-loads": 13.008637964725494,
+        "L1-dcache-load-misses": 0.0,
+        "page-faults:u": 0.0,
+        "context-switches:u": 0.0
+      },
+      "summary": "mode=readiness count=1024 rounds=32768 capacity=1024 ns_per_op=2.3327"
+    },
+    {
+      "version": "arena",
+      "mode": "readiness",
+      "count": 1024,
+      "rounds": 32768,
+      "capacity": 1024,
+      "trial": 2,
+      "counters": {
+        "cycles:u": 8.153716385364532,
+        "instructions:u": 36.00786179304123,
+        "branches:u": 9.002943992614746,
+        "branch-misses:u": 0.0009956061840057373,
+        "L1-dcache-loads": 13.0086669921875,
+        "L1-dcache-load-misses": 0.0,
+        "page-faults:u": 0.0,
+        "context-switches:u": 0.0
+      },
+      "summary": "mode=readiness count=1024 rounds=32768 capacity=1024 ns_per_op=2.5114"
+    },
+    {
+      "version": "inline-both",
+      "mode": "readiness",
+      "count": 1024,
+      "rounds": 32768,
+      "capacity": 1024,
+      "trial": 2,
+      "counters": {
+        "cycles:u": 6.840558350086212,
+        "instructions:u": 31.00785991549492,
+        "branches:u": 7.002942234277725,
+        "branch-misses:u": 0.0009842514991760254,
+        "L1-dcache-loads": 11.00468322634697,
+        "L1-dcache-load-misses": 0.0,
+        "page-faults:u": 0.0,
+        "context-switches:u": 0.0
+      },
+      "summary": "mode=readiness count=1024 rounds=32768 capacity=1024 ns_per_op=1.9138"
+    },
+    {
+      "version": "inline-both",
+      "mode": "readiness",
+      "count": 1024,
+      "rounds": 32768,
+      "capacity": 1024,
+      "trial": 3,
+      "counters": {
+        "cycles:u": 6.83208766579628,
+        "instructions:u": 31.00785940885544,
+        "branches:u": 7.002941727638245,
+        "branch-misses:u": 0.0009843707084655762,
+        "L1-dcache-loads": 11.004622220993042,
+        "L1-dcache-load-misses": 0.0,
+        "page-faults:u": 0.0,
+        "context-switches:u": 0.0
+      },
+      "summary": "mode=readiness count=1024 rounds=32768 capacity=1024 ns_per_op=1.8609"
+    },
+    {
+      "version": "arena",
+      "mode": "readiness",
+      "count": 1024,
+      "rounds": 32768,
+      "capacity": 1024,
+      "trial": 3,
+      "counters": {
+        "cycles:u": 8.190231382846832,
+        "instructions:u": 36.00786221027374,
+        "branches:u": 9.00294440984726,
+        "branch-misses:u": 0.0009926855564117432,
+        "L1-dcache-loads": 13.013281911611557,
+        "L1-dcache-load-misses": 0.0,
+        "page-faults:u": 0.0,
+        "context-switches:u": 0.0
+      },
+      "summary": "mode=readiness count=1024 rounds=32768 capacity=1024 ns_per_op=2.3983"
+    },
+    {
+      "version": "arena",
+      "mode": "readiness",
+      "count": 1024,
+      "rounds": 32768,
+      "capacity": 1024,
+      "trial": 4,
+      "counters": {
+        "cycles:u": 8.13933002948761,
+        "instructions:u": 36.00786134600639,
+        "branches:u": 9.00294354557991,
+        "branch-misses:u": 0.0009916424751281738,
+        "L1-dcache-loads": 13.00915315747261,
+        "L1-dcache-load-misses": 0.0,
+        "page-faults:u": 0.0,
+        "context-switches:u": 0.0
+      },
+      "summary": "mode=readiness count=1024 rounds=32768 capacity=1024 ns_per_op=2.3825"
+    },
+    {
+      "version": "inline-both",
+      "mode": "readiness",
+      "count": 1024,
+      "rounds": 32768,
+      "capacity": 1024,
+      "trial": 4,
+      "counters": {
+        "cycles:u": 6.866949558258057,
+        "instructions:u": 31.007860869169235,
+        "branches:u": 7.002943187952042,
+        "branch-misses:u": 0.0009860098361968994,
+        "L1-dcache-loads": 11.004762351512909,
+        "L1-dcache-load-misses": 0.0,
+        "page-faults:u": 0.0,
+        "context-switches:u": 0.0
+      },
+      "summary": "mode=readiness count=1024 rounds=32768 capacity=1024 ns_per_op=1.9058"
+    }
+  ],
+  "negative_readiness_get_experiment": [
+    {
+      "version": "arena",
+      "mode": "readiness",
+      "count": 1024,
+      "rounds": 32768,
+      "capacity": 1024,
+      "trial": 0,
+      "counters": {
+        "cycles:u": 8.103623062372208,
+        "instructions:u": 36.00786089897156,
+        "branches:u": 9.002943098545074,
+        "branch-misses:u": 0.000989764928817749,
+        "L1-dcache-loads": 13.008144348859787,
+        "L1-dcache-load-misses": 0.0,
+        "page-faults:u": 0.0,
+        "context-switches:u": 0.0
+      },
+      "summary": "mode=readiness count=1024 rounds=32768 capacity=1024 ns_per_op=2.6946"
+    },
+    {
+      "version": "readiness-get",
+      "mode": "readiness",
+      "count": 1024,
+      "rounds": 32768,
+      "capacity": 1024,
+      "trial": 0,
+      "counters": {
+        "cycles:u": 6.754149794578552,
+        "instructions:u": 31.007859230041504,
+        "branches:u": 7.00294154882431,
+        "branch-misses:u": 0.0009840428829193115,
+        "L1-dcache-loads": 11.004430085420609,
+        "L1-dcache-load-misses": 0.0,
+        "page-faults:u": 0.0,
+        "context-switches:u": 0.0
+      },
+      "summary": "mode=readiness count=1024 rounds=32768 capacity=1024 ns_per_op=1.8392"
+    },
+    {
+      "version": "readiness-get",
+      "mode": "readiness",
+      "count": 1024,
+      "rounds": 32768,
+      "capacity": 1024,
+      "trial": 1,
+      "counters": {
+        "cycles:u": 6.743970066308975,
+        "instructions:u": 31.00785920023918,
+        "branches:u": 7.002941519021988,
+        "branch-misses:u": 0.0009848475456237793,
+        "L1-dcache-loads": 11.004626899957657,
+        "L1-dcache-load-misses": 0.0,
+        "page-faults:u": 0.0,
+        "context-switches:u": 0.0
+      },
+      "summary": "mode=readiness count=1024 rounds=32768 capacity=1024 ns_per_op=1.8376"
+    },
+    {
+      "version": "arena",
+      "mode": "readiness",
+      "count": 1024,
+      "rounds": 32768,
+      "capacity": 1024,
+      "trial": 1,
+      "counters": {
+        "cycles:u": 8.148023635149002,
+        "instructions:u": 36.007860749959946,
+        "branches:u": 9.002942949533463,
+        "branch-misses:u": 0.000989675521850586,
+        "L1-dcache-loads": 13.010580778121948,
+        "L1-dcache-load-misses": 0.0,
+        "page-faults:u": 0.0,
+        "context-switches:u": 0.0
+      },
+      "summary": "mode=readiness count=1024 rounds=32768 capacity=1024 ns_per_op=2.2914"
+    },
+    {
+      "version": "arena",
+      "mode": "readiness",
+      "count": 1024,
+      "rounds": 32768,
+      "capacity": 1024,
+      "trial": 2,
+      "counters": {
+        "cycles:u": 8.13344532251358,
+        "instructions:u": 36.007860124111176,
+        "branches:u": 9.002942323684692,
+        "branch-misses:u": 0.0009877979755401611,
+        "L1-dcache-loads": 13.009007662534714,
+        "L1-dcache-load-misses": 0.0,
+        "page-faults:u": 0.0,
+        "context-switches:u": 0.0
+      },
+      "summary": "mode=readiness count=1024 rounds=32768 capacity=1024 ns_per_op=2.2325"
+    },
+    {
+      "version": "readiness-get",
+      "mode": "readiness",
+      "count": 1024,
+      "rounds": 32768,
+      "capacity": 1024,
+      "trial": 2,
+      "counters": {
+        "cycles:u": 6.767636865377426,
+        "instructions:u": 31.00785967707634,
+        "branches:u": 7.002941995859146,
+        "branch-misses:u": 0.000987231731414795,
+        "L1-dcache-loads": 11.004677683115005,
+        "L1-dcache-load-misses": 0.0,
+        "page-faults:u": 0.0,
+        "context-switches:u": 0.0
+      },
+      "summary": "mode=readiness count=1024 rounds=32768 capacity=1024 ns_per_op=2.1847"
+    },
+    {
+      "version": "readiness-get",
+      "mode": "readiness",
+      "count": 1024,
+      "rounds": 32768,
+      "capacity": 1024,
+      "trial": 3,
+      "counters": {
+        "cycles:u": 6.744503438472748,
+        "instructions:u": 31.00785917043686,
+        "branches:u": 7.0029414892196655,
+        "branch-misses:u": 0.0009857416152954102,
+        "L1-dcache-loads": 11.004480600357056,
+        "L1-dcache-load-misses": 0.0,
+        "page-faults:u": 0.0,
+        "context-switches:u": 0.0
+      },
+      "summary": "mode=readiness count=1024 rounds=32768 capacity=1024 ns_per_op=1.8760"
+    },
+    {
+      "version": "arena",
+      "mode": "readiness",
+      "count": 1024,
+      "rounds": 32768,
+      "capacity": 1024,
+      "trial": 3,
+      "counters": {
+        "cycles:u": 8.397549629211426,
+        "instructions:u": 36.00786134600639,
+        "branches:u": 9.00294354557991,
+        "branch-misses:u": 0.0009940564632415771,
+        "L1-dcache-loads": 13.075963646173477,
+        "L1-dcache-load-misses": 0.0,
+        "page-faults:u": 0.0,
+        "context-switches:u": 0.0
+      },
+      "summary": "mode=readiness count=1024 rounds=32768 capacity=1024 ns_per_op=2.5389"
+    },
+    {
+      "version": "arena",
+      "mode": "readiness",
+      "count": 1024,
+      "rounds": 32768,
+      "capacity": 1024,
+      "trial": 4,
+      "counters": {
+        "cycles:u": 8.119519084692001,
+        "instructions:u": 36.007859885692596,
+        "branches:u": 9.002942085266113,
+        "branch-misses:u": 0.0009875893592834473,
+        "L1-dcache-loads": 13.008811354637146,
+        "L1-dcache-load-misses": 0.0,
+        "page-faults:u": 0.0,
+        "context-switches:u": 0.0
+      },
+      "summary": "mode=readiness count=1024 rounds=32768 capacity=1024 ns_per_op=2.2552"
+    },
+    {
+      "version": "readiness-get",
+      "mode": "readiness",
+      "count": 1024,
+      "rounds": 32768,
+      "capacity": 1024,
+      "trial": 4,
+      "counters": {
+        "cycles:u": 6.779735177755356,
+        "instructions:u": 31.007859081029892,
+        "branches:u": 7.002941399812698,
+        "branch-misses:u": 0.0009844601154327393,
+        "L1-dcache-loads": 11.00416487455368,
+        "L1-dcache-load-misses": 0.0,
+        "page-faults:u": 0.0,
+        "context-switches:u": 0.0
+      },
+      "summary": "mode=readiness count=1024 rounds=32768 capacity=1024 ns_per_op=1.8313"
+    }
+  ],
+  "outlined_poll": [
+    {
+      "version": "arena",
+      "mode": "pending",
+      "count": 1024,
+      "rounds": 16384,
+      "capacity": 1024,
+      "trial": 0,
+      "counters": {
+        "cycles:u": 11.879184067249298,
+        "instructions:u": 50.012772142887115,
+        "branches:u": 9.002950072288513,
+        "branch-misses:u": 0.0010042190551757812,
+        "L1-dcache-loads": 19.014984667301178,
+        "L1-dcache-load-misses": 0.0,
+        "page-faults:u": 0.0,
+        "context-switches:u": 0.0
+      },
+      "summary": "mode=pending count=1024 rounds=16384 capacity=1024 ns_per_op=5.1013"
+    },
+    {
+      "version": "outlined-poll",
+      "mode": "pending",
+      "count": 1024,
+      "rounds": 16384,
+      "capacity": 1024,
+      "trial": 0,
+      "counters": {
+        "cycles:u": 9.036843657493591,
+        "instructions:u": 39.01280725002289,
+        "branches:u": 9.002957880496979,
+        "branch-misses:u": 0.0010123848915100098,
+        "L1-dcache-loads": 15.007079243659973,
+        "L1-dcache-load-misses": 0.0,
+        "page-faults:u": 5.960464477539063e-08,
+        "context-switches:u": 0.0
+      },
+      "summary": "mode=pending count=1024 rounds=16384 capacity=1024 ns_per_op=2.9455"
+    },
+    {
+      "version": "arena",
+      "mode": "register_reused",
+      "count": 32768,
+      "rounds": 32,
+      "capacity": 1024,
+      "trial": 0,
+      "counters": {
+        "cycles:u": 69.96610927581787,
+        "instructions:u": 301.97385025024414,
+        "branches:u": 50.993638038635254,
+        "branch-misses:u": 0.0031070709228515625,
+        "L1-dcache-loads": 100.72115516662598,
+        "L1-dcache-load-misses": 0.0,
+        "page-faults:u": 0.0,
+        "context-switches:u": 0.0
+      },
+      "summary": "mode=register_reused count=32768 rounds=32 capacity=1024 ns_per_op=18.8468"
+    },
+    {
+      "version": "outlined-poll",
+      "mode": "register_reused",
+      "count": 32768,
+      "rounds": 32,
+      "capacity": 1024,
+      "trial": 0,
+      "counters": {
+        "cycles:u": 66.02066040039062,
+        "instructions:u": 290.9738492965698,
+        "branches:u": 48.99363613128662,
+        "branch-misses:u": 0.0049266815185546875,
+        "L1-dcache-loads": 95.2140998840332,
+        "L1-dcache-load-misses": 0.0,
+        "page-faults:u": 0.0,
+        "context-switches:u": 0.0
+      },
+      "summary": "mode=register_reused count=32768 rounds=32 capacity=1024 ns_per_op=17.7605"
+    },
+    {
+      "version": "outlined-poll",
+      "mode": "pending",
+      "count": 1024,
+      "rounds": 16384,
+      "capacity": 1024,
+      "trial": 1,
+      "counters": {
+        "cycles:u": 9.002901554107666,
+        "instructions:u": 39.01278764009476,
+        "branches:u": 9.002951979637146,
+        "branch-misses:u": 0.0009936094284057617,
+        "L1-dcache-loads": 15.042160451412201,
+        "L1-dcache-load-misses": 0.0,
+        "page-faults:u": 0.0,
+        "context-switches:u": 0.0
+      },
+      "summary": "mode=pending count=1024 rounds=16384 capacity=1024 ns_per_op=2.4850"
+    },
+    {
+      "version": "arena",
+      "mode": "pending",
+      "count": 1024,
+      "rounds": 16384,
+      "capacity": 1024,
+      "trial": 1,
+      "counters": {
+        "cycles:u": 11.906132161617279,
+        "instructions:u": 50.01278883218765,
+        "branches:u": 9.002953231334686,
+        "branch-misses:u": 0.0009989738464355469,
+        "L1-dcache-loads": 19.055355072021484,
+        "L1-dcache-load-misses": 0.0,
+        "page-faults:u": 0.0,
+        "context-switches:u": 0.0
+      },
+      "summary": "mode=pending count=1024 rounds=16384 capacity=1024 ns_per_op=3.2474"
+    },
+    {
+      "version": "outlined-poll",
+      "mode": "register_reused",
+      "count": 32768,
+      "rounds": 32,
+      "capacity": 1024,
+      "trial": 1,
+      "counters": {
+        "cycles:u": 67.54440116882324,
+        "instructions:u": 290.9738578796387,
+        "branches:u": 48.99364471435547,
+        "branch-misses:u": 0.004733085632324219,
+        "L1-dcache-loads": 95.28013515472412,
+        "L1-dcache-load-misses": 0.0,
+        "page-faults:u": 0.0,
+        "context-switches:u": 0.0
+      },
+      "summary": "mode=register_reused count=32768 rounds=32 capacity=1024 ns_per_op=18.5853"
+    },
+    {
+      "version": "arena",
+      "mode": "register_reused",
+      "count": 32768,
+      "rounds": 32,
+      "capacity": 1024,
+      "trial": 1,
+      "counters": {
+        "cycles:u": 70.47725582122803,
+        "instructions:u": 301.97458267211914,
+        "branches:u": 50.993882179260254,
+        "branch-misses:u": 0.0037946701049804688,
+        "L1-dcache-loads": 100.71022033691406,
+        "L1-dcache-load-misses": 0.0,
+        "page-faults:u": 0.0,
+        "context-switches:u": 0.0
+      },
+      "summary": "mode=register_reused count=32768 rounds=32 capacity=1024 ns_per_op=19.0206"
+    },
+    {
+      "version": "arena",
+      "mode": "pending",
+      "count": 1024,
+      "rounds": 16384,
+      "capacity": 1024,
+      "trial": 2,
+      "counters": {
+        "cycles:u": 11.880545914173126,
+        "instructions:u": 50.01278829574585,
+        "branches:u": 9.002952694892883,
+        "branch-misses:u": 0.0009955763816833496,
+        "L1-dcache-loads": 19.038524329662323,
+        "L1-dcache-load-misses": 0.0,
+        "page-faults:u": 0.0,
+        "context-switches:u": 0.0
+      },
+      "summary": "mode=pending count=1024 rounds=16384 capacity=1024 ns_per_op=3.2172"
+    },
+    {
+      "version": "outlined-poll",
+      "mode": "pending",
+      "count": 1024,
+      "rounds": 16384,
+      "capacity": 1024,
+      "trial": 2,
+      "counters": {
+        "cycles:u": 8.818032324314117,
+        "instructions:u": 39.01278990507126,
+        "branches:u": 9.002954244613647,
+        "branch-misses:u": 0.0009968876838684082,
+        "L1-dcache-loads": 15.006437599658966,
+        "L1-dcache-load-misses": 0.0,
+        "page-faults:u": 0.0,
+        "context-switches:u": 0.0
+      },
+      "summary": "mode=pending count=1024 rounds=16384 capacity=1024 ns_per_op=2.5110"
+    },
+    {
+      "version": "arena",
+      "mode": "register_reused",
+      "count": 32768,
+      "rounds": 32,
+      "capacity": 1024,
+      "trial": 2,
+      "counters": {
+        "cycles:u": 69.61919498443604,
+        "instructions:u": 301.9738540649414,
+        "branches:u": 50.99364185333252,
+        "branch-misses:u": 0.0034551620483398438,
+        "L1-dcache-loads": 100.66693496704102,
+        "L1-dcache-load-misses": 0.0,
+        "page-faults:u": 0.0,
+        "context-switches:u": 0.0
+      },
+      "summary": "mode=register_reused count=32768 rounds=32 capacity=1024 ns_per_op=19.1565"
+    },
+    {
+      "version": "outlined-poll",
+      "mode": "register_reused",
+      "count": 32768,
+      "rounds": 32,
+      "capacity": 1024,
+      "trial": 2,
+      "counters": {
+        "cycles:u": 65.95988845825195,
+        "instructions:u": 290.97385120391846,
+        "branches:u": 48.993638038635254,
+        "branch-misses:u": 0.004511833190917969,
+        "L1-dcache-loads": 95.02797889709473,
+        "L1-dcache-load-misses": 0.0,
+        "page-faults:u": 0.0,
+        "context-switches:u": 0.0
+      },
+      "summary": "mode=register_reused count=32768 rounds=32 capacity=1024 ns_per_op=18.0668"
+    },
+    {
+      "version": "outlined-poll",
+      "mode": "pending",
+      "count": 1024,
+      "rounds": 16384,
+      "capacity": 1024,
+      "trial": 3,
+      "counters": {
+        "cycles:u": 8.763159930706024,
+        "instructions:u": 39.01278752088547,
+        "branches:u": 9.002951860427856,
+        "branch-misses:u": 0.0009922385215759277,
+        "L1-dcache-loads": 15.00646597146988,
+        "L1-dcache-load-misses": 0.0,
+        "page-faults:u": 0.0,
+        "context-switches:u": 0.0
+      },
+      "summary": "mode=pending count=1024 rounds=16384 capacity=1024 ns_per_op=2.4025"
+    },
+    {
+      "version": "arena",
+      "mode": "pending",
+      "count": 1024,
+      "rounds": 16384,
+      "capacity": 1024,
+      "trial": 3,
+      "counters": {
+        "cycles:u": 11.812069118022919,
+        "instructions:u": 50.01278871297836,
+        "branches:u": 9.002953112125397,
+        "branch-misses:u": 0.0009952783584594727,
+        "L1-dcache-loads": 19.022687554359436,
+        "L1-dcache-load-misses": 0.0,
+        "page-faults:u": 0.0,
+        "context-switches:u": 0.0
+      },
+      "summary": "mode=pending count=1024 rounds=16384 capacity=1024 ns_per_op=3.2160"
+    },
+    {
+      "version": "outlined-poll",
+      "mode": "register_reused",
+      "count": 32768,
+      "rounds": 32,
+      "capacity": 1024,
+      "trial": 3,
+      "counters": {
+        "cycles:u": 67.5772647857666,
+        "instructions:u": 290.9738607406616,
+        "branches:u": 48.99364757537842,
+        "branch-misses:u": 0.004733085632324219,
+        "L1-dcache-loads": 95.3387804031372,
+        "L1-dcache-load-misses": 0.0,
+        "page-faults:u": 0.0,
+        "context-switches:u": 0.0
+      },
+      "summary": "mode=register_reused count=32768 rounds=32 capacity=1024 ns_per_op=18.8930"
+    },
+    {
+      "version": "arena",
+      "mode": "register_reused",
+      "count": 32768,
+      "rounds": 32,
+      "capacity": 1024,
+      "trial": 3,
+      "counters": {
+        "cycles:u": 69.73191928863525,
+        "instructions:u": 301.97457218170166,
+        "branches:u": 50.993886947631836,
+        "branch-misses:u": 0.00388336181640625,
+        "L1-dcache-loads": 100.44782638549805,
+        "L1-dcache-load-misses": 0.0,
+        "page-faults:u": 0.0,
+        "context-switches:u": 0.0
+      },
+      "summary": "mode=register_reused count=32768 rounds=32 capacity=1024 ns_per_op=19.2842"
+    },
+    {
+      "version": "arena",
+      "mode": "pending",
+      "count": 1024,
+      "rounds": 16384,
+      "capacity": 1024,
+      "trial": 4,
+      "counters": {
+        "cycles:u": 11.813267827033997,
+        "instructions:u": 50.01278841495514,
+        "branches:u": 9.002952814102173,
+        "branch-misses:u": 0.000994563102722168,
+        "L1-dcache-loads": 19.024076461791992,
+        "L1-dcache-load-misses": 0.0,
+        "page-faults:u": 0.0,
+        "context-switches:u": 0.0
+      },
+      "summary": "mode=pending count=1024 rounds=16384 capacity=1024 ns_per_op=3.2029"
+    },
+    {
+      "version": "outlined-poll",
+      "mode": "pending",
+      "count": 1024,
+      "rounds": 16384,
+      "capacity": 1024,
+      "trial": 4,
+      "counters": {
+        "cycles:u": 8.751123249530792,
+        "instructions:u": 39.01278752088547,
+        "branches:u": 9.002951860427856,
+        "branch-misses:u": 0.0009914040565490723,
+        "L1-dcache-loads": 15.007496774196625,
+        "L1-dcache-load-misses": 0.0,
+        "page-faults:u": 0.0,
+        "context-switches:u": 0.0
+      },
+      "summary": "mode=pending count=1024 rounds=16384 capacity=1024 ns_per_op=2.3818"
+    },
+    {
+      "version": "arena",
+      "mode": "register_reused",
+      "count": 32768,
+      "rounds": 32,
+      "capacity": 1024,
+      "trial": 4,
+      "counters": {
+        "cycles:u": 72.98390769958496,
+        "instructions:u": 301.97446632385254,
+        "branches:u": 50.99365234375,
+        "branch-misses:u": 0.004145622253417969,
+        "L1-dcache-loads": 100.68789100646973,
+        "L1-dcache-load-misses": 0.0,
+        "page-faults:u": 0.0,
+        "context-switches:u": 0.0
+      },
+      "summary": "mode=register_reused count=32768 rounds=32 capacity=1024 ns_per_op=20.4667"
+    },
+    {
+      "version": "outlined-poll",
+      "mode": "register_reused",
+      "count": 32768,
+      "rounds": 32,
+      "capacity": 1024,
+      "trial": 4,
+      "counters": {
+        "cycles:u": 70.49812412261963,
+        "instructions:u": 290.97385692596436,
+        "branches:u": 48.99364376068115,
+        "branch-misses:u": 0.004241943359375,
+        "L1-dcache-loads": 95.52226543426514,
+        "L1-dcache-load-misses": 0.0,
+        "page-faults:u": 0.0,
+        "context-switches:u": 0.0
+      },
+      "summary": "mode=register_reused count=32768 rounds=32 capacity=1024 ns_per_op=19.1902"
+    }
+  ],
+  "direct_insert": [
+    {
+      "version": "outlined-poll",
+      "mode": "register_reused",
+      "count": 32768,
+      "rounds": 32,
+      "capacity": 1024,
+      "trial": 0,
+      "counters": {
+        "cycles:u": 66.46909999847412,
+        "instructions:u": 290.9738531112671,
+        "branches:u": 48.99363994598389,
+        "branch-misses:u": 0.004958152770996094,
+        "L1-dcache-loads": 95.15356731414795,
+        "L1-dcache-load-misses": 0.0,
+        "page-faults:u": 0.0,
+        "context-switches:u": 0.0
+      },
+      "summary": "mode=register_reused count=32768 rounds=32 capacity=1024 ns_per_op=18.0580"
+    },
+    {
+      "version": "direct-insert",
+      "mode": "register_reused",
+      "count": 32768,
+      "rounds": 32,
+      "capacity": 1024,
+      "trial": 0,
+      "counters": {
+        "cycles:u": 70.1823844909668,
+        "instructions:u": 280.97417640686035,
+        "branches:u": 45.993645668029785,
+        "branch-misses:u": 0.0044536590576171875,
+        "L1-dcache-loads": 91.01812553405762,
+        "L1-dcache-load-misses": 0.0,
+        "page-faults:u": 0.0,
+        "context-switches:u": 0.0
+      },
+      "summary": "mode=register_reused count=32768 rounds=32 capacity=1024 ns_per_op=19.6136"
+    },
+    {
+      "version": "outlined-poll",
+      "mode": "register",
+      "count": 32768,
+      "rounds": 32,
+      "capacity": 1024,
+      "trial": 0,
+      "counters": {
+        "cycles:u": 97.11692905426025,
+        "instructions:u": 292.05012798309326,
+        "branches:u": 49.02017307281494,
+        "branch-misses:u": 0.023354530334472656,
+        "L1-dcache-loads": 93.62646579742432,
+        "L1-dcache-load-misses": 0.0,
+        "page-faults:u": 0.01415252685546875,
+        "context-switches:u": 0.0
+      },
+      "summary": "mode=register count=32768 rounds=32 capacity=1024 ns_per_op=40.5968"
+    },
+    {
+      "version": "direct-insert",
+      "mode": "register",
+      "count": 32768,
+      "rounds": 32,
+      "capacity": 1024,
+      "trial": 0,
+      "counters": {
+        "cycles:u": 94.5464859008789,
+        "instructions:u": 282.05001068115234,
+        "branches:u": 46.02013397216797,
+        "branch-misses:u": 0.02188396453857422,
+        "L1-dcache-loads": 91.30295276641846,
+        "L1-dcache-load-misses": 0.0,
+        "page-faults:u": 0.01415252685546875,
+        "context-switches:u": 0.0
+      },
+      "summary": "mode=register count=32768 rounds=32 capacity=1024 ns_per_op=38.6453"
+    },
+    {
+      "version": "direct-insert",
+      "mode": "register_reused",
+      "count": 32768,
+      "rounds": 32,
+      "capacity": 1024,
+      "trial": 1,
+      "counters": {
+        "cycles:u": 65.72830486297607,
+        "instructions:u": 280.9738531112671,
+        "branches:u": 45.99363994598389,
+        "branch-misses:u": 0.0038356781005859375,
+        "L1-dcache-loads": 90.18256759643555,
+        "L1-dcache-load-misses": 0.0,
+        "page-faults:u": 9.5367431640625e-07,
+        "context-switches:u": 0.0
+      },
+      "summary": "mode=register_reused count=32768 rounds=32 capacity=1024 ns_per_op=17.8492"
+    },
+    {
+      "version": "outlined-poll",
+      "mode": "register_reused",
+      "count": 32768,
+      "rounds": 32,
+      "capacity": 1024,
+      "trial": 1,
+      "counters": {
+        "cycles:u": 66.72974300384521,
+        "instructions:u": 290.97385025024414,
+        "branches:u": 48.99363708496094,
+        "branch-misses:u": 0.0044689178466796875,
+        "L1-dcache-loads": 95.45499324798584,
+        "L1-dcache-load-misses": 0.0,
+        "page-faults:u": 0.0,
+        "context-switches:u": 0.0
+      },
+      "summary": "mode=register_reused count=32768 rounds=32 capacity=1024 ns_per_op=17.9940"
+    },
+    {
+      "version": "direct-insert",
+      "mode": "register",
+      "count": 32768,
+      "rounds": 32,
+      "capacity": 1024,
+      "trial": 1,
+      "counters": {
+        "cycles:u": 94.47047901153564,
+        "instructions:u": 282.050012588501,
+        "branches:u": 46.0201358795166,
+        "branch-misses:u": 0.021554946899414062,
+        "L1-dcache-loads": 90.7170820236206,
+        "L1-dcache-load-misses": 0.0,
+        "page-faults:u": 0.01415252685546875,
+        "context-switches:u": 0.0
+      },
+      "summary": "mode=register count=32768 rounds=32 capacity=1024 ns_per_op=38.7569"
+    },
+    {
+      "version": "outlined-poll",
+      "mode": "register",
+      "count": 32768,
+      "rounds": 32,
+      "capacity": 1024,
+      "trial": 1,
+      "counters": {
+        "cycles:u": 98.04417419433594,
+        "instructions:u": 292.05001068115234,
+        "branches:u": 49.02013397216797,
+        "branch-misses:u": 0.022826194763183594,
+        "L1-dcache-loads": 93.17568588256836,
+        "L1-dcache-load-misses": 0.0,
+        "page-faults:u": 0.01415252685546875,
+        "context-switches:u": 0.0
+      },
+      "summary": "mode=register count=32768 rounds=32 capacity=1024 ns_per_op=39.5563"
+    },
+    {
+      "version": "outlined-poll",
+      "mode": "register_reused",
+      "count": 32768,
+      "rounds": 32,
+      "capacity": 1024,
+      "trial": 2,
+      "counters": {
+        "cycles:u": 67.82666683197021,
+        "instructions:u": 290.9738492965698,
+        "branches:u": 48.99363613128662,
+        "branch-misses:u": 0.004641532897949219,
+        "L1-dcache-loads": 95.37735843658447,
+        "L1-dcache-load-misses": 0.0,
+        "page-faults:u": 0.0,
+        "context-switches:u": 0.0
+      },
+      "summary": "mode=register_reused count=32768 rounds=32 capacity=1024 ns_per_op=18.4049"
+    },
+    {
+      "version": "direct-insert",
+      "mode": "register_reused",
+      "count": 32768,
+      "rounds": 32,
+      "capacity": 1024,
+      "trial": 2,
+      "counters": {
+        "cycles:u": 66.58091640472412,
+        "instructions:u": 280.97385120391846,
+        "branches:u": 45.993638038635254,
+        "branch-misses:u": 0.0037889480590820312,
+        "L1-dcache-loads": 90.31357669830322,
+        "L1-dcache-load-misses": 0.0,
+        "page-faults:u": 0.0,
+        "context-switches:u": 0.0
+      },
+      "summary": "mode=register_reused count=32768 rounds=32 capacity=1024 ns_per_op=17.9402"
+    },
+    {
+      "version": "outlined-poll",
+      "mode": "register",
+      "count": 32768,
+      "rounds": 32,
+      "capacity": 1024,
+      "trial": 2,
+      "counters": {
+        "cycles:u": 95.0623025894165,
+        "instructions:u": 292.05000591278076,
+        "branches:u": 49.02012920379639,
+        "branch-misses:u": 0.02247333526611328,
+        "L1-dcache-loads": 93.17204284667969,
+        "L1-dcache-load-misses": 0.0,
+        "page-faults:u": 0.01415252685546875,
+        "context-switches:u": 0.0
+      },
+      "summary": "mode=register count=32768 rounds=32 capacity=1024 ns_per_op=38.5924"
+    },
+    {
+      "version": "direct-insert",
+      "mode": "register",
+      "count": 32768,
+      "rounds": 32,
+      "capacity": 1024,
+      "trial": 2,
+      "counters": {
+        "cycles:u": 94.10756015777588,
+        "instructions:u": 282.0500144958496,
+        "branches:u": 46.020137786865234,
+        "branch-misses:u": 0.021757125854492188,
+        "L1-dcache-loads": 90.58278179168701,
+        "L1-dcache-load-misses": 0.0,
+        "page-faults:u": 0.01415252685546875,
+        "context-switches:u": 0.0
+      },
+      "summary": "mode=register count=32768 rounds=32 capacity=1024 ns_per_op=38.5018"
+    },
+    {
+      "version": "direct-insert",
+      "mode": "register_reused",
+      "count": 32768,
+      "rounds": 32,
+      "capacity": 1024,
+      "trial": 3,
+      "counters": {
+        "cycles:u": 65.99506378173828,
+        "instructions:u": 280.9738531112671,
+        "branches:u": 45.99363994598389,
+        "branch-misses:u": 0.003981590270996094,
+        "L1-dcache-loads": 90.14482975006104,
+        "L1-dcache-load-misses": 0.0,
+        "page-faults:u": 0.0,
+        "context-switches:u": 0.0
+      },
+      "summary": "mode=register_reused count=32768 rounds=32 capacity=1024 ns_per_op=17.9727"
+    },
+    {
+      "version": "outlined-poll",
+      "mode": "register_reused",
+      "count": 32768,
+      "rounds": 32,
+      "capacity": 1024,
+      "trial": 3,
+      "counters": {
+        "cycles:u": 67.34993743896484,
+        "instructions:u": 290.97385025024414,
+        "branches:u": 48.99363708496094,
+        "branch-misses:u": 0.0045223236083984375,
+        "L1-dcache-loads": 95.29004192352295,
+        "L1-dcache-load-misses": 0.0,
+        "page-faults:u": 0.0,
+        "context-switches:u": 0.0
+      },
+      "summary": "mode=register_reused count=32768 rounds=32 capacity=1024 ns_per_op=18.1420"
+    },
+    {
+      "version": "direct-insert",
+      "mode": "register",
+      "count": 32768,
+      "rounds": 32,
+      "capacity": 1024,
+      "trial": 3,
+      "counters": {
+        "cycles:u": 92.16854953765869,
+        "instructions:u": 282.050009727478,
+        "branches:u": 46.02013301849365,
+        "branch-misses:u": 0.021356582641601562,
+        "L1-dcache-loads": 90.66129398345947,
+        "L1-dcache-load-misses": 0.0,
+        "page-faults:u": 0.01415252685546875,
+        "context-switches:u": 0.0
+      },
+      "summary": "mode=register count=32768 rounds=32 capacity=1024 ns_per_op=37.7944"
+    },
+    {
+      "version": "outlined-poll",
+      "mode": "register",
+      "count": 32768,
+      "rounds": 32,
+      "capacity": 1024,
+      "trial": 3,
+      "counters": {
+        "cycles:u": 94.87661457061768,
+        "instructions:u": 292.0507411956787,
+        "branches:u": 49.020376205444336,
+        "branch-misses:u": 0.022649765014648438,
+        "L1-dcache-loads": 93.26399517059326,
+        "L1-dcache-load-misses": 0.0,
+        "page-faults:u": 0.01415252685546875,
+        "context-switches:u": 0.0
+      },
+      "summary": "mode=register count=32768 rounds=32 capacity=1024 ns_per_op=38.7327"
+    },
+    {
+      "version": "outlined-poll",
+      "mode": "register_reused",
+      "count": 32768,
+      "rounds": 32,
+      "capacity": 1024,
+      "trial": 4,
+      "counters": {
+        "cycles:u": 67.52631568908691,
+        "instructions:u": 290.9738521575928,
+        "branches:u": 48.99363899230957,
+        "branch-misses:u": 0.004744529724121094,
+        "L1-dcache-loads": 95.24152183532715,
+        "L1-dcache-load-misses": 0.0,
+        "page-faults:u": 0.0,
+        "context-switches:u": 0.0
+      },
+      "summary": "mode=register_reused count=32768 rounds=32 capacity=1024 ns_per_op=18.2528"
+    },
+    {
+      "version": "direct-insert",
+      "mode": "register_reused",
+      "count": 32768,
+      "rounds": 32,
+      "capacity": 1024,
+      "trial": 4,
+      "counters": {
+        "cycles:u": 67.00300598144531,
+        "instructions:u": 280.9738664627075,
+        "branches:u": 45.993653297424316,
+        "branch-misses:u": 0.004216194152832031,
+        "L1-dcache-loads": 90.20579242706299,
+        "L1-dcache-load-misses": 0.0,
+        "page-faults:u": 0.0,
+        "context-switches:u": 0.0
+      },
+      "summary": "mode=register_reused count=32768 rounds=32 capacity=1024 ns_per_op=19.7123"
+    },
+    {
+      "version": "outlined-poll",
+      "mode": "register",
+      "count": 32768,
+      "rounds": 32,
+      "capacity": 1024,
+      "trial": 4,
+      "counters": {
+        "cycles:u": 97.15573215484619,
+        "instructions:u": 292.0500202178955,
+        "branches:u": 49.02014350891113,
+        "branch-misses:u": 0.024100303649902344,
+        "L1-dcache-loads": 93.87533473968506,
+        "L1-dcache-load-misses": 0.0,
+        "page-faults:u": 0.01415252685546875,
+        "context-switches:u": 0.0
+      },
+      "summary": "mode=register count=32768 rounds=32 capacity=1024 ns_per_op=40.7388"
+    },
+    {
+      "version": "direct-insert",
+      "mode": "register",
+      "count": 32768,
+      "rounds": 32,
+      "capacity": 1024,
+      "trial": 4,
+      "counters": {
+        "cycles:u": 94.84085655212402,
+        "instructions:u": 282.050012588501,
+        "branches:u": 46.0201358795166,
+        "branch-misses:u": 0.02268695831298828,
+        "L1-dcache-loads": 90.90470218658447,
+        "L1-dcache-load-misses": 0.0,
+        "page-faults:u": 0.01415252685546875,
+        "context-switches:u": 0.0
+      },
+      "summary": "mode=register count=32768 rounds=32 capacity=1024 ns_per_op=46.3398"
+    }
+  ]
+}

@@ -1402,6 +1402,7 @@ dependencies = [
  "pin-project-lite",
  "shep-futures",
  "shep-smp-exec",
+ "shep-util-slab",
 ]
 
 [[package]]
