@@ -30,22 +30,20 @@
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
-use std::fs::{self, File};
 use std::io;
-use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::Arc;
 use std::time::Duration;
 
 use shep_futures::FutureExt;
 use shep_futures::future::{LocalBoxFuture, Shared};
 use tokio::time::Instant;
 
-use crate::disk::{self, Disk, DiskFile};
 use crate::error::{Error, Result, corrupt};
 use crate::index::Reader;
+use crate::io::{File, StorageIo};
 use crate::record::{self, Parsed, Record};
+use shep_smp_io::FileIo;
 
 const LOG: &str = "kvstore.log";
 const SNAPSHOT: &str = "kvstore.snapshot";
@@ -70,6 +68,7 @@ impl KeySpace {
     /// For tests.
     pub const TESTING: KeySpace = KeySpace(0xffff);
 
+    /// Prefix user bytes with a fixed-width namespace so ordered scans stay within one key space.
     fn key(self, key: &[u8]) -> Vec<u8> {
         let mut k = Vec::with_capacity(2 + key.len());
         k.extend_from_slice(&self.0.to_be_bytes());
@@ -78,12 +77,13 @@ impl KeySpace {
     }
 }
 
+/// Group-commit delay and snapshot threshold for one core's durable metadata store.
 #[derive(Clone, Debug)]
 pub struct KvConfig {
     /// How long the first queued op waits for others to share its commit.
     /// Zero commits as soon as no commit is in flight.
     pub commit_interval: Duration,
-    /// Log size past which the map is snapshotted and the log emptied.
+    /// Append-log bytes past which the map is snapshotted and the log emptied.
     pub max_log_bytes: u64,
 }
 
@@ -101,6 +101,7 @@ impl Default for KvConfig {
 pub struct KvStats {
     /// Batches committed, each one append and one `fdatasync`.
     pub batches: u64,
+    /// Successfully installed snapshots that replaced the committed map.
     pub snapshots: u64,
     /// Bytes in the log.
     pub log_bytes: u64,
@@ -110,45 +111,67 @@ pub struct KvStats {
 /// `Send`: it belongs to its core's thread.
 #[derive(Clone)]
 pub struct KvStore {
+    /// Shared local metadata store and persistence state.
     inner: Rc<Inner>,
 }
 
+/// Shared local store ownership; one append log backs all namespaced keys on this core.
 struct Inner {
-    disk: Disk,
+    /// Core-local scheduled metadata operations and transaction tracking.
+    io: StorageIo,
+    /// Directory containing the snapshot and append log.
     dir: PathBuf,
+    /// Group-commit delay and snapshot threshold.
     config: KvConfig,
-    log: Arc<DiskFile>,
+    /// Buffered append-log descriptor reused after snapshot truncation.
+    log: File,
+    /// Committed map and commit state machine; borrows do not span awaits.
     state: RefCell<State>,
 }
 
+/// Committed map, queued mutations, and the single in-flight persistence transaction.
 struct State {
+    /// Durably committed namespaced values visible to readers.
     map: Map,
+    /// Ordered queued (key, value) changes; None represents deletion.
     pending: Vec<(Vec<u8>, Option<Vec<u8>>)>,
     /// When the pending ops get committed.
     deadline: Option<Instant>,
-    /// Ops queued and committed so far; an op's ticket is its position.
+    /// Count of accepted mutations; also the next operation's commit ticket.
     enqueued: u64,
+    /// Count of durably committed operations; all smaller tickets are complete.
     committed: u64,
     /// The next batch's sequence number.
     next_seq: u64,
+    /// Committed append-log length in bytes, excluding in-flight batches.
     log_size: u64,
+    /// At most one commit or snapshot transaction shared by all waiters.
     inflight: Option<Inflight>,
+    /// Next transaction ID, distinguishing shared completion handoffs.
     next_id: u64,
     /// After a failed commit nothing more is accepted: what reached the disk
     /// is unknown.
     poisoned: Option<Error>,
+    /// Cumulative durable-work counters and current log-byte gauge.
     stats: KvStats,
 }
 
+/// Shared transaction completion plus the changes to publish only after durable success.
 struct Inflight {
+    /// Transaction ID used to avoid applying shared completion twice.
     id: u64,
+    /// Shared durable completion; accepted I/O outlives an individual waiter.
     done: Shared<LocalBoxFuture<'static, Result<()>>>,
+    /// Changes to publish only after the shared completion succeeds.
     job: Job,
 }
 
+/// Commit work whose durable completion updates the map or retires the old log.
 enum Job {
     Batch {
+        /// Ordered mutations to publish to the visible map after durable success.
         ops: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+        /// Encoded batch bytes to add to the committed append-log length.
         len: u64,
     },
     Snapshot,
@@ -158,46 +181,36 @@ impl KvStore {
     /// Opens the store in `dir`, creating it if needed, and replays the
     /// snapshot and log. A torn final batch was never acknowledged and is
     /// dropped.
-    pub async fn open(disk: &Disk, dir: impl Into<PathBuf>, config: KvConfig) -> Result<KvStore> {
+    pub async fn open(
+        io: &StorageIo,
+        dir: impl Into<PathBuf>,
+        config: KvConfig,
+    ) -> Result<KvStore> {
         let dir = dir.into();
-        let counters = disk.counters();
-        let d = dir.clone();
-        let (snapshot, batches, log, log_size) = disk
-            .run(move || {
-                fs::create_dir_all(&d)?;
-                if let Some(parent) = d.parent() {
-                    disk::sync_dir(parent, &counters)?;
-                }
-                disk::remove_optional(&d.join(format!("{SNAPSHOT}.tmp")))?;
-                let snapshot = disk::read_optional(&d.join(SNAPSHOT))?;
-                let path = d.join(LOG);
-                let file = File::options()
-                    .read(true)
-                    .write(true)
-                    .create(true)
-                    .truncate(false)
-                    .open(&path)?;
-                let bytes = fs::read(&path)?;
-                let mut pos = 0;
-                let mut batches = Vec::new();
-                while let Parsed::Record(r, n) = record::parse(&bytes[pos..]) {
-                    batches.push(r);
-                    pos += n;
-                }
-                if pos < bytes.len() {
-                    tracing::warn!(path = %path.display(), pos, "truncating a torn kvstore batch");
-                    file.set_len(pos as u64)?;
-                    disk::fdatasync(&file, &counters)?;
-                }
-                disk::sync_dir(&d, &counters)?;
-                Ok((
-                    snapshot,
-                    batches,
-                    Arc::new(DiskFile::new(file, path)),
-                    pos as u64,
-                ))
-            })
-            .await?;
+        io.create_dir_all(&dir).await?;
+        if let Some(parent) = dir.parent() {
+            io.sync_dir(parent).await?;
+        }
+        io.remove(&dir.join(format!("{SNAPSHOT}.tmp"))).await?;
+        let snapshot = io.read_optional(&dir.join(SNAPSHOT)).await?;
+        let path = dir.join(LOG);
+        let log = io.open(path.clone(), false).await?;
+        let size = usize::try_from(log.len().await?)
+            .map_err(|_| io::Error::from(io::ErrorKind::InvalidData))?;
+        let bytes = io.read_at(&log, 0, size).await?;
+        let mut pos = 0;
+        let mut batches = Vec::new();
+        while let Parsed::Record(record, n) = record::parse(&bytes[pos..]) {
+            batches.push(record);
+            pos += n;
+        }
+        if pos < bytes.len() {
+            tracing::warn!(path = %path.display(), pos, "truncating a torn kvstore batch");
+            log.set_len(pos as u64).await?;
+            log.sync_data().await?;
+        }
+        let log_size = pos as u64;
+        io.sync_dir(&dir).await?;
 
         let mut map = BTreeMap::new();
         let mut next_seq = 0;
@@ -226,7 +239,7 @@ impl KvStore {
 
         Ok(KvStore {
             inner: Rc::new(Inner {
-                disk: disk.clone(),
+                io: io.clone(),
                 dir,
                 config,
                 log,
@@ -295,10 +308,13 @@ impl KvStore {
         }
     }
 
+    /// Snapshot committed batch, snapshot, and current batch-log accounting.
     pub fn stats(&self) -> KvStats {
         self.inner.state.borrow().stats
     }
 
+    /// Queue an operation immediately in call order and return a waiter for its commit ticket.
+    /// Pending operations remain queued even when that waiter is dropped.
     fn write(
         &self,
         key: Vec<u8>,
@@ -322,6 +338,7 @@ impl KvStore {
         async move { this.wait(ticket?).await }
     }
 
+    /// Drive group commit until the ticket is durable, sharing any active commit or snapshot.
     async fn wait(&self, ticket: u64) -> Result<()> {
         enum Step {
             Await(u64, Shared<LocalBoxFuture<'static, Result<()>>>),
@@ -355,6 +372,7 @@ impl KvStore {
         }
     }
 
+    /// Detach one pending batch as a write-then-sync transaction; publish its map changes on success.
     fn start_batch(&self, st: &mut State) {
         let ops = std::mem::take(&mut st.pending);
         st.deadline = None;
@@ -372,14 +390,15 @@ impl KvStore {
         let len = buf.len() as u64;
         let pos = st.log_size;
         let log = self.inner.log.clone();
-        let counters = self.inner.disk.counters();
-        let done = self.inner.disk.run(move || {
-            log.file.write_all_at(&buf, pos)?;
-            disk::sync_file(&log, &counters)
+        let io = self.inner.io.clone();
+        let done = self.inner.io.task(async move {
+            io.write_all(&log, &buf, pos).await?;
+            log.sync_data().await
         });
         self.set_inflight(st, done, Job::Batch { ops, len });
     }
 
+    /// Persist a snapshot before resetting the batch log so recovery always has a durable source.
     fn start_snapshot(&self, st: &mut State) {
         let mut b = Vec::new();
         b.extend_from_slice(SNAPSHOT_MAGIC);
@@ -394,17 +413,17 @@ impl KvStore {
         b.extend_from_slice(&(crc).to_le_bytes());
         let dir = self.inner.dir.clone();
         let log = self.inner.log.clone();
-        let counters = self.inner.disk.counters();
-        let done = self.inner.disk.run(move || {
-            disk::write_atomic(&dir, SNAPSHOT, &b, &counters)?;
-            // Batches before `next_seq` are skipped on replay, so a crash
-            // before this reset is harmless.
-            log.file.set_len(0)?;
-            disk::sync_file(&log, &counters)
+        let io = self.inner.io.clone();
+        let done = self.inner.io.task(async move {
+            io.write_atomic(&dir, SNAPSHOT, &b).await?;
+            // The durable snapshot makes resetting the old batch log safe.
+            log.set_len(0).await?;
+            log.sync_data().await
         });
         self.set_inflight(st, done, Job::Snapshot);
     }
 
+    /// Share a uniquely identified transaction so concurrent waiters can observe it safely.
     fn set_inflight(
         &self,
         st: &mut State,
@@ -457,6 +476,7 @@ impl KvStore {
     }
 }
 
+/// Apply a recovered or durably committed put/delete to the visible map.
 fn apply(map: &mut Map, key: Vec<u8>, value: Option<Vec<u8>>) {
     match value {
         Some(v) => {
@@ -468,11 +488,13 @@ fn apply(map: &mut Map, key: Vec<u8>, value: Option<Vec<u8>>) {
     }
 }
 
+/// Encode a length-prefixed byte string used by batch and snapshot formats.
 fn put_bytes(b: &mut Vec<u8>, v: &[u8]) {
     b.extend_from_slice(&(v.len() as u32).to_le_bytes());
     b.extend_from_slice(v);
 }
 
+/// Decode one length-prefixed byte string, rejecting truncated input.
 fn get_bytes(r: &mut Reader<'_>) -> Option<Vec<u8>> {
     let n = r.u32()? as usize;
     Some(r.take(n)?.to_vec())
@@ -481,8 +503,10 @@ fn get_bytes(r: &mut Reader<'_>) -> Option<Vec<u8>> {
 /// Every key's value.
 type Map = BTreeMap<Vec<u8>, Vec<u8>>;
 
+/// Ordered key mutations; None deletes a key, and Some replaces its value.
 type Ops = Vec<(Vec<u8>, Option<Vec<u8>>)>;
 
+/// Decode a complete batch payload, rejecting truncated operations or trailing bytes.
 fn decode_ops(b: &[u8]) -> Option<Ops> {
     let mut r = Reader(b);
     let n = r.u32()?;
@@ -496,6 +520,7 @@ fn decode_ops(b: &[u8]) -> Option<Ops> {
     r.0.is_empty().then_some(ops)
 }
 
+/// Verify snapshot framing and checksum before recovering its sequence and committed map.
 fn decode_snapshot(b: &[u8]) -> Option<(u64, Map)> {
     let (body, crc) = b.split_at_checked(b.len().checked_sub(4)?)?;
     if crc32c::crc32c(body) != u32::from_le_bytes(crc.try_into().ok()?) {

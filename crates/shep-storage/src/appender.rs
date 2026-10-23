@@ -1,292 +1,160 @@
-//! The write-behind side of a log's active segment, after Redpanda's
-//! `segment_appender`.
-//!
-//! An append copies the record into a chunk-sized buffer from the core's
-//! [`WritePool`] and returns. A chunk goes to the disk worker when it fills,
-//! when a flush needs it, or when no append has come for the idle timeout.
-//! Since the worker runs jobs in order, a sync submitted after a chunk covers
-//! it, and nothing waits for writes to complete except the pool.
-//!
-//! Redpanda writes with O_DIRECT and must not touch a buffer the device may
-//! be reading, so it copies a partly written page into a fresh chunk. Here a
-//! dispatched chunk is simply handed off, and the next append starts a new
-//! one.
-//!
-//! The state lives on the core's thread, shared with the idle timer, a local
-//! task. Only completion of writes crosses to the disk worker, through an
-//! atomic.
-
+//! Record-position bookkeeping above the reusable byte appender.
+use crate::io::{File, WritePool};
+use shep_append::{AppendFile, Config};
 use std::cell::RefCell;
-use std::rc::{Rc, Weak};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::collections::VecDeque;
+use std::io;
+use std::rc::Rc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 use std::time::Duration;
 
-use tokio::sync::{Notify, OwnedSemaphorePermit};
-use tokio::time::Instant;
-
-use crate::disk::{Disk, DiskFile, WritePool};
-
+/// Maps the active segment's byte progress to complete-record watermarks for the log.
 pub(crate) struct Appender {
-    state: Rc<RefCell<WriteState>>,
-    timer: Rc<Notify>,
+    /// Current segment, retained through a successful asynchronous close.
+    active: Rc<RefCell<Option<Active>>>,
+    /// Shared local chunk budget used by each activated byte appender.
     pool: WritePool,
-}
-
-struct WriteState {
-    disk: Disk,
-    chunk_size: usize,
-    prealloc_step: u64,
-    active: Option<Active>,
-    /// One past the last record the OS has, shared with the worker.
+    /// Buffering and preallocation policy copied into new segment appenders.
+    config: AppenderConfig,
+    /// Exclusive record watermark shared with the owning log.
     written: Arc<AtomicU64>,
-    last_append: Instant,
-    timer_armed: bool,
-    closed: bool,
 }
-
-/// The file being appended to.
+/// Active byte appender and ordered record ends not yet reflected in the written watermark.
 struct Active {
-    file: Arc<DiskFile>,
-    /// Bytes handed to the worker; the head chunk continues from here.
-    pos: u64,
-    /// The file's length after preallocation.
-    alloc_end: u64,
-    head: Option<Chunk>,
-    /// One past the last record whose bytes have all been handed off.
-    dispatched: u64,
+    /// Format-independent byte appender for the current segment.
+    file: AppendFile<File>,
+    /// Ordered (exclusive byte end, next record index) pairs awaiting write completion.
+    records: VecDeque<(u64, u64)>,
+    /// Next record index after all accepted records in this segment.
+    end: u64,
 }
-
-struct Chunk {
-    buf: Vec<u8>,
-    /// Returned to the pool when the chunk's write completes.
-    permit: OwnedSemaphorePermit,
-    /// One past the last record that ends in this chunk.
-    end: Option<u64>,
-}
-
-/// What [`Appender::close`] leaves to the caller.
-pub(crate) struct Closed {
-    pub sync: shep_futures::future::LocalBoxFuture<'static, std::io::Result<()>>,
-    pub size: u64,
-}
-
+/// The log's buffering policy translated to the format-independent byte appender.
 pub(crate) struct AppenderConfig {
+    /// Preferred chunk size in bytes before direct-I/O normalization.
     pub chunk_size: usize,
+    /// Byte increment reserved ahead of writes; zero disables proactive reservation.
     pub prealloc_step: u64,
+    /// Maximum idle delay before dispatching a partial chunk.
     pub idle: Duration,
 }
-
+/// Captured logical size and finish dependency; awaiting sync makes the segment durable.
+pub(crate) struct Closed {
+    /// Finish dependency that drains writes, trims padding, and synchronizes data.
+    pub sync: shep_futures::future::LocalBoxFuture<'static, io::Result<()>>,
+    /// Logical record bytes captured at close, excluding padding and preallocation.
+    pub size: u64,
+}
 impl Appender {
-    pub(crate) fn new(
-        disk: Disk,
-        pool: WritePool,
-        config: AppenderConfig,
-        written: Arc<AtomicU64>,
-    ) -> Appender {
-        let state = Rc::new(RefCell::new(WriteState {
-            disk,
-            chunk_size: config.chunk_size.clamp(1, pool.capacity()),
-            prealloc_step: config.prealloc_step,
-            active: None,
+    /// Create record-position bookkeeping with a shared byte pool and written watermark.
+    pub(crate) fn new(pool: WritePool, config: AppenderConfig, written: Arc<AtomicU64>) -> Self {
+        Self {
+            active: Rc::new(RefCell::new(None)),
+            pool,
+            config,
             written,
-            last_append: Instant::now(),
-            timer_armed: false,
-            closed: false,
-        }));
-        let timer = Rc::new(Notify::new());
-        tokio::task::spawn_local(idle_timer(
-            Rc::downgrade(&state),
-            timer.clone(),
-            config.idle,
-        ));
-        Appender { state, timer, pool }
+        }
     }
-
-    /// Starts appending to a new, empty file whose first record is `next`.
-    pub(crate) fn activate(&self, file: Arc<DiskFile>, next: u64) {
-        let mut ws = self.state.borrow_mut();
-        debug_assert!(ws.active.is_none());
-        ws.active = Some(Active {
+    /// Attach a newly created segment at byte zero, with `next` as its first record index.
+    pub(crate) async fn activate(&self, file: File, next: u64) -> io::Result<()> {
+        let file = AppendFile::open(
             file,
-            pos: 0,
-            alloc_end: 0,
-            head: None,
-            dispatched: next,
+            self.pool.clone(),
+            Config {
+                chunk_size: self.config.chunk_size,
+                preallocate: self.config.prealloc_step,
+                idle: self.config.idle,
+            },
+            0,
+        )
+        .await?;
+        *self.active.borrow_mut() = Some(Active {
+            file,
+            records: VecDeque::new(),
+            end: next,
         });
+        Ok(())
     }
-
+    /// Report whether a segment remains available for appends or an in-progress close.
     pub(crate) fn is_active(&self) -> bool {
-        self.state.borrow_mut().active.is_some()
+        self.active.borrow().is_some()
     }
-
-    /// Buffers one record, whose index is `index`, waiting for pool space
-    /// if needed.
-    pub(crate) async fn write(&self, header: &[u8], payload: &[u8], index: u64) {
-        let mut parts = [header, payload];
-        let mut part = 0;
-        loop {
-            {
-                let mut guard = self.state.borrow_mut();
-                let ws = &mut *guard;
-                let active = ws
-                    .active
-                    .as_mut()
-                    .expect("append without an active segment");
-                let mut full = false;
-                if let Some(head) = &mut active.head {
-                    while part < parts.len() && head.buf.len() < ws.chunk_size {
-                        let n = (ws.chunk_size - head.buf.len()).min(parts[part].len());
-                        let end = active.pos + (head.buf.len() + n) as u64;
-                        if end > active.alloc_end {
-                            // Grow the file ahead of the data, so writes
-                            // don't extend it a little at a time.
-                            let step = ws.prealloc_step.max(1);
-                            active.alloc_end = end.div_ceil(step) * step;
-                            ws.disk.set_len(&active.file, active.alloc_end);
-                        }
-                        head.buf.extend_from_slice(&parts[part][..n]);
-                        parts[part] = &parts[part][n..];
-                        if parts[part].is_empty() {
-                            part += 1;
-                        }
-                    }
-                    while part < parts.len() && parts[part].is_empty() {
-                        part += 1;
-                    }
-                    if part == parts.len() {
-                        head.end = Some(index + 1);
-                    }
-                    full = head.buf.len() == ws.chunk_size;
-                }
-                if full {
-                    dispatch(ws);
-                }
-                if part == parts.len() {
-                    ws.last_append = Instant::now();
-                    let pending = ws.active.as_ref().is_some_and(|a| a.head.is_some());
-                    if pending && !ws.timer_armed {
-                        ws.timer_armed = true;
-                        self.timer.notify_one();
-                    }
-                    return;
-                }
-            }
-            let chunk_size = self.state.borrow_mut().chunk_size;
-            let permit = self.pool.acquire(chunk_size).await;
-            let mut ws = self.state.borrow_mut();
-            let active = ws
-                .active
-                .as_mut()
-                .expect("append without an active segment");
-            if active.head.is_none() {
-                active.head = Some(Chunk {
-                    buf: Vec::with_capacity(chunk_size),
-                    permit,
-                    end: None,
-                });
-            }
+    /// Append a framed record and map its byte end to the next record index.
+    /// The enclosing log transaction supplies exclusion and cancellation protection.
+    pub(crate) async fn write(&self, header: &[u8], payload: &[u8], index: u64) -> io::Result<()> {
+        let file = self.active.borrow().as_ref().unwrap().file.clone();
+        file.append(header).await?;
+        let end = file.append(payload).await?;
+        {
+            let mut active = self.active.borrow_mut();
+            let active = active.as_mut().unwrap();
+            active.records.push_back((end, index + 1));
+            active.end = index + 1;
+        }
+        self.refresh_written();
+        Ok(())
+    }
+    /// Advance the record watermark only past records whose entire byte range completed writing.
+    pub(crate) fn refresh_written(&self) {
+        let mut active = self.active.borrow_mut();
+        let Some(active) = active.as_mut() else {
+            return;
+        };
+        let written = active.file.positions().written;
+        while active
+            .records
+            .front()
+            .is_some_and(|(end, _)| *end <= written)
+        {
+            let (_, index) = active.records.pop_front().unwrap();
+            self.written.fetch_max(index, Ordering::AcqRel);
         }
     }
-
-    /// Hands the head chunk to the worker and submits an `fdatasync` after
-    /// it. Returns the sync and one past the last record it covers, or `None`
-    /// if no segment is active.
-    pub(crate) fn sync(&self) -> Option<(impl Future<Output = std::io::Result<()>> + use<>, u64)> {
-        let mut ws = self.state.borrow_mut();
-        dispatch(&mut ws);
-        let active = ws.active.as_ref()?;
-        Some((ws.disk.sync(&active.file), active.dispatched))
+    /// Capture the current byte and record ends for a shared log flush dependency.
+    pub(crate) fn sync(&self) -> Option<(impl Future<Output = io::Result<()>> + use<>, u64)> {
+        let active = self.active.borrow();
+        let active = active.as_ref()?;
+        let file = active.file.clone();
+        let target = file.positions().appended;
+        let end = active.end;
+        Some((async move { file.sync_through(target).await }, end))
     }
-
-    /// Hands the head chunk off so a read can see it; reads queue behind it.
-    pub(crate) fn dispatch(&self) {
-        dispatch(&mut self.state.borrow_mut());
+    /// An explicit dependency for reads of an active segment.
+    pub(crate) fn read_barrier(&self) -> impl Future<Output = io::Result<()>> + use<> {
+        let active = self
+            .active
+            .borrow()
+            .as_ref()
+            .map(|a| (a.file.clone(), a.file.positions().appended));
+        async move {
+            if let Some((file, end)) = active {
+                file.dispatch();
+                file.wait_written(end).await?;
+            }
+            Ok(())
+        }
     }
-
-    /// Bytes handed to the worker in the active file.
-    pub(crate) fn dispatched_bytes(&self) -> u64 {
-        let ws = self.state.borrow_mut();
-        ws.active.as_ref().map_or(0, |a| a.pos)
-    }
-
-    /// Stops appending to the active file: writes out the head, trims the
-    /// preallocated tail and submits a sync of both.
+    /// Capture a finish operation that drains, trims, and synchronizes the active segment.
+    /// Keep the active handle visible to read barriers until finishing succeeds.
     pub(crate) fn close(&self) -> Option<Closed> {
-        let mut ws = self.state.borrow_mut();
-        dispatch(&mut ws);
-        let active = ws.active.take()?;
-        ws.disk.set_len(&active.file, active.pos);
+        let (file, end) = {
+            let active = self.active.borrow();
+            let active = active.as_ref()?;
+            (active.file.clone(), active.end)
+        };
+        let active = self.active.clone();
+        let size = file.positions().appended;
+        let written = self.written.clone();
         Some(Closed {
-            sync: Box::pin(ws.disk.sync(&active.file)),
-            size: active.pos,
+            size,
+            sync: Box::pin(async move {
+                file.finish().await?;
+                written.fetch_max(end, Ordering::AcqRel);
+                active.borrow_mut().take();
+                Ok(())
+            }),
         })
-    }
-
-    /// Stops the idle timer.
-    pub(crate) fn shutdown(&self) {
-        let mut ws = self.state.borrow_mut();
-        ws.closed = true;
-        self.timer.notify_one();
-    }
-}
-
-impl Drop for Appender {
-    fn drop(&mut self) {
-        self.shutdown();
-    }
-}
-
-fn dispatch(ws: &mut WriteState) {
-    let Some(active) = &mut ws.active else {
-        return;
-    };
-    let Some(chunk) = active.head.take() else {
-        return;
-    };
-    let Chunk { buf, permit, end } = chunk;
-    let pos = active.pos;
-    active.pos += buf.len() as u64;
-    if let Some(end) = end {
-        active.dispatched = end;
-    }
-    let written = ws.written.clone();
-    ws.disk.write(&active.file, pos, buf, move |ok| {
-        drop(permit);
-        if let (true, Some(end)) = (ok, end) {
-            written.fetch_max(end, Ordering::AcqRel);
-        }
-    });
-}
-
-/// Writes out a head chunk that has sat unwritten for the idle timeout.
-async fn idle_timer(state: Weak<RefCell<WriteState>>, wake: Rc<Notify>, idle: Duration) {
-    loop {
-        wake.notified().await;
-        loop {
-            let deadline = {
-                let Some(state) = state.upgrade() else { return };
-                let mut ws = state.borrow_mut();
-                if ws.closed {
-                    return;
-                }
-                if ws.active.as_ref().is_none_or(|a| a.head.is_none()) {
-                    ws.timer_armed = false;
-                    break;
-                }
-                ws.last_append + idle
-            };
-            tokio::time::sleep_until(deadline).await;
-            let Some(state) = state.upgrade() else { return };
-            let mut ws = state.borrow_mut();
-            if ws.closed {
-                return;
-            }
-            if Instant::now() >= ws.last_append + idle {
-                dispatch(&mut ws);
-                ws.timer_armed = false;
-                break;
-            }
-        }
     }
 }

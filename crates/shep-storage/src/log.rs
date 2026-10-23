@@ -1,5 +1,5 @@
 //! A Raft group's log: a directory of segment files, after Redpanda's
-//! `disk_log_impl`.
+//! `io_log_impl`.
 //!
 //! ```text
 //! <base:020>-<term>.log     records, starting with index `base`, all of
@@ -10,14 +10,14 @@
 //! A segment holds one term, so the term of any entry comes from segment
 //! metadata. A new segment starts when the term changes, when the active one
 //! passes the size limit, and on the first append after opening: the
-//! segments found on disk are never appended to again, only truncated. That
+//! segments found on io are never appended to again, only truncated. That
 //! keeps a closed segment's `.index` (written when it is closed or
 //! truncated) trustworthy.
 //!
 //! Positions, each one past the last index it covers:
 //!
 //! - appended: buffered in memory, readable
-//! - written: handed to the OS
+//! - written: all record bytes have completed writing
 //! - flushed: `fdatasync`ed, so it survives a crash
 //!
 //! Durable state outside the directory lives in the core's [`KvStore`]: the
@@ -27,9 +27,7 @@
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
-use std::fs::{self, File};
 use std::ops::{Bound, RangeBounds};
-use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -42,24 +40,26 @@ use tokio::sync::watch;
 
 use crate::appender::{Appender, AppenderConfig};
 use crate::cache::Cache;
-use crate::disk::{self, Disk, DiskFile, WritePool};
 use crate::error::{Error, Result, corrupt};
 use crate::index::{self, INDEX_INTERVAL, SegmentMeta, SparseIndex};
+use crate::io::{File, StorageIo, WritePool};
 use crate::kvstore::{KeySpace, KvStore};
 use crate::record::{self, HEADER_LEN, Parsed, Record};
+use shep_smp_io::FileIo;
 
 /// The least and most a read asks of the disk at once; a record larger than
 /// the most is read whole.
 const READ_MIN: usize = 64 << 10;
 const READ_MAX: usize = 8 << 20;
 
+/// Per-log segment, write-behind, and read-cache policy; device budgets live in StorageIo.
 #[derive(Clone, Debug)]
 pub struct LogConfig {
-    /// Size past which the active segment is closed and a new one started.
+    /// Logical record bytes past which the active segment rolls to a new file.
     pub segment_size: u64,
-    /// How much a segment file grows at a time ahead of the data.
+    /// Byte increment reserved ahead of segment data; zero disables proactive reservation.
     pub prealloc_step: u64,
-    /// Size of a write-behind buffer, and so of most writes.
+    /// Write-behind chunk size in bytes, and so the size of most writes.
     pub chunk_size: usize,
     /// How long a partly filled buffer waits for more appends before it is
     /// written anyway.
@@ -87,16 +87,18 @@ pub struct Offsets {
     pub start: u64,
     /// Appended: the next index to append.
     pub next: u64,
-    /// Handed to the OS.
+    /// All records before this index have completed writing, without a durability guarantee.
     pub written: u64,
-    /// Synced to disk.
+    /// All records before this index are covered by a completed synchronization.
     pub flushed: u64,
 }
 
 /// A segment, for inspection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SegmentInfo {
+    /// First record index, also used in the segment filename.
     pub base: u64,
+    /// Raft term assigned to the segment's records.
     pub term: u64,
     /// One past the last index in it.
     pub end: u64,
@@ -105,37 +107,52 @@ pub struct SegmentInfo {
 }
 
 /// A Raft group's log. Cheap to clone; all clones share it. Not `Send`: it
-/// belongs to its core's thread and draws on that core's [`Disk`],
+/// belongs to its core's thread and draws on that core's [`StorageIo`],
 /// [`WritePool`] and [`KvStore`].
 ///
 /// Dropping the last clone without [`Log::close`] abandons whatever wasn't
 /// written yet, as a crash would.
 #[derive(Clone)]
 pub struct Log {
+    /// Shared local segment catalog, appender, and mutation lock.
     inner: Rc<Inner>,
 }
 
+/// Shared core-local log ownership; the mutation lock spans asynchronous file transitions.
 struct Inner {
+    /// Raft group ID used to namespace persistent log metadata.
     id: u64,
+    /// Directory containing this group's segment and index files.
     dir: PathBuf,
+    /// Per-log segment, buffering, and cache policy.
     config: LogConfig,
-    disk: Disk,
+    /// Core-local I/O services shared with other logs.
+    io: StorageIo,
+    /// Durable metadata store containing this log's retained-prefix boundary.
     kv: KvStore,
+    /// Translate active byte writes into complete-record progress.
     appender: Appender,
-    /// Shared with the disk worker, which advances it as writes complete.
+    /// Record watermark derived from the byte appender's contiguous prefix.
     written: Arc<AtomicU64>,
+    /// Publish exclusive durable record ends to flush subscribers.
     flushed_tx: watch::Sender<u64>,
     /// Serializes appends, truncations and closing.
     lock: tokio::sync::Mutex<()>,
+    /// Local logical catalog; the mutation lock protects transitions across awaits.
     state: RefCell<State>,
 }
 
+/// Logical record state and segment catalog; epochs invalidate reads/syncs across truncation.
 struct State {
+    /// First readable record index after prefix truncation.
     start: u64,
+    /// Next record index to append, including buffered records.
     next: u64,
+    /// Exclusive record end covered by a completed synchronization.
     flushed: u64,
     /// By base index. Only the last can be active.
     segments: BTreeMap<u64, Segment>,
+    /// Recent accepted records available without disk reads.
     cache: Cache,
     /// Bumped by truncations, so a read or sync that straddles one doesn't
     /// trust what it saw before.
@@ -145,19 +162,27 @@ struct State {
     truncating: bool,
     /// The sync that flushes wait on; at most one at a time.
     inflight: Option<InflightSync>,
+    /// Next flush ID used to apply shared completion at most once.
     next_sync_id: u64,
+    /// Reject new mutations after close begins.
     closed: bool,
 }
 
+/// An open data descriptor and its record range; only the final segment may accept appends.
 struct Segment {
+    /// First record index and segment filename key.
     base: u64,
+    /// Raft term shared by records in this segment.
     term: u64,
     /// One past the last index.
     end: u64,
     /// Bytes of records, including any still buffered.
     size: u64,
-    file: Arc<DiskFile>,
+    /// Scheduled data descriptor retained for reads and persistence operations.
+    file: File,
+    /// Sparse record-start offsets into this segment file.
     index: SparseIndex,
+    /// This final segment is still attached to the byte appender.
     active: bool,
 }
 
@@ -165,6 +190,7 @@ struct Segment {
 struct Truncating<'a>(&'a RefCell<State>);
 
 impl<'a> Truncating<'a> {
+    /// Block disk reads from observing a suffix truncation while its segment metadata changes.
     fn start(state: &'a RefCell<State>) -> Truncating<'a> {
         state.borrow_mut().truncating = true;
         Truncating(state)
@@ -177,21 +203,31 @@ impl Drop for Truncating<'_> {
     }
 }
 
+/// Coalesced flush completion for a record prefix within one truncation epoch.
 struct InflightSync {
+    /// Flush ID used to recognize completion already applied by another waiter.
     id: u64,
+    /// Shared persistence result awaited by concurrent flush callers.
     done: Shared<LocalBoxFuture<'static, Result<()>>>,
     /// One past the last index the sync makes durable.
     upto: u64,
+    /// Truncation generation captured when this flush started.
     epoch: u64,
 }
 
 /// A segment as recovery leaves it.
 struct Recovered {
+    /// First record index parsed from the segment filename.
     base: u64,
+    /// Raft term parsed from the filename and checked against records.
     term: u64,
+    /// Exclusive record end validated by metadata or sequential recovery scan.
     end: u64,
+    /// Validated logical data length in bytes.
     size: u64,
-    file: Arc<DiskFile>,
+    /// Recovered descriptor retained for the live segment catalog.
+    file: File,
+    /// Validated or rebuilt sparse record-start offsets.
     index: SparseIndex,
 }
 
@@ -203,6 +239,7 @@ fn index_path(dir: &Path, base: u64, term: u64) -> PathBuf {
     dir.join(format!("{base:020}-{term}.index"))
 }
 
+/// Extract a segment base and term only when the expected filename extension matches.
 fn parse_name(name: &str, ext: &str) -> Option<(u64, u64)> {
     let (base, term) = name.strip_suffix(ext)?.split_once('-')?;
     Some((base.parse().ok()?, term.parse().ok()?))
@@ -228,7 +265,7 @@ impl Log {
     /// to its last good record: a torn or corrupt tail there is what a crash
     /// leaves. Anywhere else it's an error.
     pub async fn open(
-        disk: &Disk,
+        io: &StorageIo,
         pool: &WritePool,
         kv: &KvStore,
         dir: impl Into<PathBuf>,
@@ -236,37 +273,30 @@ impl Log {
         config: LogConfig,
     ) -> Result<Log> {
         let dir = dir.into();
-        let counters = disk.counters();
-        let d = dir.clone();
-        let names = disk
-            .run(move || {
-                fs::create_dir_all(&d)?;
-                if let Some(parent) = d.parent() {
-                    disk::sync_dir(parent, &counters)?;
-                }
-                let mut logs = Vec::new();
-                let mut indexes = Vec::new();
-                for ent in fs::read_dir(&d)? {
-                    let name = ent?.file_name();
-                    let Some(name) = name.to_str() else { continue };
-                    if name.ends_with(".tmp") {
-                        disk::remove_optional(&d.join(name))?;
-                    } else if let Some(n) = parse_name(name, ".log") {
-                        logs.push(n);
-                    } else if let Some(n) = parse_name(name, ".index") {
-                        indexes.push(n);
-                    }
-                }
-                // An index whose segment is gone.
-                for &(b, t) in &indexes {
-                    if !logs.contains(&(b, t)) {
-                        disk::remove_optional(&index_path(&d, b, t))?;
-                    }
-                }
-                logs.sort();
-                Ok(logs)
-            })
-            .await?;
+        io.create_dir_all(&dir).await?;
+        if let Some(parent) = dir.parent() {
+            io.sync_dir(parent).await?;
+        }
+        let mut names = Vec::new();
+        let mut indexes = Vec::new();
+        for path in io.read_dir(&dir).await? {
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if name.ends_with(".tmp") {
+                io.remove(&path).await?;
+            } else if let Some(n) = parse_name(name, ".log") {
+                names.push(n);
+            } else if let Some(n) = parse_name(name, ".index") {
+                indexes.push(n);
+            }
+        }
+        for (base, term) in indexes {
+            if !names.contains(&(base, term)) {
+                io.remove(&index_path(&dir, base, term)).await?;
+            }
+        }
+        names.sort();
 
         let start = kv
             .get(KeySpace::STORAGE, &start_key(id))
@@ -283,12 +313,7 @@ impl Log {
             }
             let last = n + 1 == names.len();
             let trusted = !last || clean == Some(base);
-            let d = dir.clone();
-            let counters = disk.counters();
-            let rec = disk
-                .run(move || recover_segment(&d, base, term, trusted, last, &counters))
-                .await
-                .map_err(Error::from)?;
+            let rec = recover_segment(io, &dir, base, term, trusted, last).await?;
             let rec = match rec {
                 Ok(rec) => rec,
                 Err(reason) => return Err(corrupt(segment_path(&dir, base, term), reason)),
@@ -321,17 +346,13 @@ impl Log {
         let keep = segments.partition_point(|s| s.end <= start);
         doomed.extend(segments.drain(..keep));
         if !doomed.is_empty() {
-            let d = dir.clone();
-            let counters = disk.counters();
-            let doomed: Vec<_> = doomed.iter().map(|s| (s.base, s.term)).collect();
-            disk.run(move || {
-                for (b, t) in doomed {
-                    disk::remove_optional(&index_path(&d, b, t))?;
-                    disk::remove_optional(&segment_path(&d, b, t))?;
-                }
-                disk::sync_dir(&d, &counters)
-            })
-            .await?;
+            for segment in doomed {
+                io.remove(&index_path(&dir, segment.base, segment.term))
+                    .await?;
+                io.remove(&segment_path(&dir, segment.base, segment.term))
+                    .await?;
+            }
+            io.sync_dir(&dir).await?;
         }
         if let Some(first) = segments.first()
             && first.base > start
@@ -348,7 +369,6 @@ impl Log {
         let next = segments.last().map_or(start, |s| s.end).max(start);
         let written = Arc::new(AtomicU64::new(next));
         let appender = Appender::new(
-            disk.clone(),
             pool.clone(),
             AppenderConfig {
                 chunk_size: config.chunk_size,
@@ -376,7 +396,7 @@ impl Log {
             inner: Rc::new(Inner {
                 id,
                 dir,
-                disk: disk.clone(),
+                io: io.clone(),
                 kv: kv.clone(),
                 appender,
                 written,
@@ -399,15 +419,19 @@ impl Log {
         })
     }
 
+    /// Return the group identifier whose records this log stores.
     pub fn id(&self) -> u64 {
         self.inner.id
     }
 
+    /// Return the directory containing this log's segments and indexes.
     pub fn dir(&self) -> &Path {
         &self.inner.dir
     }
 
+    /// Snapshot record positions after translating completed byte writes into whole-record progress.
     pub fn offsets(&self) -> Offsets {
+        self.inner.appender.refresh_written();
         let st = self.inner.state.borrow();
         Offsets {
             start: st.start,
@@ -427,6 +451,7 @@ impl Log {
         self.inner.state.borrow().next
     }
 
+    /// Return the final readable record index, or `None` when the retained log is empty.
     pub fn last_index(&self) -> Option<u64> {
         let st = self.inner.state.borrow();
         (st.next > st.start).then(|| st.next - 1)
@@ -445,10 +470,12 @@ impl Log {
             .map(|(_, s)| s.term)
     }
 
+    /// Return the final readable record's term, or `None` for an empty log.
     pub fn last_term(&self) -> Option<u64> {
         self.term_at(self.last_index()?)
     }
 
+    /// Snapshot segment boundaries and logical sizes in base-index order.
     pub fn segments(&self) -> Vec<SegmentInfo> {
         let st = self.inner.state.borrow();
         st.segments
@@ -471,9 +498,19 @@ impl Log {
     /// Appends records, returning once they are buffered, not durable; see
     /// [`Log::flush`]. Indexes must continue from [`Log::next_index`] and
     /// terms must not go back. Waits if the core's write pool is exhausted.
+    /// Once polled, the transaction runs even if its waiting future is dropped;
+    /// cancellation cannot leave half a record in front of later appends.
     pub async fn append(&self, records: impl IntoIterator<Item = Record>) -> Result<()> {
-        let _guard = self.inner.lock.lock().await;
         let records: Vec<Record> = records.into_iter().collect();
+        let this = self.clone();
+        tokio::task::spawn_local(async move { this.append_inner(records).await })
+            .await
+            .map_err(|e| Error::from(std::io::Error::other(e)))?
+    }
+
+    /// Serialize validation, segment rolls, and complete framed-record appends as one transaction.
+    async fn append_inner(&self, records: Vec<Record>) -> Result<()> {
+        let _guard = self.inner.lock.lock().await;
         {
             let st = self.inner.state.borrow();
             if st.closed {
@@ -514,7 +551,7 @@ impl Log {
             self.inner
                 .appender
                 .write(&r.header(), &r.payload, r.index)
-                .await;
+                .await?;
             let mut st = self.inner.state.borrow_mut();
             let seg = st.segments.values_mut().next_back().unwrap();
             seg.index.maybe_add(r.index, seg.size);
@@ -538,6 +575,7 @@ impl Log {
         async move { this.flush_to(target).await }
     }
 
+    /// Wait for a record prefix to become durable, sharing active segment syncs and close operations.
     async fn flush_to(&self, target: u64) -> Result<()> {
         loop {
             let (id, done) = {
@@ -566,6 +604,7 @@ impl Log {
         }
     }
 
+    /// Share a sync with its record limit and truncation epoch so stale completions cannot advance durability.
     fn set_inflight(
         &self,
         st: &mut State,
@@ -619,7 +658,7 @@ impl Log {
             let mut out: Vec<Record> = Vec::new();
             let mut bytes = 0;
             let mut lo = lo;
-            // Where the last disk read left off: (segment, index, position).
+            // Where the last io read left off: (segment, index, position).
             let mut cursor: Option<(u64, u64, u64)> = None;
             let full = |out: &Vec<Record>, bytes: usize| !out.is_empty() && bytes >= max_bytes;
             loop {
@@ -628,7 +667,7 @@ impl Log {
                     drop(self.inner.lock.lock().await);
                     continue 'restart;
                 }
-                let (seg_base, file, mut pos, mut index, size, hi, epoch) = {
+                let (seg_base, file, mut pos, mut index, size, hi, epoch, barrier) = {
                     let st = self.inner.state.borrow();
                     if st.closed {
                         return Err(Error::Closed);
@@ -656,11 +695,6 @@ impl Log {
                         Some((b, i, p)) if b == seg.base && i <= lo => (i, p),
                         _ => seg.index.nearest(lo).unwrap_or((seg.base, 0)),
                     };
-                    if seg.active && seg.size > self.inner.appender.dispatched_bytes() {
-                        // Hand the buffered tail to the worker; the read
-                        // queues behind it.
-                        self.inner.appender.dispatch();
-                    }
                     (
                         seg.base,
                         seg.file.clone(),
@@ -669,18 +703,22 @@ impl Log {
                         seg.size,
                         hi,
                         st.epoch,
+                        seg.active.then(|| self.inner.appender.read_barrier()),
                     )
                 };
+                if let Some(barrier) = barrier {
+                    barrier.await?;
+                }
                 let want = max_bytes.saturating_sub(bytes).clamp(READ_MIN, READ_MAX);
                 let mut len = ((lo - index) as usize * HEADER_LEN + INDEX_INTERVAL as usize + want)
                     .min((size - pos) as usize);
                 let progressed = loop {
-                    let buf = self.inner.disk.read_at(&file, pos, len).await?;
+                    let buf = self.inner.io.read_at(&file, pos, len).await?;
                     if self.inner.state.borrow().epoch != epoch {
                         continue 'restart;
                     }
                     if buf.len() < len {
-                        return Err(corrupt(&file.path, "segment shorter than its records"));
+                        return Err(corrupt(file.path(), "segment shorter than its records"));
                     }
                     let mut off = 0;
                     let mut progressed = false;
@@ -689,7 +727,7 @@ impl Log {
                             Parsed::Record(r, n) => {
                                 if r.index != index {
                                     return Err(corrupt(
-                                        &file.path,
+                                        file.path(),
                                         format!("found index {} where {index} belongs", r.index),
                                     ));
                                 }
@@ -704,7 +742,7 @@ impl Log {
                             Parsed::Short(need) if !progressed => {
                                 if need > (size - pos) as usize {
                                     return Err(corrupt(
-                                        &file.path,
+                                        file.path(),
                                         "record runs past the segment",
                                     ));
                                 }
@@ -712,8 +750,8 @@ impl Log {
                                 break;
                             }
                             Parsed::Short(_) => break,
-                            Parsed::End => return Err(corrupt(&file.path, "log ends early")),
-                            Parsed::Corrupt(e) => return Err(corrupt(&file.path, e)),
+                            Parsed::End => return Err(corrupt(file.path(), "log ends early")),
+                            Parsed::Corrupt(e) => return Err(corrupt(file.path(), e)),
                         }
                     }
                     pos += off as u64;
@@ -722,7 +760,7 @@ impl Log {
                     }
                 };
                 if !progressed && index < hi {
-                    return Err(corrupt(&file.path, "no records where some belong"));
+                    return Err(corrupt(file.path(), "no records where some belong"));
                 }
                 lo = lo.max(index);
                 cursor = (pos < size).then_some((seg_base, index, pos));
@@ -734,6 +772,14 @@ impl Log {
     /// follower's log conflicts with its leader's. Later segments are deleted
     /// first, so a crash part-way leaves a longer log, never one with a gap.
     pub async fn truncate_suffix(&self, from: u64) -> Result<()> {
+        let this = self.clone();
+        tokio::task::spawn_local(async move { this.truncate_suffix_inner(from).await })
+            .await
+            .map_err(|e| Error::from(std::io::Error::other(e)))?
+    }
+
+    /// Serialize suffix removal and file truncation, invalidating reads and old flush epochs.
+    async fn truncate_suffix_inner(&self, from: u64) -> Result<()> {
         let _guard = self.inner.lock.lock().await;
         {
             let st = self.inner.state.borrow();
@@ -786,24 +832,24 @@ impl Log {
         };
         if let Some((base, term, file, nearest)) = cut {
             let (i, p) = nearest.unwrap_or((base, 0));
-            let counters = self.inner.disk.counters();
-            let f = file.clone();
-            let scan = self
-                .inner
-                .disk
-                .run(move || {
-                    let scan =
-                        index::scan(&f.file, p, i, term, Some(from), &mut SparseIndex::default())?;
-                    if scan.last.map_or(i, |l| l + 1) == from {
-                        f.file.set_len(scan.end)?;
-                        disk::sync_file(&f, &counters)?;
-                    }
-                    Ok(scan)
-                })
-                .await?;
+            let scan = index::scan(
+                &self.inner.io,
+                &file,
+                p,
+                i,
+                term,
+                Some(from),
+                &mut SparseIndex::default(),
+            )
+            .await?;
+            if scan.last.map_or(i, |last| last + 1) == from {
+                file.set_len(scan.end).await?;
+                file.sync_data().await?;
+            }
+
             if scan.last.map_or(i, |l| l + 1) != from {
                 return Err(corrupt(
-                    &file.path,
+                    file.path(),
                     format!("can't find {from} to truncate at"),
                 ));
             }
@@ -833,6 +879,14 @@ impl Log {
     /// past the end empties the log, and the next append must be at
     /// `new_start`.
     pub async fn truncate_prefix(&self, new_start: u64) -> Result<()> {
+        let this = self.clone();
+        tokio::task::spawn_local(async move { this.truncate_prefix_inner(new_start).await })
+            .await
+            .map_err(|e| Error::from(std::io::Error::other(e)))?
+    }
+
+    /// Persist the new readable start before deleting obsolete segments under log exclusion.
+    async fn truncate_prefix_inner(&self, new_start: u64) -> Result<()> {
         let _guard = self.inner.lock.lock().await;
         let (start, next) = {
             let st = self.inner.state.borrow();
@@ -893,6 +947,14 @@ impl Log {
     /// Writes out and syncs everything, and marks the log clean so the next
     /// open needn't rescan it. Later calls fail with [`Error::Closed`].
     pub async fn close(&self) -> Result<()> {
+        let this = self.clone();
+        tokio::task::spawn_local(async move { this.close_inner().await })
+            .await
+            .map_err(|e| Error::from(std::io::Error::other(e)))?
+    }
+
+    /// Serialize final segment persistence before recording the clean-recovery marker.
+    async fn close_inner(&self) -> Result<()> {
         let _guard = self.inner.lock.lock().await;
         if self.inner.state.borrow().closed {
             return Ok(());
@@ -917,10 +979,10 @@ impl Log {
             None => self.clear_clean_marker().await?,
         }
         self.inner.state.borrow_mut().closed = true;
-        self.inner.appender.shutdown();
         Ok(())
     }
 
+    /// Durably revoke trusted-index recovery before operations can make segment metadata stale.
     async fn clear_clean_marker(&self) -> Result<()> {
         let key = clean_key(self.inner.id);
         if self.inner.kv.get(KeySpace::STORAGE, &key).is_some() {
@@ -933,9 +995,9 @@ impl Log {
     async fn roll(&self, base: u64, term: u64) -> Result<()> {
         self.close_active().await?;
         let path = segment_path(&self.inner.dir, base, term);
-        let file = self.inner.disk.open(path, true).await?;
-        self.inner.disk.sync_dir(&self.inner.dir).await?;
-        self.inner.appender.activate(file.clone(), base);
+        let file = self.inner.io.open_data(path, true).await?;
+        self.inner.io.sync_dir(&self.inner.dir).await?;
+        self.inner.appender.activate(file.clone(), base).await?;
         self.inner.state.borrow_mut().segments.insert(
             base,
             Segment {
@@ -1001,37 +1063,25 @@ impl Log {
         }
     }
 
+    /// Persist checksummed metadata for a closed segment; clean-marker ordering governs trust on reopen.
     async fn write_index(&self, meta: SegmentMeta) -> Result<()> {
         let path = index_path(&self.inner.dir, meta.base, meta.term);
-        let counters = self.inner.disk.counters();
-        self.inner
-            .disk
-            .run(move || {
-                // No rename: the checksum and recorded size catch a torn or
-                // stale index, which is then rebuilt by scanning.
-                let file = File::create(&path)?;
-                file.write_all_at(&meta.encode(), 0)?;
-                disk::fdatasync(&file, &counters)
-            })
-            .await?;
+        // Checksums and recorded length detect torn or stale index files.
+        self.inner.io.write_file(&path, &meta.encode()).await?;
         Ok(())
     }
 
+    /// Remove both index and data, then persist their directory removals.
     async fn remove_segment(&self, base: u64, term: u64) -> Result<()> {
-        let dir = self.inner.dir.clone();
-        let counters = self.inner.disk.counters();
-        self.inner
-            .disk
-            .run(move || {
-                disk::remove_optional(&index_path(&dir, base, term))?;
-                disk::remove_optional(&segment_path(&dir, base, term))?;
-                disk::sync_dir(&dir, &counters)
-            })
-            .await?;
+        let dir = &self.inner.dir;
+        self.inner.io.remove(&index_path(dir, base, term)).await?;
+        self.inner.io.remove(&segment_path(dir, base, term)).await?;
+        self.inner.io.sync_dir(dir).await?;
         Ok(())
     }
 }
 
+/// Snapshot a nonempty segment's logical end and sparse offsets for its persisted index.
 fn seg_meta(seg: &Segment) -> SegmentMeta {
     SegmentMeta {
         base: seg.base,
@@ -1042,22 +1092,25 @@ fn seg_meta(seg: &Segment) -> SegmentMeta {
     }
 }
 
-/// Recovers one segment on the disk worker. The outer error is I/O; the
+/// Recovers one segment through asynchronous, scheduled reads. The outer error is I/O; the
 /// inner one is corruption recovery can't repair.
-fn recover_segment(
+async fn recover_segment(
+    io: &StorageIo,
     dir: &Path,
     base: u64,
     term: u64,
     trusted: bool,
     last: bool,
-    counters: &disk::Counters,
 ) -> std::io::Result<std::result::Result<Recovered, String>> {
     let path = segment_path(dir, base, term);
-    let file = File::options().read(true).write(true).open(&path)?;
-    let file_len = file.metadata()?.len();
+    let file = io.open_data(path.clone(), false).await?;
+    let file_len = file.len().await?;
     let ipath = index_path(dir, base, term);
     if trusted
-        && let Some(meta) = disk::read_optional(&ipath)?.and_then(|b| SegmentMeta::decode(&b))
+        && let Some(meta) = io
+            .read_optional(&ipath)
+            .await?
+            .and_then(|b| SegmentMeta::decode(&b))
         && meta.base == base
         && meta.term == term
         && meta.size == file_len
@@ -1067,12 +1120,12 @@ fn recover_segment(
             term,
             end: meta.last + 1,
             size: meta.size,
-            file: Arc::new(DiskFile::new(file, path)),
+            file,
             index: meta.index,
         }));
     }
     let mut sparse = SparseIndex::default();
-    let scan = index::scan(&file, 0, base, term, None, &mut sparse)?;
+    let scan = index::scan(io, &file, 0, base, term, None, &mut sparse).await?;
     if !last {
         if scan.end != file_len {
             return Ok(Err(format!(
@@ -1095,10 +1148,10 @@ fn recover_segment(
                 "truncating the log's torn tail"
             );
         }
-        file.set_len(scan.end)?;
+        file.set_len(scan.end).await?;
     }
     // What a crashed process left may still be only in the page cache.
-    disk::fdatasync(&file, counters)?;
+    file.sync_data().await?;
     if let Some(l) = scan.last {
         let meta = SegmentMeta {
             base,
@@ -1107,16 +1160,14 @@ fn recover_segment(
             size: scan.end,
             index: sparse.clone(),
         };
-        let f = File::create(&ipath)?;
-        f.write_all_at(&meta.encode(), 0)?;
-        disk::fdatasync(&f, counters)?;
+        io.write_file(&ipath, &meta.encode()).await?;
     }
     Ok(Ok(Recovered {
         base,
         term,
         end: scan.last.map_or(base, |l| l + 1),
         size: scan.end,
-        file: Arc::new(DiskFile::new(file, path)),
+        file,
         index: sparse,
     }))
 }

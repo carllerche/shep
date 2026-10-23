@@ -1,0 +1,17 @@
+[package]
+name = "shep-append"
+description = "Bounded write-behind byte appending and explicit persistence positions"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+[lints]
+workspace = true
+[dependencies]
+shep-smp-io.workspace = true
+tokio.workspace = true
+[dev-dependencies]
+libc.workspace = true
+shep-smp-io-scheduler.workspace = true
+shep-futures.workspace = true
+tempfile.workspace = true

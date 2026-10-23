@@ -5,7 +5,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use shep_storage::{
-    Disk, HEADER_LEN, KvConfig, KvStore, Log, LogConfig, Offsets, Record, SegmentInfo, WritePool,
+    HEADER_LEN, KvConfig, KvStore, Log, LogConfig, Offsets, Record, SegmentInfo, StorageIo,
+    WritePool,
 };
 use tempfile::TempDir;
 
@@ -14,7 +15,7 @@ pub const LOG_ID: u64 = 1;
 /// One core's storage in a temporary directory, on the real disk.
 pub struct Env {
     pub tmp: TempDir,
-    pub disk: Disk,
+    pub io: StorageIo,
     pub pool: WritePool,
     pub kv: KvStore,
     pub kv_config: KvConfig,
@@ -26,18 +27,22 @@ impl Env {
     }
 
     pub async fn with_pool(pool_bytes: usize) -> Env {
+        Self::with_mode(pool_bytes, false).await
+    }
+
+    pub async fn with_mode(pool_bytes: usize, direct: bool) -> Env {
         let tmp = tempfile::tempdir().unwrap();
-        let disk = Disk::new().unwrap();
+        let io = StorageIo::with_config(Default::default(), Default::default(), direct).unwrap();
         let kv_config = KvConfig {
             commit_interval: Duration::ZERO,
             ..KvConfig::default()
         };
-        let kv = KvStore::open(&disk, tmp.path().join("kvstore"), kv_config.clone())
+        let kv = KvStore::open(&io, tmp.path().join("kvstore"), kv_config.clone())
             .await
             .unwrap();
         Env {
             tmp,
-            disk,
+            io,
             pool: WritePool::new(pool_bytes),
             kv,
             kv_config,
@@ -50,7 +55,7 @@ impl Env {
 
     pub async fn try_open(&self, config: LogConfig) -> shep_storage::Result<Log> {
         Log::open(
-            &self.disk,
+            &self.io,
             &self.pool,
             &self.kv,
             self.log_dir(),
@@ -64,10 +69,10 @@ impl Env {
         self.try_open(config).await.unwrap()
     }
 
-    /// Reopens the key-value store from disk, as a restarted process would.
+    /// Reopens the key-value store from io, as a restarted process would.
     pub async fn restart_kv(&mut self) {
         self.kv = KvStore::open(
-            &self.disk,
+            &self.io,
             self.tmp.path().join("kvstore"),
             self.kv_config.clone(),
         )
@@ -78,6 +83,8 @@ impl Env {
     /// Drops `log` without closing it, as a crash would, then reopens it.
     pub async fn crash(&mut self, log: Log, config: LogConfig) -> Log {
         drop(log);
+        self.pool.drain().await;
+        self.io.drain().await.unwrap();
         self.restart_kv().await;
         self.open(config).await
     }
@@ -85,6 +92,8 @@ impl Env {
     pub async fn reopen(&mut self, log: Log, config: LogConfig) -> Log {
         log.close().await.unwrap();
         drop(log);
+        self.pool.drain().await;
+        self.io.drain().await.unwrap();
         self.restart_kv().await;
         self.open(config).await
     }

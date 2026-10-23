@@ -1226,7 +1226,7 @@ impl<M: Machine> Core<M> {
         let storage = self.storage();
         let dir = self.config.data_dir.join("logs").join(group.0.to_string());
         let log = Log::open(
-            storage.disk(),
+            storage.io(),
             storage.pool(),
             storage.kvstore(),
             dir,
@@ -1276,6 +1276,9 @@ impl<M: Machine> Core<M> {
             if let Err(e) = g.log.close().await {
                 tracing::warn!(core = %self.id, "closing a log: {e}");
             }
+        }
+        if let Err(e) = self.storage().shutdown().await {
+            tracing::warn!(core = %self.id, "draining storage I/O: {e}");
         }
     }
 

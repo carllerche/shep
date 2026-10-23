@@ -232,16 +232,16 @@ async fn concurrent_flushes_share_one_sync() {
     let env = Env::new().await;
     let log = env.open(LogConfig::default()).await;
     log.append(recs(0..100, 1)).await.unwrap();
-    let before = env.disk.stats().fsyncs;
+    let before = env.io.stats().fsyncs;
     let results = join_all((0..50).map(|_| log.flush())).await;
     assert!(results.iter().all(|r| r.is_ok()));
-    assert_eq!(env.disk.stats().fsyncs - before, 1);
+    assert_eq!(env.io.stats().fsyncs - before, 1);
     assert_eq!(log.offsets().flushed, 100);
     assert_eq!(log.offsets().written, 100);
 
     // Nothing new: no sync at all.
     log.flush().await.unwrap();
-    assert_eq!(env.disk.stats().fsyncs - before, 1);
+    assert_eq!(env.io.stats().fsyncs - before, 1);
 }
 
 #[tokio::test(flavor = "local")]
@@ -249,7 +249,7 @@ async fn flush_after_a_sync_starts_waits_for_another() {
     let env = Env::new().await;
     let log = env.open(LogConfig::default()).await;
     log.append(recs(0..10, 1)).await.unwrap();
-    let before = env.disk.stats().fsyncs;
+    let before = env.io.stats().fsyncs;
     let mut first = std::pin::pin!(log.flush());
     // Start the first sync.
     assert!(shep_futures::poll!(first.as_mut()).is_pending());
@@ -261,7 +261,7 @@ async fn flush_after_a_sync_starts_waits_for_another() {
     b.unwrap();
     c.unwrap();
     // One sync for the first flush, one shared by the other two.
-    assert_eq!(env.disk.stats().fsyncs - before, 2);
+    assert_eq!(env.io.stats().fsyncs - before, 2);
     assert_eq!(log.offsets().flushed, 20);
 }
 
@@ -290,14 +290,14 @@ async fn idle_buffers_are_written_without_syncing() {
     };
     let log = env.open(config).await;
     log.append(recs(0..3, 1)).await.unwrap();
-    let before = env.disk.stats();
+    let before = env.io.stats();
     assert_eq!(log.offsets().written, 0);
     tokio::time::sleep(Duration::from_millis(300)).await;
     let o = log.offsets();
     assert_eq!(o.written, 3);
     assert_eq!(o.flushed, 0);
-    assert_eq!(env.disk.stats().fsyncs, before.fsyncs);
-    assert!(env.disk.stats().writes > before.writes);
+    assert_eq!(env.io.stats().fsyncs, before.fsyncs);
+    assert!(env.io.stats().writes > before.writes);
 }
 
 #[tokio::test(flavor = "local")]
@@ -306,8 +306,9 @@ async fn full_chunks_are_written_without_flushing() {
     let log = env.open(small()).await;
     // Ten records span two 512-byte chunks.
     log.append(recs(0..10, 1)).await.unwrap();
-    // Let the worker finish the full chunk's write.
-    env.disk.run(|| Ok(())).await.unwrap();
+    // Wait for dispatched chunks without dispatching the partial head.
+    env.pool.drain().await;
+    env.io.drain().await.unwrap();
     let o = log.offsets();
     assert!(o.written > 0 && o.written < 10, "{o:?}");
     assert_eq!(o.flushed, 0);
@@ -398,9 +399,9 @@ async fn clean_close_skips_rescanning_the_last_segment() {
     let path = env.segment_files().last().unwrap().clone();
     let len = file_len(&path);
     flip(&path, len - 1);
-    let before = env.disk.stats().fsyncs;
+    let before = env.io.stats().fsyncs;
     let log = env.open(small()).await;
-    assert_eq!(env.disk.stats().fsyncs, before, "no rescan, no repair");
+    assert_eq!(env.io.stats().fsyncs, before, "no rescan, no repair");
     assert_eq!(log.next_index(), 30);
     assert_eq!(log.segments().last().unwrap().base, last);
     assert!(matches!(
@@ -412,9 +413,9 @@ async fn clean_close_skips_rescanning_the_last_segment() {
     // A truncation clears the marker first, so after a crash the same
     // segment is rescanned.
     log.truncate_suffix(29).await.unwrap();
-    let before = env.disk.stats().fsyncs;
+    let before = env.io.stats().fsyncs;
     let log = env.crash(log, small()).await;
-    assert!(env.disk.stats().fsyncs > before);
+    assert!(env.io.stats().fsyncs > before);
     assert_eq!(read_all(&log).await, recs(0..29, 1));
 }
 
@@ -424,10 +425,10 @@ async fn crash_without_close_rescans() {
     let log = env.open(small()).await;
     log.append(recs(0..30, 1)).await.unwrap();
     log.flush().await.unwrap();
-    let before = env.disk.stats().fsyncs;
+    let before = env.io.stats().fsyncs;
     let log = env.crash(log, small()).await;
     // The rescan syncs what it recovered and writes its index.
-    assert!(env.disk.stats().fsyncs > before);
+    assert!(env.io.stats().fsyncs > before);
     assert_eq!(read_all(&log).await, recs(0..30, 1));
 }
 
@@ -454,4 +455,53 @@ async fn per_core_storage_bundle() {
     assert_eq!(read_all(&a).await, recs(1..3, 1));
     assert_eq!(read_all(&b).await, recs(0..5, 7));
     assert!(storage.log_dir(1).exists());
+}
+
+#[tokio::test(flavor = "local")]
+async fn canceled_append_waiters_do_not_leave_partial_records() {
+    let env = Env::with_pool(1024).await;
+    let log = env.open(small()).await;
+    let record = shep_storage::Record::new(0, 1, 0, vec![7; 10000]);
+    {
+        let mut append = std::pin::pin!(log.append([record.clone()]));
+        assert!(shep_futures::poll!(&mut append).is_pending());
+    }
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while log.next_index() != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    log.append([rec(1, 1)]).await.unwrap();
+    log.flush().await.unwrap();
+    assert_eq!(read_all(&log).await, vec![record, rec(1, 1)]);
+}
+
+#[tokio::test(flavor = "local")]
+async fn canceled_truncation_waiters_finish_the_metadata_transaction() {
+    let env = Env::new().await;
+    let log = env.open(small()).await;
+    log.append(recs(0..100, 1)).await.unwrap();
+    log.flush().await.unwrap();
+    {
+        let mut truncate = std::pin::pin!(log.truncate_suffix(10));
+        assert!(shep_futures::poll!(&mut truncate).is_pending());
+    }
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while log.next_index() != 10 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    log.append(recs(10..20, 2)).await.unwrap();
+    log.flush().await.unwrap();
+    assert_eq!(
+        read_all(&log).await,
+        recs(0..10, 1)
+            .into_iter()
+            .chain(recs(10..20, 2))
+            .collect::<Vec<_>>()
+    );
 }

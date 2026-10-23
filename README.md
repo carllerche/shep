@@ -19,6 +19,9 @@ replicates.
 | `crates/shep-rpc-server` | Serving it: concurrent handlers, routing on the header and metadata before the body is read |
 | `crates/shep-rpc-client` | Calling it: pipelined calls over one connection, reconnect with backoff, a connection cache |
 | `crates/shep-smp` | Thread-per-core: a `LocalRuntime` per core, each with its own state, reached with `submit_to` |
+| `crates/shep-smp-io` | Core-local io_uring files, owned aligned buffers, and explicit I/O lifetime management |
+| `crates/shep-smp-io-scheduler` | Weighted admission with shared physical-device capacity and per-class metrics |
+| `crates/shep-append` | Format-independent buffered append files with explicit written and durable positions |
 | `crates/shep-storage` | Per-core storage, after Redpanda's: segmented logs with coalesced fsync and crash recovery, and a key-value store |
 | `crates/shep-raft-engine` | openraft 0.10.0-alpha.37, forked (see its `FORK.md`), with its test suite |
 | `crates/shep-raft-memstore` | openraft's test-support store, vendored |
@@ -64,3 +67,5 @@ shep-node --id 1 --listen 10.0.0.1:7000 --data-dir /var/lib/shep \
   feature table, cluster identity checks on connect, lightweight heartbeats,
   follower-admitted recovery, moving replicas between cores, then the
   materializer.
+
+Storage I/O architecture, lifecycle, and benchmark commands: [docs/io.md](docs/io.md).

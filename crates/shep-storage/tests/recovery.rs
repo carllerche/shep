@@ -20,7 +20,8 @@ async fn crashed_log(env: &mut Env, n: u64) -> Vec<PathBuf> {
     log.flush().await.unwrap();
     assert_eq!(log.segments()[0].end, PER_SEGMENT.min(n));
     drop(log);
-    env.disk.run(|| Ok(())).await.unwrap();
+    env.pool.drain().await;
+    env.io.drain().await.unwrap();
     env.segment_files()
 }
 

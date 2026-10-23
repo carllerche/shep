@@ -16,9 +16,9 @@
 //! `size` is the segment file's length when the index was written; an index
 //! whose size doesn't match the file is stale and is rebuilt by scanning.
 
-use std::fs::File;
+use crate::io::{File, StorageIo};
+use shep_smp_io::FileIo;
 use std::io;
-use std::os::unix::fs::FileExt;
 
 use crate::record::{self, HEADER_LEN};
 
@@ -31,9 +31,10 @@ const VERSION: u32 = 1;
 /// Bytes read per I/O while scanning.
 const SCAN_BLOCK: usize = 1 << 20;
 
+/// Sparse record-to-byte offsets used to bound the scan needed for a point lookup.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct SparseIndex {
-    /// `(index, position)`, both increasing.
+    /// `(record index, byte offset)` pairs, both increasing.
     entries: Vec<(u64, u64)>,
 }
 
@@ -65,14 +66,20 @@ impl SparseIndex {
 /// What an `.index` file records about a closed segment.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SegmentMeta {
+    /// First record index, also encoded in the segment filename.
     pub base: u64,
+    /// Raft term encoded in the segment filename and validated during recovery.
     pub term: u64,
+    /// Inclusive last record index in this closed segment.
     pub last: u64,
+    /// Logical data length in bytes, excluding padding and preallocation.
     pub size: u64,
+    /// Sparse record-start offsets used to accelerate later reads.
     pub index: SparseIndex,
 }
 
 impl SegmentMeta {
+    /// Encode closed-segment metadata and sparse offsets with a checksum for torn-write detection.
     pub(crate) fn encode(&self) -> Vec<u8> {
         let mut b = Vec::with_capacity(48 + self.index.entries.len() * 16);
         b.extend_from_slice(MAGIC);
@@ -116,23 +123,28 @@ impl SegmentMeta {
     }
 }
 
+/// Borrowed decoding cursor shared by index and KV formats; short input returns None.
 pub(crate) struct Reader<'a>(pub &'a [u8]);
 
 impl<'a> Reader<'a> {
+    /// Consume an exact byte slice, leaving the cursor unchanged if the input is short.
     pub(crate) fn take(&mut self, n: usize) -> Option<&'a [u8]> {
         let (a, b) = self.0.split_at_checked(n)?;
         self.0 = b;
         Some(a)
     }
 
+    /// Consume one byte, or report truncated input.
     pub(crate) fn u8(&mut self) -> Option<u8> {
         Some(self.take(1)?[0])
     }
 
+    /// Consume a little-endian 32-bit integer, or report truncated input.
     pub(crate) fn u32(&mut self) -> Option<u32> {
         Some(u32::from_le_bytes(self.take(4)?.try_into().ok()?))
     }
 
+    /// Consume a little-endian 64-bit integer, or report truncated input.
     pub(crate) fn u64(&mut self) -> Option<u64> {
         Some(u64::from_le_bytes(self.take(8)?.try_into().ok()?))
     }
@@ -152,9 +164,9 @@ pub(crate) struct Scan {
 /// Scans records from `pos`, where record `index` should start, checking
 /// checksums and that indexes count up by one in `term`. Stops at the first
 /// bad record, at an all-zero header, at the end of the file, or before
-/// record `until`. Adds entries to `sparse` along the way. Runs on the disk
-/// worker.
-pub(crate) fn scan(
+/// record `until`. Adds entries to `sparse` along the way.
+pub(crate) async fn scan(
+    io: &StorageIo,
     file: &File,
     mut pos: u64,
     mut index: u64,
@@ -162,9 +174,10 @@ pub(crate) fn scan(
     until: Option<u64>,
     sparse: &mut SparseIndex,
 ) -> io::Result<Scan> {
-    let file_len = file.metadata()?.len();
+    let file_len = file.len().await?;
     let mut buf = Buffered {
         file,
+        io,
         file_len,
         buf: Vec::new(),
         at: pos,
@@ -174,7 +187,7 @@ pub(crate) fn scan(
         if until == Some(index) {
             break None;
         }
-        let Some(h) = buf.get(pos, HEADER_LEN)? else {
+        let Some(h) = buf.get(pos, HEADER_LEN).await? else {
             break (pos < file_len).then_some("short header");
         };
         let h = match record::parse_header(h) {
@@ -189,7 +202,7 @@ pub(crate) fn scan(
             break Some("term differs from the segment's");
         }
         let len = h.record_len();
-        let Some(rec) = buf.get(pos, len)? else {
+        let Some(rec) = buf.get(pos, len).await? else {
             break Some("short payload");
         };
         if crc32c::crc32c(&rec[HEADER_LEN..]) != h.payload_crc {
@@ -209,8 +222,13 @@ pub(crate) fn scan(
 
 /// Sequential reads through a file in large blocks.
 struct Buffered<'a> {
+    /// Borrowed descriptor being scanned.
     file: &'a File,
+    /// Core-local service used for lower-share recovery reads.
+    io: &'a StorageIo,
+    /// Byte boundary beyond which this scan must not read.
     file_len: u64,
+    /// Most recently fetched contiguous block of file bytes.
     buf: Vec<u8>,
     /// File position of `buf[0]`.
     at: u64,
@@ -218,15 +236,17 @@ struct Buffered<'a> {
 
 impl Buffered<'_> {
     /// The `len` bytes at `pos`, or `None` if the file ends first.
-    fn get(&mut self, pos: u64, len: usize) -> io::Result<Option<&[u8]>> {
+    async fn get(&mut self, pos: u64, len: usize) -> io::Result<Option<&[u8]>> {
         if pos + len as u64 > self.file_len {
             return Ok(None);
         }
         let end = self.at + self.buf.len() as u64;
         if pos < self.at || pos + len as u64 > end {
             let want = (len.max(SCAN_BLOCK) as u64).min(self.file_len - pos) as usize;
-            self.buf.resize(want, 0);
-            self.file.read_exact_at(&mut self.buf, pos)?;
+            self.buf = self.io.read_recovery(self.file, pos, want).await?;
+            if self.buf.len() < len {
+                return Ok(None);
+            }
             self.at = pos;
         }
         let off = (pos - self.at) as usize;

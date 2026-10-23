@@ -10,6 +10,9 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+shep-smp-io.workspace = true
+shep-smp-io-scheduler.workspace = true
+shep-append.workspace = true
 crc32c.workspace = true
 shep-futures.workspace = true
 thiserror.workspace = true

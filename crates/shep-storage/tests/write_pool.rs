@@ -1,22 +1,7 @@
-//! Backpressure from the per-core write buffer pool.
-
+//! Backpressure and pressure-triggered writeback from the shared buffer pool.
 mod util;
-
-use std::sync::mpsc;
-use std::time::Duration;
-
 use shep_storage::LogConfig;
 use util::*;
-
-/// Stalls the disk worker until the returned sender is used or dropped.
-fn stall(env: &Env) -> mpsc::Sender<()> {
-    let (tx, rx) = mpsc::channel::<()>();
-    drop(env.disk.run(move || {
-        let _ = rx.recv();
-        Ok(())
-    }));
-    tx
-}
 
 fn config() -> LogConfig {
     LogConfig {
@@ -25,31 +10,18 @@ fn config() -> LogConfig {
     }
 }
 
-// Adapted from segment_appender_test.cc's chunk-cache exhaustion and
-// storage_resources.cc's write-buffer accounting.
 #[tokio::test(flavor = "local")]
-async fn appends_wait_for_pool_space() {
+async fn large_appends_stay_within_the_pool_budget() {
     let env = Env::with_pool(2048).await;
     let log = env.open(config()).await;
-    assert_eq!(env.pool.available(), 2048);
-    // The first append creates the segment, which needs the worker.
     log.append([rec(0, 1)]).await.unwrap();
-    let unstall = stall(&env);
-
-    // Two chunks' worth fills the pool; the writes can't complete.
     let mut append = std::pin::pin!(log.append(recs(1..30, 1)));
-    tokio::select! {
-        _ = &mut append => panic!("append should wait for buffer space"),
-        _ = tokio::time::sleep(Duration::from_millis(100)) => {}
-    }
-    assert_eq!(env.pool.available(), 0);
-    assert!(log.next_index() > 1 && log.next_index() < 30);
-
-    drop(unstall);
+    // Accept the transaction, which then proceeds under the shared budget.
+    assert!(shep_futures::poll!(&mut append).is_pending());
     append.await.unwrap();
-    assert_eq!(log.next_index(), 30);
     log.flush().await.unwrap();
-    assert_eq!(env.pool.available(), 2048, "buffers go back once written");
+    assert_eq!(env.pool.available(), 2048);
+    assert!(env.pool.allocated() <= 2048);
     assert_eq!(read_all(&log).await, recs(0..30, 1));
 }
 
@@ -58,7 +30,7 @@ async fn logs_on_a_core_share_the_pool() {
     let env = Env::with_pool(2048).await;
     let a = env.open(config()).await;
     let b = shep_storage::Log::open(
-        &env.disk,
+        &env.io,
         &env.pool,
         &env.kv,
         env.tmp.path().join("b"),
@@ -67,22 +39,19 @@ async fn logs_on_a_core_share_the_pool() {
     )
     .await
     .unwrap();
-    // Each log holds a chunk; a third can't be had.
     a.append([rec(0, 1)]).await.unwrap();
     b.append([rec(0, 1)]).await.unwrap();
     assert_eq!(env.pool.available(), 0);
-    let unstall = stall(&env);
-    let mut more = std::pin::pin!(a.append(recs(1..10, 1)));
-    tokio::select! {
-        _ = &mut more => panic!("append should wait for buffer space"),
-        _ = tokio::time::sleep(Duration::from_millis(100)) => {}
-    }
-    drop(unstall);
-    // b's partial chunk is only returned once written.
-    b.flush().await.unwrap();
-    more.await.unwrap();
+    // Pool pressure flushes both heads even though their idle timeout is an hour.
+    tokio::time::timeout(std::time::Duration::from_secs(2), a.append(recs(1..10, 1)))
+        .await
+        .unwrap()
+        .unwrap();
     a.flush().await.unwrap();
+    b.flush().await.unwrap();
     assert_eq!(env.pool.available(), 2048);
+    assert_eq!(read_all(&a).await, recs(0..10, 1));
+    assert_eq!(read_all(&b).await, recs(0..1, 1));
 }
 
 #[tokio::test(flavor = "local")]

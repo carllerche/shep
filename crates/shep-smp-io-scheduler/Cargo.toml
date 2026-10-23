@@ -1,0 +1,12 @@
+[package]
+name = "shep-smp-io-scheduler"
+description = "Local fair I/O admission with shared device capacity budgets"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+[lints]
+workspace = true
+[dependencies]
+shep-smp-io.workspace = true
+tokio.workspace = true

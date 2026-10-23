@@ -4,19 +4,19 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use shep_futures::future::join_all;
-use shep_storage::{Disk, Error, KeySpace, KvConfig, KvStore};
+use shep_storage::{Error, KeySpace, KvConfig, KvStore, StorageIo};
 use tempfile::TempDir;
 
 struct Env {
     tmp: TempDir,
-    disk: Disk,
+    io: StorageIo,
 }
 
 impl Env {
     fn new() -> Env {
         Env {
             tmp: tempfile::tempdir().unwrap(),
-            disk: Disk::new().unwrap(),
+            io: StorageIo::with_config(Default::default(), Default::default(), false).unwrap(),
         }
     }
 
@@ -25,17 +25,17 @@ impl Env {
     }
 
     async fn open(&self, config: KvConfig) -> KvStore {
-        KvStore::open(&self.disk, self.dir(), config).await.unwrap()
+        KvStore::open(&self.io, self.dir(), config).await.unwrap()
     }
 
     fn log(&self) -> PathBuf {
         self.dir().join("kvstore.log")
     }
 
-    /// Waits for the disk worker to finish what was queued, such as a
+    /// Waits for accepted storage transactions to finish, such as a
     /// snapshot a dropped store started.
     async fn drain(&self) {
-        self.disk.run(|| Ok(())).await.unwrap();
+        self.io.drain().await.unwrap();
     }
 }
 
@@ -153,7 +153,7 @@ async fn group_commit_batches_a_window_into_one_sync() {
             ..KvConfig::default()
         })
         .await;
-    let before = env.disk.stats().fsyncs;
+    let before = env.io.stats().fsyncs;
     let keys: Vec<String> = (0..100).map(|i| format!("k{i}")).collect();
     let results = join_all(
         keys.iter()
@@ -162,7 +162,7 @@ async fn group_commit_batches_a_window_into_one_sync() {
     .await;
     assert!(results.iter().all(|r| r.is_ok()));
     assert_eq!(kv.stats().batches, 1);
-    assert_eq!(env.disk.stats().fsyncs - before, 1);
+    assert_eq!(env.io.stats().fsyncs - before, 1);
     assert_eq!(kv.scan(KeySpace::TESTING).len(), 100);
 }
 
@@ -308,6 +308,6 @@ async fn corrupt_snapshot_is_an_error() {
     let mut bytes = std::fs::read(&snap).unwrap();
     bytes[10] ^= 1;
     std::fs::write(&snap, bytes).unwrap();
-    let err = KvStore::open(&env.disk, env.dir(), config).await;
+    let err = KvStore::open(&env.io, env.dir(), config).await;
     assert!(matches!(err, Err(Error::Corrupt { .. })));
 }

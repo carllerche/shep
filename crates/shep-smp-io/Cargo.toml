@@ -1,0 +1,17 @@
+[package]
+name = "shep-smp-io"
+description = "Core-local completion-based file I/O with owned buffers"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+[lints]
+workspace = true
+[dependencies]
+io-uring.workspace = true
+libc.workspace = true
+slab.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+[dev-dependencies]
+tempfile.workspace = true
