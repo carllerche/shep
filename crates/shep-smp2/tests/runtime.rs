@@ -1,5 +1,5 @@
 #![forbid(unsafe_code)]
-use shep_smp2::{Buffer, Config, Runtime, sleep, spawn};
+use shep_smp2::{Buffer, Config, File, Runtime, sleep, spawn};
 use std::{
     cell::Cell,
     future::{Future, pending, poll_fn},
@@ -17,7 +17,7 @@ fn nested_local_tasks_and_file_io_run_without_tokio_runtime() {
         task_budget: 2,
     })
     .unwrap();
-    let file = runtime.io().file(tempfile::tempfile().unwrap());
+    let file = File::from_std(runtime.io(), tempfile::tempfile().unwrap());
     let local = Rc::new(42);
     let expected = local.clone();
     let result = runtime
@@ -122,7 +122,7 @@ fn shutdown_cancels_tasks_and_drains_detached_kernel_work() {
     let mut runtime = Runtime::new(Config::default()).unwrap();
     let io = runtime.io();
     let original = tempfile::NamedTempFile::new().unwrap();
-    let file = io.file(original.reopen().unwrap());
+    let file = File::from_std(io.clone(), original.reopen().unwrap());
     let dropped = Rc::new(Cell::new(false));
     let probe = Dropped(dropped.clone());
     let join = runtime.spawn(async move {
@@ -145,13 +145,13 @@ fn shutdown_cancels_tasks_and_drains_detached_kernel_work() {
 }
 
 #[test]
-fn io_and_timers_progress_under_sustained_task_and_admission_load() {
+fn io_and_timers_progress_under_sustained_task_load() {
     let mut runtime = Runtime::new(Config {
         task_budget: 2,
-        max_in_flight: 1,
+        max_in_flight: 64,
     })
     .unwrap();
-    let file = runtime.io().file(tempfile::tempfile().unwrap());
+    let file = File::from_std(runtime.io(), tempfile::tempfile().unwrap());
     runtime
         .block_on(async move {
             let mut tasks = Vec::new();
@@ -189,13 +189,13 @@ fn task_panics_are_contained_and_runtime_can_be_reused() {
 }
 
 #[test]
-fn rejected_operation_releases_admission_and_wakes_capacity_waiters() {
+fn invalid_operation_does_not_consume_admission() {
     let mut runtime = Runtime::new(Config {
         task_budget: 8,
         max_in_flight: 1,
     })
     .unwrap();
-    let file = runtime.io().file(tempfile::tempfile().unwrap());
+    let file = File::from_std(runtime.io(), tempfile::tempfile().unwrap());
     runtime
         .block_on(async move {
             let bad = file.clone();
@@ -220,4 +220,32 @@ fn rejected_operation_releases_admission_and_wakes_capacity_waiters() {
             good.await.unwrap();
         })
         .unwrap();
+}
+
+#[test]
+fn saturated_runtime_returns_owned_operation_without_an_admission_waiter() {
+    let mut runtime = Runtime::new(Config {
+        max_in_flight: 1,
+        task_budget: 8,
+    })
+    .unwrap();
+    let file = File::from_std(runtime.io(), tempfile::tempfile().unwrap());
+    runtime
+        .block_on(async move {
+            let mut first = file
+                .submit_write_at(Buffer::from_slice(b"first", 1).unwrap(), 0)
+                .unwrap();
+            let (result, buffer) = file
+                .write_at(Buffer::from_slice(b"second", 1).unwrap(), 8)
+                .await;
+            assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+            assert_eq!(&*buffer, b"second");
+            std::future::poll_fn(|cx| first.poll_complete(file.io(), cx))
+                .await
+                .result
+                .unwrap();
+            assert_eq!(file.write_at(buffer, 8).await.0.unwrap(), 6);
+        })
+        .unwrap();
+    runtime.shutdown().unwrap();
 }

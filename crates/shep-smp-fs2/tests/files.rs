@@ -1,5 +1,7 @@
+#![cfg(not(miri))]
 #![forbid(unsafe_code)]
-use shep_smp_io2::{Buffer, Reactor};
+use shep_smp_fs2::File;
+use shep_smp_io2::{Buffer, Driver};
 use std::{
     future::Future,
     io::Read,
@@ -13,10 +15,11 @@ fn poll<F: Future>(f: std::pin::Pin<&mut F>) -> Poll<F::Output> {
 }
 
 #[test]
-fn futures_are_lazy_and_backpressure_returns_cancelled_waiters_buffers() {
-    let (mut reactor, io) = Reactor::new(1).unwrap();
+fn futures_are_lazy_and_saturation_returns_owned_buffer_immediately() {
+    let mut reactor = Driver::new(1).unwrap();
+    let io = reactor.io().clone();
     let temp = tempfile::tempfile().unwrap();
-    let file = io.file(temp);
+    let file = File::from_std(io.clone(), temp);
     let first = file.write_at(Buffer::from_slice(b"first", 1).unwrap(), 0);
     let mut first = pin!(first);
     assert_eq!(io.in_flight(), 0);
@@ -24,10 +27,14 @@ fn futures_are_lazy_and_backpressure_returns_cancelled_waiters_buffers() {
     assert_eq!(io.in_flight(), 1);
     {
         let mut second = pin!(file.write_at(Buffer::from_slice(b"second", 1).unwrap(), 8));
-        assert!(poll(second.as_mut()).is_pending());
+        let Poll::Ready((result, buffer)) = poll(second.as_mut()) else {
+            panic!("fail fast at capacity");
+        };
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+        assert_eq!(&*buffer, b"second");
         assert_eq!(io.in_flight(), 1);
     }
-    reactor.shutdown().unwrap();
+    reactor.drain().unwrap();
     let Poll::Ready((result, buffer)) = poll(first.as_mut()) else {
         panic!("completed write");
     };
@@ -43,15 +50,17 @@ fn futures_are_lazy_and_backpressure_returns_cancelled_waiters_buffers() {
 }
 
 #[test]
-fn dropping_a_waiter_before_submission_keeps_accepted_work() {
-    let (reactor, io) = Reactor::new(2).unwrap();
+fn dropping_a_handle_before_submission_keeps_accepted_work_until_drain() {
+    let mut reactor = Driver::new(2).unwrap();
+    let io = reactor.io().clone();
     let mut original = tempfile::tempfile().unwrap();
-    let file = io.file(original.try_clone().unwrap());
+    let file = File::from_std(io.clone(), original.try_clone().unwrap());
     {
         let mut write = pin!(file.write_at(Buffer::from_slice(b"detached", 1).unwrap(), 0));
         assert!(poll(write.as_mut()).is_pending());
     }
     assert_eq!(io.in_flight(), 1);
+    reactor.drain().unwrap();
     drop(reactor);
     let mut bytes = Vec::new();
     original.read_to_end(&mut bytes).unwrap();
@@ -61,26 +70,29 @@ fn dropping_a_waiter_before_submission_keeps_accepted_work() {
 
 #[test]
 fn submitted_waiter_can_be_dropped_and_remaining_operations_complete() {
-    let (mut reactor, io) = Reactor::new(2).unwrap();
-    let file = io.file(tempfile::tempfile().unwrap());
+    let mut reactor = Driver::new(2).unwrap();
+    let io = reactor.io().clone();
+    let file = File::from_std(io.clone(), tempfile::tempfile().unwrap());
     {
         let mut write = pin!(file.write_at(Buffer::from_slice(b"submitted", 1).unwrap(), 0));
         assert!(poll(write.as_mut()).is_pending());
-        reactor.poll().unwrap();
+        reactor.submit().unwrap();
+        reactor.reap().wake();
     }
     let mut sync = pin!(file.sync_all());
     assert!(poll(sync.as_mut()).is_pending());
     let end = Instant::now() + Duration::from_secs(2);
     loop {
-        reactor.poll().unwrap();
+        reactor.submit().unwrap();
+        reactor.reap().wake();
         if let Poll::Ready(result) = poll(sync.as_mut()) {
             result.unwrap();
             break;
         }
         assert!(Instant::now() < end);
-        reactor.prepare_park().unwrap().wait(Some(end)).unwrap();
+        reactor.submit_and_wait(Some(end)).unwrap();
     }
-    reactor.shutdown().unwrap();
+    reactor.drain().unwrap();
 }
 
 #[test]
@@ -91,8 +103,9 @@ fn a_panicking_completion_waker_does_not_strand_other_completions() {
             panic!("bad wake");
         }
     }
-    let (mut reactor, io) = Reactor::new(2).unwrap();
-    let file = io.file(tempfile::tempfile().unwrap());
+    let mut reactor = Driver::new(2).unwrap();
+    let io = reactor.io().clone();
+    let file = File::from_std(io.clone(), tempfile::tempfile().unwrap());
     let mut first = pin!(file.write_at(Buffer::new(1, 1).unwrap(), 0));
     let mut second = pin!(file.write_at(Buffer::new(1, 1).unwrap(), 1));
     let bad = Waker::from(std::sync::Arc::new(Bad));
@@ -103,7 +116,7 @@ fn a_panicking_completion_waker_does_not_strand_other_completions() {
             .is_pending()
     );
     assert!(poll(second.as_mut()).is_pending());
-    reactor.shutdown().unwrap();
+    reactor.drain().unwrap();
     assert!(poll(first.as_mut()).is_ready());
     assert!(poll(second.as_mut()).is_ready());
     assert_eq!(io.in_flight(), 0);
@@ -111,10 +124,12 @@ fn a_panicking_completion_waker_does_not_strand_other_completions() {
 
 #[test]
 fn completed_result_survives_dropping_the_reactor_owner() {
-    let (reactor, io) = Reactor::new(1).unwrap();
-    let file = io.file(tempfile::tempfile().unwrap());
+    let mut reactor = Driver::new(1).unwrap();
+    let io = reactor.io().clone();
+    let file = File::from_std(io.clone(), tempfile::tempfile().unwrap());
     let mut write = pin!(file.write_at(Buffer::from_slice(b"survives", 1).unwrap(), 0));
     assert!(poll(write.as_mut()).is_pending());
+    reactor.drain().unwrap();
     drop(reactor);
     let Poll::Ready((result, buffer)) = poll(write.as_mut()) else {
         panic!("retired result remains available");

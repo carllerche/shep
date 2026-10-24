@@ -1,7 +1,7 @@
 //! Public API foundation benchmarks; see benches/README.md.
 #![forbid(unsafe_code)]
 use criterion::{BenchmarkId, Criterion, Throughput};
-use shep_smp2::{Buffer, Config, Runtime, sleep, spawn};
+use shep_smp2::{Buffer, Config, File, Runtime, sleep, spawn};
 use std::{future::poll_fn, hint::black_box, task::Poll, time::Duration};
 
 fn main() {
@@ -59,7 +59,7 @@ fn main() {
     });
     let original = tempfile::tempfile().unwrap();
     original.set_len(16 << 20).unwrap();
-    let file = runtime.io().file(original);
+    let file = File::from_std(runtime.io(), original);
     let mut group = c.benchmark_group("io/write_read");
     for bytes in [64, 4096, 65536] {
         group.throughput(Throughput::Bytes((bytes * 2) as u64));
@@ -110,7 +110,7 @@ fn main() {
         });
     }
     group.finish();
-    let (mut reactor, _io) = shep_smp_io2::Reactor::new(1).unwrap();
+    let (mut reactor, _io) = shep_smp2::Parking::new(1).unwrap();
     let wake = reactor.wake_handle();
     c.bench_function("park/owner_notification", |b| {
         b.iter(|| {

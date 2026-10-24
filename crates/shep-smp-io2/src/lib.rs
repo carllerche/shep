@@ -1,24 +1,27 @@
-//! Local owned-buffer file futures and bounded admission, independent of Tokio.
-//! The runtime drives [`Reactor`]; applications clone [`Io`] and [`File`].
-//! Dropping an accepted operation's future detaches its result, preserving all
-//! kernel-visible resources and admission capacity through actual completion.
+//! Safe, local io_uring building blocks for Shep.
+//!
+//! [`Io::push`] owns and publishes an [`Operation`] without submitting it.
+//! [`Driver::submit`] submits a batch; [`Driver::reap`] only processes CQEs.
+//! [`OperationHandle::poll_complete`] observes an operation's shared lifecycle.
+//! Handles contain only a packed ID. Pass the allocating Io to complete or
+//! explicitly release them; adapters release dropped futures with borrowed guards.
+//! Cancel operations also retain their target identity until their CQE retires.
 //! ```compile_fail
 //! fn send<T: Send>() {}
 //! send::<shep_smp_io2::Io>();
 //! ```
 //! ```compile_fail
 //! fn send<T: Send>() {}
-//! send::<shep_smp_io2::Reactor>();
-//! ```
-//! ```compile_fail
-//! fn sync<T: Sync>() {}
-//! sync::<shep_smp_io2::Reactor>();
+//! send::<shep_smp_io2::Driver>();
 //! ```
 #![deny(unsafe_code)]
 #![deny(unsafe_op_in_unsafe_fn)]
-
-mod core;
-mod io;
-
-pub use core::{Buffer, WaitOutcome, WakeHandle};
-pub use io::{File, Io, Park, Reactor};
+mod buffer;
+mod driver;
+mod lifecycle;
+mod operation;
+pub use buffer::Buffer;
+pub use driver::{
+    CancelTarget, Completion, Driver, Io, OperationHandle, Progress, Rejected, Value, WaitOutcome,
+};
+pub use operation::{Close, Operation, SocketAddress};

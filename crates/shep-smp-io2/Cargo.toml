@@ -1,6 +1,6 @@
 [package]
 name = "shep-smp-io2"
-description = "Safe owned-buffer futures for Shep's native io_uring reactor"
+description = "Safe owned-operation io_uring driver with explicit batching and completion lifecycle"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -13,3 +13,8 @@ libc.workspace = true
 slab.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
+criterion.workspace = true
+
+[[bench]]
+name = "driver"
+harness = false

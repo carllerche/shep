@@ -13,8 +13,10 @@
 
 use shep_smp_exec::Executor;
 pub use shep_smp_exec::{JoinError, JoinHandle, spawn};
-use shep_smp_io2::Reactor;
-pub use shep_smp_io2::{Buffer, File, Io};
+mod park;
+pub use park::{Park, Parking, WakeHandle};
+pub use shep_smp_fs2::File;
+pub use shep_smp_io2::{Buffer, Io};
 use shep_smp_time::{Instant, Timer};
 pub use shep_smp_time::{sleep, sleep_until, timeout};
 use std::{
@@ -42,7 +44,7 @@ impl Default for Config {
 /// Run one instance on each owning OS thread when building an SMP layer.
 pub struct Runtime {
     executor: Executor,
-    reactor: Reactor,
+    reactor: Parking,
     timer: Timer,
     io: Io,
     task_budget: usize,
@@ -56,7 +58,7 @@ impl Runtime {
                 "zero task budget",
             ));
         }
-        let (reactor, io) = Reactor::new(config.max_in_flight)?;
+        let (reactor, io) = Parking::new(config.max_in_flight)?;
         let executor = Executor::new(reactor.wake_handle().waker());
         Ok(Self {
             executor,
@@ -161,7 +163,7 @@ mod tests {
     }
     #[test]
     fn local_io_timer_and_channel_completions_never_invoke_the_driver_waker() {
-        let (reactor, io) = Reactor::new(8).unwrap();
+        let (reactor, io) = Parking::new(8).unwrap();
         let wakes = Arc::new(AtomicUsize::new(0));
         let wake = Waker::from(Arc::new(CountDriver {
             wakes: wakes.clone(),
@@ -175,7 +177,7 @@ mod tests {
             task_budget: 8,
             closed: false,
         };
-        let file = runtime.io().file(tempfile::tempfile().unwrap());
+        let file = File::from_std(runtime.io(), tempfile::tempfile().unwrap());
         runtime
             .block_on(async move {
                 let (send, recv) = tokio::sync::oneshot::channel();

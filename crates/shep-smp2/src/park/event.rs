@@ -1,30 +1,28 @@
-//! The only direct syscalls used by the wakeup protocol.
+//! Runtime-owned eventfd notification protocol.
+#![forbid(unsafe_code)]
 use std::{
     fs::File,
     io::{self, Read, Write},
-    os::fd::{AsRawFd, FromRawFd},
     sync::{Arc, Weak},
     task::{Wake, Waker},
     thread::{self, ThreadId},
 };
 
-use super::park_state::ParkState;
+use super::state::ParkState;
 
 pub(super) struct Event {
-    file: File,
+    file: Arc<File>,
     state: ParkState,
     owner: ThreadId,
 }
 impl Event {
     pub(super) fn new() -> io::Result<Arc<Self>> {
-        // SAFETY: eventfd takes no pointers; flags request a private nonblocking fd.
-        let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: Successful eventfd returned a fresh owned descriptor, adopted once.
+        let fd = rustix::event::eventfd(
+            0,
+            rustix::event::EventfdFlags::CLOEXEC | rustix::event::EventfdFlags::NONBLOCK,
+        )?;
         Ok(Arc::new(Self {
-            file: unsafe { File::from_raw_fd(fd) },
+            file: Arc::new(File::from(fd)),
             state: ParkState::new(),
             owner: thread::current().id(),
         }))
@@ -34,7 +32,7 @@ impl Event {
         // One eventfd read drains the whole counter (not semaphore mode). Do
         // not loop on successful reads: a wake storm must not starve the core.
         loop {
-            match (&self.file).read(&mut bytes) {
+            match (&*self.file).read(&mut bytes) {
                 Ok(8) => return Ok(()),
                 Ok(_) => return Err(io::Error::other("short eventfd read")),
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
@@ -57,8 +55,8 @@ impl Event {
     pub(super) fn finish(&self) {
         self.state.finish();
     }
-    pub(super) fn fd(&self) -> i32 {
-        self.file.as_raw_fd()
+    pub(super) fn file(&self) -> Arc<File> {
+        self.file.clone()
     }
 }
 
@@ -83,7 +81,7 @@ impl WakeHandle {
             return Ok(true);
         }
         loop {
-            match (&event.file).write(&1u64.to_ne_bytes()) {
+            match (&*event.file).write(&1u64.to_ne_bytes()) {
                 Ok(8) => return Ok(true),
                 Ok(_) => return Err(io::Error::other("short eventfd write")),
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
@@ -109,11 +107,11 @@ impl Wake for WakeHandle {
 #[cfg(all(test, not(miri)))]
 mod tests {
     use super::*;
-    use crate::core::{Reactor, WaitOutcome};
+    use crate::park::{Parking, WaitOutcome};
     use std::time::{Duration, Instant};
     fn counter(event: &Event) -> io::Result<u64> {
         let mut bytes = [0; 8];
-        (&event.file).read_exact(&mut bytes)?;
+        (&*event.file).read_exact(&mut bytes)?;
         Ok(u64::from_ne_bytes(bytes))
     }
     fn assert_no_write(event: &Event) {
@@ -130,7 +128,7 @@ mod tests {
     }
     #[test]
     fn owner_notifications_never_write_even_after_prepare() {
-        let mut reactor = Reactor::new(1).unwrap();
+        let mut reactor = Parking::new(1).unwrap().0;
         let event = reactor.event.as_ref().unwrap().clone();
         let wake = reactor.wake_handle();
         wake.unpark().unwrap();
@@ -147,7 +145,7 @@ mod tests {
     }
     #[test]
     fn remote_running_notifications_skip_writes_and_survive_until_prepare() {
-        let mut reactor = Reactor::new(1).unwrap();
+        let mut reactor = Parking::new(1).unwrap().0;
         let event = reactor.event.as_ref().unwrap().clone();
         let wake = reactor.wake_handle();
         remote(&wake);
@@ -160,7 +158,7 @@ mod tests {
     }
     #[test]
     fn remote_parked_notifications_coalesce_to_one_eventfd_write() {
-        let mut reactor = Reactor::new(1).unwrap();
+        let mut reactor = Parking::new(1).unwrap().0;
         let event = reactor.event.as_ref().unwrap().clone();
         let wake = reactor.wake_handle();
         let park = reactor.prepare_park().unwrap();
@@ -179,7 +177,7 @@ mod tests {
     }
     #[test]
     fn abandoned_ready_and_timed_out_waits_restore_running() {
-        let mut reactor = Reactor::new(1).unwrap();
+        let mut reactor = Parking::new(1).unwrap().0;
         let event = reactor.event.as_ref().unwrap().clone();
         let wake = reactor.wake_handle();
         drop(reactor.prepare_park().unwrap());
@@ -208,7 +206,7 @@ mod tests {
     }
     #[test]
     fn a_delayed_foreign_notification_interrupts_a_kernel_wait() {
-        let mut reactor = Reactor::new(1).unwrap();
+        let mut reactor = Parking::new(1).unwrap().0;
         let event = reactor.event.as_ref().unwrap().clone();
         let wake = reactor.wake_handle();
         let park = reactor.prepare_park().unwrap();

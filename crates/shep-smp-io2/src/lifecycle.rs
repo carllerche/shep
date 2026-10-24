@@ -1,0 +1,467 @@
+//! Shared submitter/kernel ownership. Only safe Rust mutates the operation slab.
+#![forbid(unsafe_code)]
+use crate::{Completion, Operation, Rejected, Value};
+use slab::Slab;
+use std::{io, task::Waker};
+
+const INDEX_BITS: u32 = 40;
+const MAX_INDEX: u64 = (1 << INDEX_BITS) - 1;
+const MAX_IO_ID: u32 = (1 << 24) - 1;
+static NEXT_IO_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct IoId(u32);
+impl IoId {
+    pub(crate) fn allocate() -> io::Result<Self> {
+        Self::allocate_from(&NEXT_IO_ID)
+    }
+    fn allocate_from(counter: &std::sync::atomic::AtomicU32) -> io::Result<Self> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let mut next = counter.load(Relaxed);
+        loop {
+            if next > MAX_IO_ID {
+                return Err(io::Error::other(
+                    "process io_uring identity limit exhausted",
+                ));
+            }
+            match counter.compare_exchange_weak(next, next + 1, Relaxed, Relaxed) {
+                Ok(_) => return Ok(Self(next)),
+                Err(actual) => next = actual,
+            }
+        }
+    }
+    fn operation(self, index: usize) -> Option<OperationId> {
+        let index = u64::try_from(index).ok()?;
+        if index > MAX_INDEX {
+            return None;
+        }
+        Some(OperationId(
+            std::num::NonZeroU64::new((u64::from(self.0) << INDEX_BITS) | index)
+                .expect("nonzero I/O identity"),
+        ))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct OperationId(std::num::NonZeroU64);
+impl OperationId {
+    pub(crate) fn from_raw(raw: u64) -> Self {
+        Self(std::num::NonZeroU64::new(raw).expect("nonzero CQE identity"))
+    }
+    pub(crate) fn raw(self) -> u64 {
+        self.0.get()
+    }
+    pub(crate) fn belongs_to(self, owner: IoId) -> bool {
+        (self.raw() >> INDEX_BITS) == u64::from(owner.0)
+    }
+    pub(crate) fn check(self, owner: IoId) {
+        assert!(
+            self.belongs_to(owner),
+            "operation belongs to a different Io"
+        );
+    }
+    fn index(self) -> usize {
+        (self.raw() & MAX_INDEX) as usize
+    }
+}
+
+enum Lifecycle {
+    Submitted,
+    Waiting(Waker),
+    Ignored(Option<io::Result<Value>>),
+    Completed(io::Result<Value>),
+}
+pub(crate) struct Record {
+    // Values can be consumed after the target CQE while a cancel still pins its ID.
+    pub(crate) operation: Option<Operation>,
+    lifecycle: Lifecycle,
+    kernel_refs: usize,
+    pub(crate) own_done: bool,
+    cancel: bool,
+}
+pub(crate) struct Arena {
+    io_id: IoId,
+    entries: Slab<Record>,
+    active: usize,
+    cancel_active: usize,
+    capacity: usize,
+    closed: bool,
+    failed: bool,
+}
+impl Arena {
+    pub(crate) fn new(capacity: usize, io_id: IoId) -> Self {
+        Self {
+            io_id,
+            entries: Slab::with_capacity(capacity + 1),
+            active: 0,
+            cancel_active: 0,
+            capacity,
+            closed: false,
+            failed: false,
+        }
+    }
+    pub(crate) fn insert(&mut self, operation: Operation) -> Result<OperationId, Rejected> {
+        let cancel = operation.is_cancel();
+        let error = if self.failed || (self.closed && !cancel) {
+            Some(io::ErrorKind::BrokenPipe)
+        } else if (cancel && self.cancel_active != 0)
+            || (!cancel && self.active - self.cancel_active == self.capacity)
+        {
+            // One reserved cancellation permits progress even at the regular limit.
+            Some(io::ErrorKind::WouldBlock)
+        } else {
+            None
+        };
+        if let Some(error) = error {
+            return Err(Rejected {
+                operation,
+                error: error.into(),
+            });
+        }
+        let entry = self.entries.vacant_entry();
+        let Some(id) = self.io_id.operation(entry.key()) else {
+            return Err(Rejected {
+                operation,
+                error: io::ErrorKind::WouldBlock.into(),
+            });
+        };
+        entry.insert(Record {
+            operation: Some(operation),
+            lifecycle: Lifecycle::Submitted,
+            kernel_refs: 1,
+            own_done: false,
+            cancel,
+        });
+        self.active += 1;
+        self.cancel_active += usize::from(cancel);
+        Ok(id)
+    }
+    pub(crate) fn record(&mut self, id: OperationId) -> &mut Record {
+        self.entries
+            .get_mut(id.index())
+            .expect("live operation identity")
+    }
+    pub(crate) fn reject(&mut self, id: OperationId, error: io::Error) -> Rejected {
+        let record = self.entries.remove(id.index());
+        assert!(matches!(record.lifecycle, Lifecycle::Submitted));
+        assert_eq!(record.kernel_refs, 1);
+        self.active -= 1;
+        self.cancel_active -= usize::from(record.cancel);
+        Rejected {
+            operation: record.operation.unwrap(),
+            error,
+        }
+    }
+    pub(crate) fn pin(&mut self, id: OperationId) {
+        let record = self.record(id);
+        record.kernel_refs = record
+            .kernel_refs
+            .checked_add(1)
+            .expect("operation reference overflow");
+    }
+    pub(crate) fn unpin(&mut self, id: OperationId) -> Option<Record> {
+        let record = self.record(id);
+        assert!(record.kernel_refs != 0);
+        record.kernel_refs -= 1;
+        if record.kernel_refs == 0 && matches!(record.lifecycle, Lifecycle::Ignored(_)) {
+            Some(self.entries.remove(id.index()))
+        } else {
+            None
+        }
+    }
+    pub(crate) fn complete(
+        &mut self,
+        id: OperationId,
+        result: io::Result<Value>,
+    ) -> (Option<Waker>, Option<Record>) {
+        let record = self.record(id);
+        assert!(!record.own_done, "duplicate terminal CQE");
+        record.own_done = true;
+        let previous = std::mem::replace(&mut record.lifecycle, Lifecycle::Submitted);
+        let (wake, next) = match previous {
+            Lifecycle::Submitted => (None, Lifecycle::Completed(result)),
+            Lifecycle::Waiting(waker) => (Some(waker), Lifecycle::Completed(result)),
+            Lifecycle::Ignored(None) => (None, Lifecycle::Ignored(Some(result))),
+            _ => unreachable!(),
+        };
+        record.lifecycle = next;
+        self.cancel_active -= usize::from(self.entries[id.index()].cancel);
+        self.active -= 1;
+        (wake, self.unpin(id))
+    }
+    pub(crate) fn take(&mut self, id: OperationId) -> Option<Completion> {
+        let record = self.entries.get_mut(id.index())?;
+        if !matches!(record.lifecycle, Lifecycle::Completed(_)) {
+            return None;
+        }
+        let Lifecycle::Completed(result) =
+            std::mem::replace(&mut record.lifecycle, Lifecycle::Ignored(None))
+        else {
+            unreachable!()
+        };
+        let operation = record.operation.take().expect("unconsumed operation");
+        if record.kernel_refs == 0 {
+            self.entries.remove(id.index());
+        }
+        Some(Completion { result, operation })
+    }
+    pub(crate) fn wait(&mut self, id: OperationId, waker: Waker) -> Option<Waker> {
+        match &mut self.record(id).lifecycle {
+            state @ Lifecycle::Submitted => {
+                *state = Lifecycle::Waiting(waker);
+                None
+            }
+            Lifecycle::Waiting(old) => Some(std::mem::replace(old, waker)),
+            Lifecycle::Completed(_) => Some(waker),
+            Lifecycle::Ignored(_) => unreachable!("submitter released operation"),
+        }
+    }
+    pub(crate) fn abandon(&mut self, id: OperationId) -> (Option<Waker>, Option<Record>) {
+        let record = self.record(id);
+        if record.kernel_refs == 0 {
+            return (None, Some(self.entries.remove(id.index())));
+        }
+        let previous = std::mem::replace(&mut record.lifecycle, Lifecycle::Ignored(None));
+        let wake = match previous {
+            Lifecycle::Waiting(waker) => Some(waker),
+            Lifecycle::Submitted => None,
+            Lifecycle::Completed(result) => {
+                record.lifecycle = Lifecycle::Ignored(Some(result));
+                None
+            }
+            Lifecycle::Ignored(_) => unreachable!("submitter released twice"),
+        };
+        (wake, None)
+    }
+    pub(crate) fn close(&mut self) {
+        self.closed = true;
+    }
+    pub(crate) fn fail(&mut self) {
+        self.closed = true;
+        self.failed = true;
+    }
+    pub(crate) fn is_failed(&self) -> bool {
+        self.failed
+    }
+    pub(crate) fn in_flight(&self) -> usize {
+        self.active
+    }
+    pub(crate) fn wakers(&mut self) -> Vec<Waker> {
+        let mut wakes = Vec::new();
+        for (_, record) in &mut self.entries {
+            if matches!(record.lifecycle, Lifecycle::Waiting(_)) {
+                let Lifecycle::Waiting(waker) =
+                    std::mem::replace(&mut record.lifecycle, Lifecycle::Submitted)
+                else {
+                    unreachable!()
+                };
+                wakes.push(waker);
+            }
+        }
+        wakes
+    }
+    pub(crate) fn retain_unresolved(&mut self) -> Vec<Operation> {
+        self.fail();
+        let operations = self
+            .entries
+            .iter_mut()
+            .filter_map(|(_, record)| {
+                if !record.own_done {
+                    record.operation.take()
+                } else {
+                    None
+                }
+            })
+            .collect();
+        self.active = 0;
+        self.cancel_active = 0;
+        operations
+    }
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Buffer;
+    use std::{fs::File, sync::Arc};
+    fn operation() -> Operation {
+        Operation::ReadAt {
+            file: Arc::new(File::open("/dev/null").unwrap()),
+            buffer: Buffer::new(8, 8).unwrap(),
+            offset: 0,
+        }
+    }
+    #[test]
+    fn completion_first_keeps_values_until_the_future_consumes_them() {
+        let mut arena = Arena::new(1, IoId::allocate().unwrap());
+        let token = arena.insert(operation()).unwrap();
+        assert!(arena.take(token).is_none());
+        let (wake, discard) = arena.complete(token, Ok(Value::Count(3)));
+        assert!(wake.is_none() && discard.is_none());
+        assert_eq!(arena.in_flight(), 0);
+        assert_eq!(arena.len(), 1);
+        let completion = arena.take(token).unwrap();
+        assert!(matches!(completion.result.unwrap(), Value::Count(3)));
+        assert_eq!(arena.len(), 0);
+        let next = arena.insert(operation()).unwrap();
+        assert_eq!(next.index(), token.index());
+    }
+    #[test]
+    fn future_drop_first_retains_resources_until_the_terminal_cqe() {
+        let mut arena = Arena::new(1, IoId::allocate().unwrap());
+        let operation = operation();
+        let Operation::ReadAt { file, .. } = &operation else {
+            unreachable!()
+        };
+        let weak = Arc::downgrade(file);
+        let token = arena.insert(operation).unwrap();
+        assert!(arena.abandon(token).1.is_none());
+        assert_eq!(arena.len(), 1);
+        assert_eq!(arena.in_flight(), 1);
+        assert!(weak.upgrade().is_some());
+        let (_, discarded) = arena.complete(token, Ok(Value::Count(0)));
+        assert_eq!(arena.len(), 0);
+        assert_eq!(arena.in_flight(), 0);
+        drop(discarded);
+        assert!(weak.upgrade().is_none());
+    }
+    #[test]
+    fn waiting_completion_extracts_waker_before_removing_a_completed_entry() {
+        let mut arena = Arena::new(1, IoId::allocate().unwrap());
+        let token = arena.insert(operation()).unwrap();
+        assert!(arena.wait(token, Waker::noop().clone()).is_none());
+        assert!(arena.wait(token, Waker::noop().clone()).is_some());
+        let (wake, discarded) = arena.complete(token, Ok(Value::Count(0)));
+        assert!(wake.is_some() && discarded.is_none());
+        assert!(arena.take(token).is_some());
+        assert_eq!(arena.len(), 0);
+        drop(wake); // Driver holds a waker, not an index into a reused slot.
+    }
+    #[test]
+    fn dropping_a_waiting_future_releases_its_waker_but_not_its_operation() {
+        let mut arena = Arena::new(1, IoId::allocate().unwrap());
+        let token = arena.insert(operation()).unwrap();
+        arena.wait(token, Waker::noop().clone());
+        let (wake, discarded) = arena.abandon(token);
+        assert!(wake.is_some() && discarded.is_none());
+        assert_eq!(arena.in_flight(), 1);
+        let (wake, discarded) = arena.complete(token, Ok(Value::Count(0)));
+        assert!(wake.is_none() && discarded.is_some());
+        assert_eq!(arena.len(), 0);
+    }
+    #[test]
+    fn dropping_a_completed_future_removes_the_entry() {
+        let mut arena = Arena::new(1, IoId::allocate().unwrap());
+        let token = arena.insert(operation()).unwrap();
+        arena.complete(token, Ok(Value::Count(0)));
+        assert!(arena.abandon(token).1.is_some());
+        assert_eq!(arena.len(), 0);
+    }
+    #[test]
+    fn completed_results_do_not_consume_kernel_capacity() {
+        let mut arena = Arena::new(1, IoId::allocate().unwrap());
+        let first = arena.insert(operation()).unwrap();
+        arena.complete(first, Ok(Value::Count(0)));
+        let second = arena.insert(operation()).unwrap();
+        assert_ne!(first.index(), second.index());
+        assert_eq!(arena.len(), 2);
+        assert_eq!(arena.in_flight(), 1);
+        assert!(arena.take(first).is_some());
+        arena.complete(second, Ok(Value::Count(0)));
+        assert!(arena.take(second).is_some());
+    }
+    #[test]
+    fn rejection_and_closure_preserve_unaccepted_values() {
+        let mut arena = Arena::new(1, IoId::allocate().unwrap());
+        let first = arena.insert(operation()).unwrap();
+        assert_eq!(
+            arena.insert(operation()).unwrap_err().error.kind(),
+            io::ErrorKind::WouldBlock
+        );
+        let rejected = arena.reject(first, io::ErrorKind::WouldBlock.into());
+        assert_eq!(arena.in_flight(), 0);
+        arena.close();
+        assert_eq!(
+            arena.insert(rejected.operation).unwrap_err().error.kind(),
+            io::ErrorKind::BrokenPipe
+        );
+    }
+
+    #[test]
+    fn consumed_completion_keeps_identity_until_cancel_reference_retires() {
+        let mut arena = Arena::new(1, IoId::allocate().unwrap());
+        let first = arena.insert(Operation::Nop).unwrap();
+        arena.pin(first);
+        arena.complete(first, Ok(Value::Done));
+        assert!(arena.take(first).is_some());
+        assert_eq!(arena.len(), 1);
+        let second = arena.insert(Operation::Nop).unwrap();
+        assert_ne!(first, second);
+        assert!(arena.unpin(first).is_some());
+        arena.complete(second, Ok(Value::Done));
+        arena.take(second).unwrap();
+        assert_eq!(arena.len(), 0);
+    }
+    #[test]
+    fn cancel_reference_retiring_first_preserves_original_kernel_ownership() {
+        let mut arena = Arena::new(1, IoId::allocate().unwrap());
+        let id = arena.insert(Operation::Nop).unwrap();
+        arena.pin(id);
+        arena.abandon(id);
+        assert!(arena.unpin(id).is_none());
+        assert_eq!(arena.len(), 1);
+        assert!(arena.complete(id, Ok(Value::Done)).1.is_some());
+        assert_eq!(arena.len(), 0);
+    }
+    #[test]
+    fn ignored_fd_result_is_owned_until_the_final_kernel_reference() {
+        let mut arena = Arena::new(1, IoId::allocate().unwrap());
+        let id = arena.insert(Operation::Nop).unwrap();
+        arena.pin(id);
+        arena.abandon(id);
+        arena.complete(id, Ok(Value::File(File::open("/dev/null").unwrap())));
+        let record = arena.unpin(id).unwrap();
+        assert!(matches!(
+            record.lifecycle,
+            Lifecycle::Ignored(Some(Ok(Value::File(_))))
+        ));
+    }
+    #[test]
+    fn fatal_retention_preserves_identity_for_handles_outliving_driver() {
+        let mut arena = Arena::new(1, IoId::allocate().unwrap());
+        let id = arena.insert(Operation::Nop).unwrap();
+        arena.pin(id);
+        let payloads = arena.retain_unresolved();
+        assert_eq!(payloads.len(), 1);
+        assert!(arena.abandon(id).1.is_none());
+        assert!(arena.unpin(id).is_none());
+        assert!(arena.is_failed());
+    }
+
+    #[test]
+    fn packed_ids_keep_all_24_owner_bits_and_40_slot_bits() {
+        let owner = IoId(MAX_IO_ID);
+        let id = owner.operation(MAX_INDEX as usize).unwrap();
+        assert_eq!(id.raw(), u64::MAX);
+        assert_eq!(id.index() as u64, MAX_INDEX);
+        assert!(id.belongs_to(owner));
+        assert!(!id.belongs_to(IoId(1)));
+        assert!(owner.operation((MAX_INDEX + 1) as usize).is_none());
+        assert_eq!(IoId(1).operation(0).unwrap().raw(), 1 << INDEX_BITS);
+    }
+    #[test]
+    fn exhausted_owner_counter_never_wraps_or_reuses_an_id() {
+        use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
+        let counter = AtomicU32::new(MAX_IO_ID);
+        assert_eq!(IoId::allocate_from(&counter).unwrap(), IoId(MAX_IO_ID));
+        assert_eq!(counter.load(Relaxed), MAX_IO_ID + 1);
+        for _ in 0..3 {
+            assert!(IoId::allocate_from(&counter).is_err());
+        }
+        assert_eq!(counter.load(Relaxed), MAX_IO_ID + 1);
+    }
+}

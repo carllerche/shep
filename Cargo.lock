@@ -1367,6 +1367,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "shep-smp-fs2"
+version = "0.1.0"
+dependencies = [
+ "shep-smp-io2",
+ "tempfile",
+]
+
+[[package]]
 name = "shep-smp-io"
 version = "0.1.0"
 dependencies = [
@@ -1390,6 +1398,7 @@ dependencies = [
 name = "shep-smp-io2"
 version = "0.1.0"
 dependencies = [
+ "criterion",
  "io-uring",
  "libc",
  "slab",
@@ -1421,7 +1430,9 @@ name = "shep-smp2"
 version = "0.1.0"
 dependencies = [
  "criterion",
+ "rustix",
  "shep-smp-exec",
+ "shep-smp-fs2",
  "shep-smp-io2",
  "shep-smp-time",
  "tempfile",

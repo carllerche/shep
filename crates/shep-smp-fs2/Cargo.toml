@@ -1,0 +1,13 @@
+[package]
+name = "shep-smp-fs2"
+description = "Positional owned-buffer file operations built on Shep's io_uring driver"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+[lints]
+workspace = true
+[dependencies]
+shep-smp-io2.workspace = true
+[dev-dependencies]
+tempfile.workspace = true

@@ -1,156 +1,166 @@
 # Native io_uring runtime foundation
 
-This parallel implementation leaves shep-smp, shep-smp-io, the existing I/O
-scheduler, and all Raft/WAL/storage/node consumers on their current runtime.
-It requires Linux io_uring with extended enter arguments (Linux 5.11+), and
-returns initialization errors when the environment does not support it.
+The parallel *2 crates keep existing Raft/WAL/storage/node consumers on their
+current runtime. Linux io_uring with extended enter arguments is required
+(Linux 5.11+ for waiting; individual opcodes can require newer kernels).
+Unsupported initialization and opcode errors are returned without a fallback.
 
 | Component | Responsibility |
 |---|---|
-| shep-smp-io2/src/core.rs + core/ | Private ring/SQ/CQ ownership, kernel-visible resources, operation arena and eventfd parking |
-| shep-smp-io2/src/io.rs | Safe owned-buffer file futures, bounded admission and completion delivery |
-| shep-smp2 | Single-core Runtime combining the existing executor/timer with the native reactor |
+| shep-smp-io2 | Safe owned operations, ring push/submit/reap, completion lifecycle and cancellation |
+| shep-smp-fs2 | Positional owned-buffer file adapter and operation-completion futures |
+| shep-smp2 | Local executor/timer integration, batching policy and eventfd parking |
 
-The I/O implementation is one crate. Its root denies unsafe code by default;
-only the private core module opts in. The io, arena, buffer and park_state
-modules each enforce forbid(unsafe_code), as does the runtime crate. All four
-unsafe blocks remain in core.rs and core/park.rs; see
-[the safety review](../crates/shep-smp-io2/SAFETY.md). Arena internals use
-parent-module visibility, so the safe I/O module cannot retire a submitted
-operation or access its kernel-owned buffer through implementation helpers.
-Production dependencies contain no Tokio runtime. Tests and benchmarks use
-Tokio channels only as runtime-independent notification primitives. The
-existing task crate retains its separately reviewed unsafe implementation.
+The io2 crate root denies unsafe code; only its private driver module opts in.
+Lifecycle, operations and buffers each forbid unsafe code. Both higher layers
+forbid unsafe code too. The three unsafe blocks publish SQEs and adopt owned
+file descriptors. See [the safety boundary](../crates/shep-smp-io2/SAFETY.md).
+Production dependencies have no Tokio runtime. Existing task internals retain
+their separate unsafe implementation and upstream attribution.
 
-## Current functionality
+## Driver phases and operations
 
-Runtime::block_on runs a local 'static root future. Runtime::spawn and the
-scoped spawn function schedule local child/background tasks. Futures and outputs
-need not be Send. Each turn services I/O and timers around a bounded executor
-turn. Ready work prevents parking; idle work waits in io_uring until a CQE,
-foreign notification or next timer-wheel deadline. A root completing does not
-cancel background tasks: they remain owned until completion or shutdown.
+Io::push(Operation) immediately admits an owned request and publishes its SQE,
+returning an OperationHandle. It performs no submit syscall, wait or reap.
+Full admission/SQ capacity returns Rejected { error: WouldBlock, operation };
+validation and closed admission also return the original inputs. There is no
+admission-waiter map or second queue behind a full queue.
 
-Io::file binds an already-open std::fs::File. File provides positional owned-
-buffer read_at/write_at and explicit sync_data/sync_all. Reads/writes may be
-short. Await prerequisite writes before syncing; independently submitted
-operations have no implicit ordering. Offset u64::MAX is rejected rather than
-silently selecting io_uring's current-file-position sentinel. Aligned buffers
-support descriptors opened with O_DIRECT, but alignment discovery/open policy
-is not implemented by this layer yet.
+Driver::submit explicitly submits the current batch. Driver::reap only
+processes available CQEs and returns Progress; the caller then calls
+Progress::wake after the batch's lifecycle transitions. Driver::submit_and_wait
+is an explicit combined submission/wait primitive for an idle runtime.
 
-Operations are lazy until first polled and wait for bounded admission. Once
-accepted, the slab owns the operation, buffer, descriptor and lifecycle. The
-safe core immediately publishes its SQE, carrying just the slab index; the
-reactor batches submission syscalls. There is no software submission queue,
-per-operation Rc/RefCell mailbox, or reply lookup table.
+Operation explicitly enumerates supported requests: Nop, ReadAt, WriteAt,
+Fsync, Fallocate, Ftruncate, OpenAt, Close, Socket, Accept, Connect, Send, Recv,
+Shutdown, PollAdd and Cancel. Every request owns the inputs whose addresses or
+file descriptors the kernel needs. Successful completions return Count, File,
+Poll or Done; errors preserve the original owned operation and its buffer.
+New opcodes require implementing ownership, completion and cancellation rules;
+arbitrary raw SQEs and SQE flags are not exposed.
 
-The lifecycle follows Monoio's Submitted/Waiting/Ignored/Completed model. A
-terminal CQE releases driver interest, and result consumption or future drop
-releases consumer interest. Whichever finishes last removes the entry. Dropped
-in-flight futures become Ignored and keep their buffers/descriptors until the
-real CQE. Completed results stay available until consumed, including after the
-reactor is destroyed, and do not hold kernel admission capacity.
+OperationHandle is an eight-byte opaque ID, with no Io reference and no Future
+implementation. Use handle.try_complete(&io), handle.poll_complete(&io, cx), or
+poll_fn(|cx| handle.poll_complete(&io, cx)).await. Pass the allocating Io to
+handle.release(&io) when abandoning a result. File adapters use borrowed guards
+to release claims on dropped futures; raw-token callers own that responsibility.
+A bare token drop retains its slab claim until Io destruction. The registered
+waker belongs to the operation's slab record; no per-request Rc clone or
+Rc/RefCell mailbox is needed for ordinary operations.
 
-Completion delivery extracts owned wakers before invoking callbacks; it keeps
-no notification indices. A callback can consume another completed result and
-immediately reuse its slot safely. There are no generations, tombstones,
-Consumed placeholders or deferred reclamation lists. Ring/arena borrows never
-survive waker callbacks or operation destruction.
+A static atomic allocates nonzero 24-bit Io IDs once per driver, never recycling
+or wrapping them. The CQE's u64 packs that owner ID above a 40-bit slab index
+(24 + 40 = 64). Passing a token to the wrong Io panics before accessing the
+slab. Cancellation tokens retain their allocating Io while their pin is active;
+retirement releases that reference.
 
-Fatal driver failures are terminal and may retain unresolved resources; see
-SAFETY.md. Normal shutdown cancels task consumers, drains accepted I/O, retires
-the wake watch and closes reactor resources.
+The shared Submitted/Waiting/Ignored/Completed lifecycle follows Monoio's model:
+slots remain occupied until both the submitter and kernel release their claims.
+Releasing a handle marks its request Ignored without freeing kernel-owned data.
+Completed results do not consume kernel admission capacity and remain available
+after driver destruction when the caller retains its Io. Retained completed results may grow the slab.
 
-A runnable example opens its descriptor before entering the reactor, writes,
-syncs, waits on a timer, and reads on the new runtime:
+A CancelTarget pins a live identity until its token is dropped unsubmitted or
+its cancellation CQE arrives. The original operation may complete and its
+values may be consumed first; its slot still cannot be reused for another
+request. One cancellation can be admitted beyond the ordinary in-flight limit.
+Cancellation is explicit and does not promise that the target had no effect.
+
+Driver::drain stops ordinary admission and waits for accepted operations;
+non-completing receives/watches must first be explicitly canceled. Bare driver
+drop reaps available CQEs and conservatively retains unresolved memory before
+closing the ring, without waiting on arbitrary I/O. Drain explicitly to avoid
+that fallback. Fatal driver errors wake waiters; unresolved results cannot
+safely return their inputs and panic if polled afterward.
+
+## Higher layers
+
+File::from_std binds an already-open std::fs::File to Io. The fs2 adapter
+provides eager submit_read_at/submit_write_at handles and async read_at/write_at
+helpers returning (Result<usize>, Buffer). Async helpers are lazy until polled;
+saturation then returns immediately. Short I/O and partial effects are exposed.
+There are no shared file cursors. sync_data/sync_all await their own completion;
+callers must establish prerequisite write completion before syncing. The lower
+layer's Close takes a uniquely owned descriptor; a high-level resource close
+protocol must first account for its outstanding operations.
+
+The driver owns no write backlog, resource-readiness waiter collection,
+durability frontier or background error policy. File writers can retain eager
+handles to track concurrent completion, contiguous progress and durability above
+it. TCP serialization, write capacity, flush, graceful close, and background
+drop cleanup belong in a future net2 adapter. A resource registry can likewise
+be added without moving operation waiters out of the operation slab.
+
+Current Send/Recv are ordinary single-shot owned-buffer operations. Provided
+buffer pools, buffer selection, multishot and zero-copy notifications remain
+extensions requiring separate safe ownership protocols. They are required
+building blocks for the eventual buffer-pool TCP API, not implemented by this
+refactor.
+
+Runtime::block_on runs a local root task and services I/O/timers around bounded
+executor turns. Background tasks survive root completion until finished or
+shutdown. Its parking adapter keeps one eventfd PollAdd armed, reserves that
+ordinary operation in addition to Config::max_in_flight, and rearms before
+calling completion wakers. The driver's cancellation reserve permits shutdown
+to retire that watch even at full data capacity. Io::in_flight includes this
+runtime-owned watch. Runtime shutdown cancels task consumers and drains accepted
+kernel work; users of raw indefinite operations must cancel those operations
+before shutdown. No resource-level forced close policy is inferred.
 
 ```sh
 cargo run -p shep-smp2 --example files
 ```
 
-There is no background Tokio runtime, polling helper thread, periodic I/O retry
-timer or epoll completion bridge. Each reactor is explicitly local; its weak
-waker alone crosses threads.
+## Idle/wakeup protocol
 
-## Idle protocol
+Parking::prepare_park drains stale eventfd tokens and publishes PARKING before
+the runtime's final ready-work/deadline check. The Park guard restores RUNNING
+on wait, error, timeout, unwind or an abandoned attempt. NOTIFIED retains a
+permit that skips waiting; CLOSED is terminal. SeqCst atomic RMWs linearize
+publication and state transitions, including already-notified producers.
 
-The core exposes prepare_park, which arms the eventfd PollAdd, drains old
-counter values and publishes PARKING before submitting. The runtime rechecks
-ready work and deadlines, then either drops the guard or calls wait(deadline).
-Every guard exit restores RUNNING. A retained NOTIFIED permit makes the attempt
-skip waiting; CLOSED is terminal. This four-state protocol uses SeqCst CASes.
+Foreign scheduling publishes the task ID before notification. RUNNING wakes
+retain a permit without writing eventfd. Only the first foreign transition
+PARKING -> NOTIFIED writes; later wakes coalesce. The final inbox check and
+retained readable kernel token cover both sides of entering the wait. A delayed
+write from an earlier parking attempt is harmless and drained on a later turn.
 
-Foreign scheduling publishes the task ID before notifying. RUNNING -> NOTIFIED
-retains the notification without a syscall; only the first foreign transition
-from PARKING -> NOTIFIED writes the eventfd. Later notifications coalesce. The
-post-prepare inbox check and the retained kernel token cover both sides of the
-race with entering the wait. Native tests inspect the actual counter, while
-threaded regression tests force notifications around preparation and entering
-wait, timeout, abandoned waits and shutdown.
+The runtime enters executor scoped TLS around its entire driving loop. Matching
+owner wakes enqueue directly into the local ready queue. A mismatch uses the
+target inbox without invoking its driver waker. WakeHandle independently checks
+the owner thread and suppresses owner eventfd writes, including after prepare.
+No unsafe borrowed TLS lifetime mechanism or global executor registry is needed.
 
-The runtime enters the executor's scoped TLS context for its entire loop, not
-just task polling. I/O/timer callbacks with a matching executor identity push
-directly into its local ready queue. An owner-thread wake with a mismatched or
-absent context uses the inbox without calling the driver waker. WakeHandle also
-checks the owner thread, so direct owner unpark calls never write the eventfd.
-Task-poll recursion is guarded separately from entering a context, allowing
-ordinary driver work inside the scope while preserving nested-poll rejection.
-No thread-local executor registry or unsafe borrowed TLS references are used.
+WakeHandle is weak; upgraded writers retain the event descriptor throughout a
+racing write. Late wakes return false after closure. Native tests inspect the
+actual eventfd counter and force races before/after the final check, during
+wait, timeout, guard abandonment and destruction. This protocol belongs to
+smp2, built from io2's ordinary PollAdd/Cancel operations.
 
-WakeHandle::unpark returns false after closure; already-started writers retain
-the descriptor through their writes. A late write claimed during an earlier
-parking attempt may arrive after the owner resumes and is harmless. Park reports
-Ready, TimedOut or Interrupted. Absolute deadlines apply to one wait attempt.
+## Design sources and validation
 
-This eventfd wakes the native reactor for external work. It is not the existing
-shep-smp-io eventfd that forwards kernel completions into Tokio's AsyncFd.
-
-## Design sources
-
-This is a new implementation using the workspace io-uring crate, not copied
-Seastar/Monoio implementation code. It uses:
-
-- [Monoio's driver/waker](https://github.com/bytedance/monoio/tree/8675e9406ea7943c441d969e38c3f5fc198ef6d1/monoio/src/driver/uring):
-  reactor-owned waiting, retained eventfd wakeups, weak unpark ownership and
-  extended wait arguments. Shep uses PollAdd on eventfd instead of a kernel read
-  into a reactor-owned buffer, and avoids Rc<UnsafeCell<driver>>.
-- [Seastar's reactor](https://github.com/scylladb/seastar/blob/master/src/core/reactor.cc):
-  local execution, servicing event sources between task turns, and preparing
-  interrupt mode before rechecking for pending work. Shep does not copy the
-  systemwide-barrier optimization or its task/I/O schedulers. Its own
-  CAS-based parking handshake suppresses eventfd writes while running.
-
-No attribution file claims this Rust implementation is a fork. The existing
-executor/task/timer crates retain their own upstream attribution.
-
-## Validation and next steps
-
-Run the two new crates' native tests and Clippy. Buffer and operation arena tests can run under Miri; actual io_uring/eventfd tests require
-a native kernel. Compile-fail docs enforce local-only Reactor/Runtime ownership.
-The [benchmark suite](../crates/shep-smp2/benches/README.md) establishes
-baselines for root tasks, yielding, timers, foreign handoff, file I/O
-batches and retained wakeups. It is not an equivalence/performance claim against
-Tokio, Monoio or Seastar.
-
-The foundation is deliberately single-core. Still to implement before migrating
-production: a bounded blocking metadata helper pool and async open/metadata
-policy, thread-per-core startup/shutdown and submit_to in shep-smp2, networking
-and RPC integration, and shep-smp-io-scheduler2. Registered buffers/files,
-multishot operations and busy-poll tuning require their own
-measurements and safety/lifetime review. The old crates stay in place until an
-explicit application migration.
-
-The former shep-smp-io2-core package was merged into io2's private core module.
-Historical benchmark JSON deliberately retains the original source paths and
-hashes for the versions measured. Current validation commands are:
+This is a Shep implementation using the workspace io-uring crate. It draws on
+[Monoio's lifecycle and driver](https://github.com/bytedance/monoio/tree/8675e9406ea7943c441d969e38c3f5fc198ef6d1/monoio/src/driver/uring)
+and [Seastar's reactor](https://github.com/scylladb/seastar/blob/master/src/core/reactor.cc):
+local execution, explicit submission batches, retained wakeups and preparing
+sleep before rechecking pending work. It does not copy their unsafe driver
+cell or systemwide memory-barrier mechanisms.
 
 ```sh
-cargo test -p shep-smp-io2 -p shep-smp2
-cargo clippy -p shep-smp-io2 -p shep-smp2 --all-targets -- -D warnings
+cargo test -p shep-smp-io2 -p shep-smp-fs2 -p shep-smp2
+cargo clippy -p shep-smp-io2 -p shep-smp-fs2 -p shep-smp2 --all-targets -- -D warnings
 MIRIFLAGS='-Zmiri-disable-isolation -Zmiri-tree-borrows' cargo +nightly-2026-10-22 miri test -p shep-smp-io2 --lib
 ```
 
-Native core tests live under src/core/tests; public buffer/file tests remain
-integration tests. Miri runs the pure arena/parking-state tests; native kernel
-and callback tests are excluded from Miri.
+Pure lifecycle and buffer tests run under Miri; actual io_uring/eventfd tests
+require a native kernel. Compile-fail docs enforce local-only driver/runtime
+ownership. The [13-case runtime benchmarks](../crates/shep-smp2/benches/README.md)
+cover scheduling, timers, foreign handoff, file batches and parking.
+[Eight driver-only cases](../crates/shep-smp-io2/benches/README.md) isolate
+batching, owned-buffer reuse, ignored completions and identity pins. Historical
+archives retain their original source paths and hashes, including the former
+io2-core crate and former core module. They are measurement records.
+
+Remaining steps before production migration include buffer-pool networking,
+resource close/flush APIs, filesystem metadata policy, thread-per-core
+startup/shutdown and submit_to, RPC integration, and shep-smp-io-scheduler2.

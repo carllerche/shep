@@ -1,5 +1,5 @@
 #![forbid(unsafe_code)]
-use crate::core::{Reactor, WaitOutcome};
+use crate::park::{Parking, WaitOutcome};
 use std::{
     sync::{
         Arc, Barrier,
@@ -11,7 +11,7 @@ use std::{
 
 #[test]
 fn wake_between_final_check_and_kernel_wait_is_retained() {
-    let mut reactor = Reactor::new(1).unwrap();
+    let mut reactor = Parking::new(1).unwrap().0;
     let wake = reactor.wake_handle();
     for _ in 0..100 {
         reactor.poll().unwrap();
@@ -30,7 +30,7 @@ fn wake_between_final_check_and_kernel_wait_is_retained() {
 
 #[test]
 fn prepare_then_recheck_observes_a_wake_drained_before_final_check() {
-    let mut reactor = Reactor::new(1).unwrap();
+    let mut reactor = Parking::new(1).unwrap().0;
     let wake = reactor.wake_handle();
     let ready = Arc::new(AtomicBool::new(false));
     thread::scope(|scope| {
@@ -50,7 +50,7 @@ fn prepare_then_recheck_observes_a_wake_drained_before_final_check() {
 
 #[test]
 fn remote_wake_interrupts_idle_wait_and_watch_rearms() {
-    let mut reactor = Reactor::new(1).unwrap();
+    let mut reactor = Parking::new(1).unwrap().0;
     let wake = reactor.wake_handle();
     for _ in 0..20 {
         reactor.poll().unwrap();
@@ -75,7 +75,7 @@ fn remote_wake_interrupts_idle_wait_and_watch_rearms() {
 
 #[test]
 fn empty_reactor_deadline_expires_and_late_wakes_are_harmless() {
-    let mut reactor = Reactor::new(1).unwrap();
+    let mut reactor = Parking::new(1).unwrap().0;
     let wake = reactor.wake_handle();
     let deadline = Instant::now() + Duration::from_millis(5);
     reactor
@@ -97,7 +97,7 @@ fn empty_reactor_deadline_expires_and_late_wakes_are_harmless() {
 
 #[test]
 fn wake_storm_can_race_with_reactor_destruction() {
-    let mut reactor = Reactor::new(1).unwrap();
+    let mut reactor = Parking::new(1).unwrap().0;
     drop(reactor.prepare_park().unwrap());
     let wake = reactor.wake_handle();
     thread::scope(|scope| {
@@ -112,4 +112,26 @@ fn wake_storm_can_race_with_reactor_destruction() {
         drop(reactor);
     });
     assert!(!wake.unpark().unwrap());
+}
+
+#[test]
+fn shutdown_retires_an_existing_cancel_before_canceling_its_watch() {
+    use shep_smp_io2::{Buffer, Operation};
+    use std::{fs::File, os::fd::OwnedFd, sync::Arc};
+    let (mut parking, io) = Parking::new(1).unwrap();
+    let (socket, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+    let mut receive = io
+        .push(Operation::Recv {
+            socket: Arc::new(File::from(OwnedFd::from(socket))),
+            buffer: Buffer::new(8, 1).unwrap(),
+        })
+        .unwrap();
+    let mut cancellation = io
+        .push(Operation::Cancel(receive.cancel_target(&io)))
+        .unwrap();
+    parking.shutdown().unwrap();
+    parking.shutdown().unwrap();
+    assert!(receive.try_complete(&io).unwrap().result.is_err());
+    assert!(cancellation.try_complete(&io).unwrap().result.is_ok());
+    assert_eq!(io.in_flight(), 0);
 }

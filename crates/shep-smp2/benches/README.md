@@ -65,3 +65,16 @@ There are no deferred reclamation lists or software submission queues.
 LIFECYCLE.md and lifecycle.json retain the comparison with the prior version.
 RECLAIM.md and reclaim.json describe the preceding implementation at measurement
 time; the older arena/wake archives likewise remain historical records.
+
+The current driver split moves positional file adapters into shep-smp-fs2 and
+parking into shep-smp2. shep-smp-io2 exposes owned operations and separate
+push/submit/reap phases. Saturation returns the rejected operation immediately;
+there is no admission-waiter map. Cancellation targets pin their slab identities
+through the cancellation CQE. DRIVER.md and driver-split.json retain the
+before/after runtime comparison. Eight additional driver-only cases live in
+[io2/benches](../../shep-smp-io2/benches/README.md).
+
+Operation handles now take &Io when polling/releasing and no longer own an Io
+clone. The current packed identity has 24 owner bits and 40 slab-index bits.
+The [driver comparison](../../shep-smp-io2/benches/OWNERLESS.md) records this
+change; previous source hashes and API descriptions remain historical records.
