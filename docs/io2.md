@@ -26,9 +26,11 @@ Full admission/SQ capacity returns Rejected { error: WouldBlock, operation };
 validation and closed admission also return the original inputs. There is no
 admission-waiter map or second queue behind a full queue.
 
-Driver::submit explicitly submits the current batch. Driver::reap only
-processes available CQEs and returns Progress; the caller then calls
-Progress::wake after the batch's lifecycle transitions. Driver::submit_and_wait
+Driver::submit explicitly submits the current batch. Driver::reap_into processes
+available CQEs, returns the number processed, and appends waiter notifications
+to a caller-owned Progress. The caller calls Progress::wake after the batch's
+lifecycle transitions. Progress retains its allocation across wake calls, and
+the driver reuses storage for discarded records. Driver::submit_and_wait
 is an explicit combined submission/wait primitive for an idle runtime.
 
 Operation explicitly enumerates supported requests: Nop, ReadAt, WriteAt,

@@ -4,11 +4,12 @@ mod event;
 mod state;
 pub use event::WakeHandle;
 pub use shep_smp_io2::WaitOutcome;
-use shep_smp_io2::{Driver, Io, Operation, OperationHandle};
+use shep_smp_io2::{Driver, Io, Operation, OperationHandle, Progress};
 use std::{io, sync::Arc, time::Instant};
 
 pub struct Parking {
     driver: Driver,
+    progress: Progress,
     event: Option<Arc<event::Event>>,
     watch: Option<OperationHandle>,
     closed: bool,
@@ -27,6 +28,7 @@ impl Parking {
         let io = driver.io().clone();
         let mut reactor = Self {
             driver,
+            progress: Progress::default(),
             event: Some(event::Event::new()?),
             watch: None,
             closed: false,
@@ -65,10 +67,9 @@ impl Parking {
                 result?;
             }
         }
-        let progress = self.driver.reap();
-        let retired = progress.retired;
+        let retired = self.driver.reap_into(&mut self.progress);
         let armed = if retired != 0 { self.arm() } else { Ok(()) };
-        progress.wake();
+        self.progress.wake();
         armed?;
         Ok(retired)
     }
@@ -116,9 +117,8 @@ impl Parking {
                                 result?;
                             }
                         }
-                        let progress = self.driver.reap();
-                        let retired = progress.retired;
-                        progress.wake();
+                        let retired = self.driver.reap_into(&mut self.progress);
+                        self.progress.wake();
                         if retired == 0 {
                             self.driver.submit_and_wait(None)?;
                         }

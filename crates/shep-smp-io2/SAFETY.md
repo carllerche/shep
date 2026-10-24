@@ -89,12 +89,16 @@ The physical SQ and default CQ accommodate this single-shot outstanding bound.
 There are no admission waiters or software submission backlogs.
 
 The driver retires an entire CQ snapshot and extracts owned wakers before
-calling callbacks. Progress contains wakers, never old slab IDs. Reentrant wakes
+calling callbacks. Driver::reap_into appends notifications to reusable caller-owned
+Progress storage and returns a per-call completion count. Progress contains
+wakers, never old slab IDs. Reentrant wakes
 can consume other completed results and submit new operations safely. Replaced
 wakers, abandoned operations, and discarded completion results are destroyed
 after ring and arena RefCell borrows end. A panicking wake is contained so other
 notifications are still delivered. Applications must call Progress::wake to
-notify registered waiters.
+notify registered waiters; wake drains notifications while retaining allocation.
+Removed records are collected in driver-owned scratch storage and cleared only
+after ring and arena borrows end.
 
 ## Three unsafe sites
 

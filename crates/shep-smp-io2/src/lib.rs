@@ -1,7 +1,7 @@
 //! Safe, local io_uring building blocks for Shep.
 //!
 //! [`Io::push`] owns and publishes an [`Operation`] without submitting it.
-//! [`Driver::submit`] submits a batch; [`Driver::reap`] only processes CQEs.
+//! [`Driver::submit`] submits a batch; [`Driver::reap_into`] only processes CQEs.
 //! [`OperationHandle::poll_complete`] observes an operation's shared lifecycle.
 //! Handles contain only a packed ID. Pass the allocating Io to complete or
 //! explicitly release them; adapters release dropped futures with borrowed guards.

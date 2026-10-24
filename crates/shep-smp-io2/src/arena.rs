@@ -276,8 +276,7 @@ impl Arena {
     }
     /// Extract pending wakers with Waiting -> Submitted; leave other states unchanged.
     /// Failure cleanup uses this to notify waiters outside borrows; no SQE is resubmitted.
-    pub(crate) fn wakers(&mut self) -> Vec<Waker> {
-        let mut wakes = Vec::new();
+    pub(crate) fn wakers_into(&mut self, wakes: &mut Vec<Waker>) {
         for (_, record) in &mut self.entries {
             if matches!(record.lifecycle, Lifecycle::Waiting(_)) {
                 let Lifecycle::Waiting(waker) =
@@ -288,7 +287,6 @@ impl Arena {
                 wakes.push(waker);
             }
         }
-        wakes
     }
     /// Mark the arena failed and detach inputs whose original CQEs are unobserved.
     /// Leave lifecycle states and identity refs intact for later token cleanup; reset

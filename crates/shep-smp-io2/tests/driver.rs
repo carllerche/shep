@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 #![cfg(not(miri))]
-use shep_smp_io2::{Buffer, Completion, Driver, Operation, OperationHandle, Value};
+use shep_smp_io2::{Buffer, Completion, Driver, Operation, OperationHandle, Progress, Value};
 use std::{
     ffi::CString,
     fs::File,
@@ -14,8 +14,10 @@ use std::{
 
 fn finish(driver: &mut Driver, handle: &mut OperationHandle) -> Completion {
     let end = Instant::now() + Duration::from_secs(3);
+    let mut progress = Progress::default();
     loop {
-        driver.reap().wake();
+        driver.reap_into(&mut progress);
+        progress.wake();
         if let Some(done) = handle.try_complete(driver.io()) {
             return done;
         }
@@ -25,13 +27,54 @@ fn finish(driver: &mut Driver, handle: &mut OperationHandle) -> Completion {
 }
 
 #[test]
+fn progress_accumulates_across_reaps_and_can_be_reused_after_waking() {
+    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+    struct Count(AtomicUsize);
+    impl std::task::Wake for Count {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Relaxed);
+        }
+    }
+    let mut driver = Driver::new(1).unwrap();
+    let mut progress = Progress::default();
+    let count = Arc::new(Count(AtomicUsize::new(0)));
+    let waker = Waker::from(count.clone());
+    for round in 0..3 {
+        let mut handle = driver.push(Operation::Nop).unwrap();
+        assert!(
+            handle
+                .poll_complete(driver.io(), &mut Context::from_waker(&waker))
+                .is_pending()
+        );
+        let end = Instant::now() + Duration::from_secs(3);
+        let mut completed = 0;
+        while driver.in_flight() != 0 {
+            driver.submit_and_wait(Some(end)).unwrap();
+            completed += driver.reap_into(&mut progress);
+            assert!(Instant::now() < end);
+        }
+        assert_eq!(completed, 1);
+        assert_eq!(driver.reap_into(&mut progress), 0);
+        handle.try_complete(driver.io()).unwrap().result.unwrap();
+        assert_eq!(count.0.load(Relaxed), if round == 2 { 2 } else { 0 });
+        if round >= 1 {
+            progress.wake();
+            assert_eq!(count.0.load(Relaxed), round + 1);
+        }
+    }
+    progress.wake();
+    assert_eq!(count.0.load(Relaxed), 3);
+    driver.drain().unwrap();
+}
+
+#[test]
 fn push_reap_and_submit_are_separate_batch_phases() {
     let mut driver = Driver::new(8).unwrap();
     let mut handles: Vec<_> = (0..8)
         .map(|_| driver.push(Operation::Nop).unwrap())
         .collect();
     assert!(driver.has_pending());
-    assert_eq!(driver.reap().retired, 0);
+    assert_eq!(driver.reap_into(&mut Progress::default()), 0);
     assert!(
         handles
             .iter_mut()
@@ -351,16 +394,14 @@ fn reentrant_wake_consumes_another_result_and_pushes_into_reused_slot() {
             .is_pending()
     );
     // Defer notification until the whole batch is retired, as a runtime may do.
-    let mut progress = Vec::new();
+    let mut progress = Progress::default();
     let end = Instant::now() + Duration::from_secs(3);
     while driver.in_flight() != 0 {
         driver.submit_and_wait(Some(end)).unwrap();
-        progress.push(driver.reap());
+        driver.reap_into(&mut progress);
         assert!(Instant::now() < end);
     }
-    for batch in progress {
-        batch.wake();
-    }
+    progress.wake();
     a.try_complete(driver.io()).unwrap().result.unwrap();
     finish(&mut driver, next.borrow_mut().as_mut().unwrap())
         .result
@@ -400,6 +441,7 @@ fn retained_results_grow_slab_without_moving_kernel_buffers() {
     let mut driver = Driver::new(1).unwrap();
     let file = Arc::new(tempfile::tempfile().unwrap());
     let mut handles = Vec::new();
+    let mut progress = Progress::default();
     for offset in 0..64 {
         let buffer = Buffer::from_slice(b"stable", 64).unwrap();
         let pointer = buffer.as_ptr();
@@ -413,7 +455,8 @@ fn retained_results_grow_slab_without_moving_kernel_buffers() {
         let end = Instant::now() + Duration::from_secs(3);
         while driver.in_flight() != 0 {
             driver.submit_and_wait(Some(end)).unwrap();
-            driver.reap().wake();
+            driver.reap_into(&mut progress);
+            progress.wake();
             assert!(Instant::now() < end);
         }
         handles.push((handle, pointer));
@@ -507,7 +550,7 @@ fn ignored_open_output_is_closed_when_its_cqe_is_reaped() {
         .unwrap();
     // The kernel-created descriptor exists before its ignored result is reaped.
     assert_eq!(descriptors_for(original.path()), 2);
-    assert_eq!(driver.reap().retired, 1);
+    assert_eq!(driver.reap_into(&mut Progress::default()), 1);
     assert_eq!(descriptors_for(original.path()), 1);
     driver.drain().unwrap();
 }

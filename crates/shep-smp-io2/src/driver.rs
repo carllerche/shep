@@ -2,7 +2,7 @@
 #![allow(unsafe_code)]
 use crate::{
     Io, Operation, OperationHandle, Rejected, Value,
-    arena::{Arena, OperationId},
+    arena::{Arena, OperationId, Record},
 };
 use io_uring::{IoUring, opcode, types};
 use std::{
@@ -51,21 +51,42 @@ impl DriverId {
     }
 }
 
-/// All results have entered lifecycle state before callbacks are invoked.
-/// Notification never looks up an old slab index.
+/// Deferred notifications for completed I/O operations.
+///
+/// Pass this to [`Driver::reap_into`] to process available completions. Reaping
+/// updates operation state immediately and adds waiter notifications here.
+/// Call [`Progress::wake`] when ready to notify those waiters.
+///
+/// Multiple calls to `reap_into` may accumulate into the same `Progress` before
+/// waking. I/O results remain available through their operation handles; they
+/// are not stored here. Reuse this value to retain its notification allocation.
+///
+/// # Example
+///
+/// ```no_run
+/// # fn example(driver: &mut shep_smp_io2::Driver) {
+/// let mut progress = shep_smp_io2::Progress::default();
+/// loop {
+///     let _completed = driver.reap_into(&mut progress);
+///     progress.wake();
+///     // Run ready tasks and submit or wait for more I/O.
+/// }
+/// # }
+/// ```
 #[must_use = "call wake() to notify operation waiters after reaping"]
 #[derive(Debug, Default)]
 pub struct Progress {
-    /// Terminal CQEs reaped in this batch, including cancellation and watch operations.
-    pub retired: usize,
     /// Completion notifications detached from slab IDs, ready to run without arena borrows.
     wakes: Vec<Waker>,
 }
 impl Progress {
-    /// Deliver extracted notifications, containing each panic so others still run.
-    /// Record transitions already happened during reap; this does not access the slab.
-    pub fn wake(self) {
-        for waker in self.wakes {
+    /// Notify all accumulated waiters, retaining notification storage for reuse.
+    ///
+    /// Operation states have already been updated by `reap_into`. Each
+    /// notification is delivered even if another waiter panics. This does not
+    /// access operation storage.
+    pub fn wake(&mut self) {
+        for waker in self.wakes.drain(..) {
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| waker.wake()));
         }
     }
@@ -127,6 +148,8 @@ pub struct Driver {
     /// Driver-owned reference to the ring/slab; clones can outlive the driver
     /// to consume completed records, but cannot submit once the ring is closed.
     io: Io,
+    /// Removed records destroyed after releasing ring and arena borrows.
+    discarded: Vec<Record>,
 }
 impl Driver {
     /// Create an empty ring with max_in_flight ordinary slots plus one cancel reserve.
@@ -148,6 +171,7 @@ impl Driver {
         }
         let id = DriverId::allocate()?;
         Ok(Self {
+            discarded: Vec::new(),
             io: Io {
                 shared: Rc::new(Shared {
                     id,
@@ -195,26 +219,34 @@ impl Driver {
             && error.raw_os_error() != Some(libc::ETIME)
         {
             self.io.shared.arena.borrow_mut().fail();
-            let wakes = self.io.shared.arena.borrow_mut().wakers();
-            Progress { retired: 0, wakes }.wake();
+            let mut progress = Progress::default();
+            self.io
+                .shared
+                .arena
+                .borrow_mut()
+                .wakers_into(&mut progress.wakes);
+            progress.wake();
         }
         result
     }
     /// Reap only: never calls submit or runs an application future.
     /// For each original CQE, Submitted/Waiting -> Completed, or keep Ignored
     /// until its final ref retires, then remove it. Cancellation CQEs also end
-    /// their target pins. Return extracted wakers for Progress::wake outside
+    /// their target pins. Append extracted wakers for Progress::wake outside
     /// borrows; abandoned inputs/results are destroyed after the CQ snapshot.
     /// Panics on invalid identities, duplicate CQEs, or unsupported nonterminal CQEs.
-    pub fn reap(&mut self) -> Progress {
-        let mut progress = Progress::default();
-        let mut discarded = Vec::new();
+    ///
+    /// Return the number of terminal CQEs processed by this call, including
+    /// cancellation and watch completions. Existing notifications in `progress`
+    /// are preserved; call [`Progress::wake`] to deliver them outside borrows.
+    pub fn reap_into(&mut self, progress: &mut Progress) -> usize {
+        let mut retired = 0;
         {
             let mut ring = self.io.shared.ring.borrow_mut();
             let ring = ring.as_mut().expect("live driver");
             let mut completions = ring.completion();
             if completions.is_empty() {
-                return progress;
+                return 0;
             }
             let mut arena = self.io.shared.arena.borrow_mut();
             for cqe in &mut completions {
@@ -239,21 +271,21 @@ impl Driver {
                     progress.wakes.push(wake);
                 }
                 if let Some(record) = released {
-                    discarded.push(record);
+                    self.discarded.push(record);
                 }
                 if let Some(target) = dependency
                     && let Some(record) = arena.unpin(target)
                 {
-                    discarded.push(record);
+                    self.discarded.push(record);
                 }
-                progress.retired += 1;
+                retired += 1;
             }
         }
-        drop(discarded);
-        progress
+        self.discarded.clear();
+        retired
     }
     /// Submit a batch and wait for a CQE/deadline; the runtime decides when to sleep.
-    /// Does not reap or advance record states; call reap to observe completion.
+    /// Does not reap or advance record states; call reap_into to observe completion.
     /// An expired deadline skips submission. Transient errors return Interrupted;
     /// fatal errors close admission and wake Waiting records as in submit.
     pub fn submit_and_wait(&mut self, deadline: Option<Instant>) -> io::Result<WaitOutcome> {
@@ -287,6 +319,7 @@ impl Driver {
     /// later consumption. Return enter errors; this can wait indefinitely for I/O.
     pub fn drain(&mut self) -> io::Result<()> {
         self.io.close();
+        let mut progress = Progress::default();
         while self.in_flight() != 0 {
             match self.submit() {
                 Err(e) if transient(&e) => {}
@@ -294,7 +327,8 @@ impl Driver {
                     result?;
                 }
             }
-            self.reap().wake();
+            self.reap_into(&mut progress);
+            progress.wake();
             if self.in_flight() != 0 {
                 self.submit_and_wait(None)?;
             }
@@ -309,14 +343,20 @@ impl Drop for Driver {
     /// remain available through retained Io clones until consumed/released.
     fn drop(&mut self) {
         self.io.close();
-        self.reap().wake();
-        let wakes = self.io.shared.arena.borrow_mut().wakers();
+        let mut progress = Progress::default();
+        self.reap_into(&mut progress);
+        progress.wake();
+        self.io
+            .shared
+            .arena
+            .borrow_mut()
+            .wakers_into(&mut progress.wakes);
         let unresolved = self.io.shared.arena.borrow_mut().retain_unresolved();
         // Closing a ring isn't used as proof that userspace memory is retired.
         std::mem::forget(unresolved);
         let ring = self.io.shared.ring.borrow_mut().take();
         drop(ring);
-        Progress { retired: 0, wakes }.wake();
+        progress.wake();
     }
 }
 /// Outcome of one kernel wait attempt; completion records have not yet been reaped.
@@ -511,6 +551,36 @@ fn finish_close(operation: &mut Operation, result: i32) {
 mod tests {
     #![forbid(unsafe_code)]
     use super::*;
+    #[test]
+    fn progress_reuses_storage_and_delivers_each_notification_once() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering::Relaxed},
+        };
+        struct Count(AtomicUsize);
+        impl std::task::Wake for Count {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Relaxed);
+            }
+        }
+        let count = Arc::new(Count(AtomicUsize::new(0)));
+        let mut progress = Progress::default();
+        progress.wakes.push(Waker::from(count.clone()));
+        progress.wakes.push(Waker::from(count.clone()));
+        let capacity = progress.wakes.capacity();
+        let storage = progress.wakes.as_ptr();
+        progress.wake();
+        assert_eq!(count.0.load(Relaxed), 2);
+        assert!(progress.wakes.is_empty());
+        assert_eq!(progress.wakes.capacity(), capacity);
+        assert_eq!(progress.wakes.as_ptr(), storage);
+        progress.wake();
+        assert_eq!(count.0.load(Relaxed), 2);
+        progress.wakes.push(Waker::from(count.clone()));
+        progress.wake();
+        assert_eq!(count.0.load(Relaxed), 3);
+        assert_eq!(progress.wakes.as_ptr(), storage);
+    }
     #[test]
     fn exhausted_owner_counter_never_wraps_or_reuses_an_id() {
         use std::sync::atomic::{AtomicU32, Ordering::Relaxed};

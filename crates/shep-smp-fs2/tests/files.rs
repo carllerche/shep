@@ -70,6 +70,7 @@ fn dropping_a_handle_before_submission_keeps_accepted_work_until_drain() {
 
 #[test]
 fn submitted_waiter_can_be_dropped_and_remaining_operations_complete() {
+    let mut progress = shep_smp_io2::Progress::default();
     let mut reactor = Driver::new(2).unwrap();
     let io = reactor.io().clone();
     let file = File::from_std(io.clone(), tempfile::tempfile().unwrap());
@@ -77,14 +78,16 @@ fn submitted_waiter_can_be_dropped_and_remaining_operations_complete() {
         let mut write = pin!(file.write_at(Buffer::from_slice(b"submitted", 1).unwrap(), 0));
         assert!(poll(write.as_mut()).is_pending());
         reactor.submit().unwrap();
-        reactor.reap().wake();
+        reactor.reap_into(&mut progress);
+        progress.wake();
     }
     let mut sync = pin!(file.sync_all());
     assert!(poll(sync.as_mut()).is_pending());
     let end = Instant::now() + Duration::from_secs(2);
     loop {
         reactor.submit().unwrap();
-        reactor.reap().wake();
+        reactor.reap_into(&mut progress);
+        progress.wake();
         if let Poll::Ready(result) = poll(sync.as_mut()) {
             result.unwrap();
             break;
