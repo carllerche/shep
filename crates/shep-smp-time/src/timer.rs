@@ -4,21 +4,11 @@
 
 //! Reactor-owned timer wheel
 
-mod entry;
-use self::entry::{Entry, EntryId, EntryList, TimerEntry};
-
-mod handle;
-pub(crate) use self::handle::Handle;
-
-mod wheel;
-
-pub mod sleep;
-
 use std::{cell::RefCell, fmt, rc::Rc};
 
 use shep_util_slab::Slab;
 
-use crate::{Duration, Instant};
+use crate::{Duration, Instant, entry::Entry, wheel::Wheel};
 
 /// A core-local timer wheel owned and advanced by the reactor.
 ///
@@ -73,12 +63,12 @@ pub struct Timer {
 
 /// Conversion between absolute instants and wheel-relative millisecond ticks.
 #[derive(Debug, Clone)]
-struct ClockTime {
+pub(crate) struct ClockTime {
     start_time: Instant,
 }
 
 impl ClockTime {
-    fn deadline_to_tick(&self, t: Instant) -> u64 {
+    pub(crate) fn deadline_to_tick(&self, t: Instant) -> u64 {
         self.instant_to_tick(t + Duration::from_nanos(999_999))
     }
 
@@ -97,13 +87,13 @@ impl ClockTime {
 }
 
 /// Timer state shared locally by the owner and its registered entries.
-struct Inner {
-    state: RefCell<InnerState>,
+pub(crate) struct Inner {
+    pub(crate) state: RefCell<InnerState>,
 }
 
-struct InnerState {
-    wheel: wheel::Wheel,
-    entries: Slab<Entry>,
+pub(crate) struct InnerState {
+    pub(crate) wheel: Wheel,
+    pub(crate) entries: Slab<Entry>,
 }
 
 impl Timer {
@@ -121,7 +111,7 @@ impl Timer {
     pub fn with_capacity(now: Instant, capacity: usize) -> Self {
         let inner = Inner {
             state: RefCell::new(InnerState {
-                wheel: wheel::Wheel::new(),
+                wheel: Wheel::new(),
                 entries: Slab::with_capacity(capacity),
             }),
         };
@@ -185,5 +175,61 @@ impl Timer {
 impl fmt::Debug for Inner {
     fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt.debug_struct("Inner").finish()
+    }
+}
+
+thread_local! {
+    static CURRENT: RefCell<Option<Handle>> = const { RefCell::new(None) };
+}
+
+/// Local handle to a reactor-owned timer wheel.
+#[derive(Clone)]
+pub(crate) struct Handle {
+    time_source: ClockTime,
+    inner: Rc<Inner>,
+}
+
+impl Handle {
+    /// Creates a new timer `Handle` from a shared `Inner` timer state.
+    fn new(inner: Rc<Inner>, time_source: ClockTime) -> Self {
+        Handle { time_source, inner }
+    }
+
+    /// Returns the time source associated with this handle
+    pub(crate) fn time_source(&self) -> &ClockTime {
+        &self.time_source
+    }
+
+    /// Access the driver's inner structure
+    pub(crate) fn get(&self) -> &Inner {
+        &self.inner
+    }
+
+    /// Standalone replacement for the enclosing Monoio runtime's time handle.
+    fn with<R>(&self, f: impl FnOnce() -> R) -> R {
+        struct Reset(Option<Handle>);
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                CURRENT.with(|slot| slot.replace(self.0.take()));
+            }
+        }
+        let _reset = Reset(CURRENT.with(|slot| slot.replace(Some(self.clone()))));
+        f()
+    }
+    /// Tries to get a handle to the current timer.
+    ///
+    /// # Panics
+    ///
+    /// This function panics if there is no current timer set.
+    ///
+    /// Timers must be constructed inside `Timer::with`.
+    pub(crate) fn current() -> Self {
+        CURRENT.with(|slot| slot.borrow().clone().expect("timer requires Timer::with"))
+    }
+}
+
+impl fmt::Debug for Handle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Handle")
     }
 }

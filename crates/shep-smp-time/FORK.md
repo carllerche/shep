@@ -55,6 +55,11 @@ Changes for Shep:
 - Promote time to the crate root and keep internals private. Use standard
   `ready!`/`poll_fn`. `pin-project-lite` and `shep-util-slab` are the normal
   dependencies; the latter has no normal dependencies or unsafe source.
+- Flatten the source into sibling modules under `src/`. Keep the scoped handle
+  with the owner in `timer.rs`, and the ID list with its private entry links in
+  `entry.rs`. `wheel.rs`, `level.rs`, and `sleep.rs` import their dependencies
+  directly, with no nested forwarding modules. `Instant::now` calls the standard
+  clock directly instead of passing through an obsolete clock-variant module.
 - Use a scoped local handle through `Timer::with`, restoring the previous handle
   on return/unwind. Sleeps remain bound to their creation owner.
 - Preserve the upstream wheel unit tests and adapt the four original list

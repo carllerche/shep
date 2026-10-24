@@ -4,6 +4,11 @@ The timer owns entries in `shep_util_slab::Slab<Entry>` and enforces
 `#![forbid(unsafe_code)]`. The reactor still assembles a concrete Timer with
 `with`, `advance`, and `next_wake`; there is no driver trait or waiting here.
 
+The implementation uses flat sibling modules in `src/`: `timer.rs` owns the
+clock, scoped handle, and shared state; `entry.rs` keeps registration state and
+its ID list together; `wheel.rs` and `level.rs` implement the hierarchy;
+`sleep.rs` provides the consumer future. Entry links stay private to `entry.rs`.
+
 ## Ownership
 
 ```text

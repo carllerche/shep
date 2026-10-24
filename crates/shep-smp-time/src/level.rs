@@ -6,7 +6,10 @@ use std::fmt;
 
 use shep_util_slab::Slab;
 
-use crate::timer::{Entry, EntryId, EntryList};
+use crate::{
+    entry::{Entry, EntryId, EntryList},
+    wheel::NUM_LEVELS,
+};
 
 /// Wheel for a single level in the timer. This wheel contains 64 slots.
 pub(crate) struct Level {
@@ -164,7 +167,7 @@ impl Level {
             // pseudo-ring buffer, and we rotate around them indefinitely. If we
             // compute a deadline before now, and it's the top level, it
             // therefore means we're actually looking at a slot in the future.
-            debug_assert_eq!(self.level, super::NUM_LEVELS - 1);
+            debug_assert_eq!(self.level, NUM_LEVELS - 1);
 
             deadline += self.level_range;
         }
@@ -198,8 +201,7 @@ impl Level {
         // its start has already passed. Search subsequent slots first so that
         // a distant timer here cannot hide an earlier timer in another slot.
         // Lower levels cannot contain entries in an already processed slot.
-        let now_slot =
-            (now / self.slot_range) as usize + usize::from(self.level == super::NUM_LEVELS - 1);
+        let now_slot = (now / self.slot_range) as usize + usize::from(self.level == NUM_LEVELS - 1);
         let occupied = self.occupied.rotate_right(now_slot as u32);
         let zeros = occupied.trailing_zeros() as usize;
         let slot = (zeros + now_slot) % 64;

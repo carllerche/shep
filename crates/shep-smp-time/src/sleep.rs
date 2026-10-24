@@ -10,11 +10,7 @@ use std::{
 
 use pin_project_lite::pin_project;
 
-use crate::{
-    Duration, Instant,
-    error::Error,
-    timer::{Handle, TimerEntry},
-};
+use crate::{Duration, Instant, entry::TimerEntry, error::Error, timer::Handle};
 
 /// Waits until `deadline` is reached.
 ///

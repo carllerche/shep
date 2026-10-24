@@ -55,21 +55,20 @@
 // Retain the upstream wheel's formatting and control flow.
 #![allow(clippy::collapsible_if)]
 
-mod timer;
-pub use timer::{
-    Timer,
-    sleep::{Sleep, sleep, sleep_until},
-};
-
+mod entry;
 pub mod error;
-
 mod instant;
-pub use instant::Instant;
-
 mod interval;
-pub use interval::{Interval, MissedTickBehavior, interval, interval_at};
-
+mod level;
+mod sleep;
 mod timeout;
+mod timer;
+mod wheel;
+
+pub use instant::Instant;
+pub use interval::{Interval, MissedTickBehavior, interval, interval_at};
+pub use sleep::{Sleep, sleep, sleep_until};
 pub use timeout::{Timeout, timeout, timeout_at};
+pub use timer::Timer;
 
 pub use std::time::Duration;

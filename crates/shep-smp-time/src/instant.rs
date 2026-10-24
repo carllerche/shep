@@ -46,7 +46,7 @@ impl Instant {
     /// let now = Instant::now();
     /// ```
     pub fn now() -> Instant {
-        variant::now()
+        Instant::from_std(std::time::Instant::now())
     }
 
     /// Create a `shep_smp_time::Instant` from a `std::time::Instant`.
@@ -206,13 +206,5 @@ impl ops::SubAssign<Duration> for Instant {
 impl fmt::Debug for Instant {
     fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.std.fmt(fmt)
-    }
-}
-
-mod variant {
-    use super::Instant;
-
-    pub(super) fn now() -> Instant {
-        Instant::from_std(std::time::Instant::now())
     }
 }

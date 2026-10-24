@@ -2,17 +2,13 @@
 // Copyright (c) 2021 ihciah, dyxushuai and other Monoio Contributors.
 // Portions Copyright (c) 2021 Tokio Contributors. Licensed under MIT.
 
-use crate::{
-    error::InsertError,
-    timer::{Entry, EntryId},
-};
-
-mod level;
 use shep_util_slab::Slab;
 
-pub(crate) use self::level::Expiration;
-use self::level::Level;
-use super::EntryList;
+use crate::{
+    entry::{Entry, EntryId, EntryList},
+    error::InsertError,
+    level::{Expiration, Level},
+};
 
 /// Timing wheel implementation.
 ///
@@ -43,10 +39,10 @@ pub(crate) struct Wheel {
 /// Number of levels. Each level has 64 slots. By using 6 levels with 64 slots
 /// each, the timer is able to track time up to 2 years into the future with a
 /// precision of 1 millisecond.
-const NUM_LEVELS: usize = 6;
+pub(crate) const NUM_LEVELS: usize = 6;
 
 /// One rotation of the hierarchy; longer deadlines wrap through the top level.
-pub(super) const MAX_DURATION: u64 = (1 << (6 * NUM_LEVELS)) - 1;
+const MAX_DURATION: u64 = (1 << (6 * NUM_LEVELS)) - 1;
 
 impl Wheel {
     /// Create a new timing wheel
@@ -165,7 +161,7 @@ impl Wheel {
 
     /// Returns the tick at which this timer wheel next needs to perform some
     /// processing, or None if there are no timers registered.
-    pub(super) fn next_expiration_time(&self) -> Option<u64> {
+    pub(crate) fn next_expiration_time(&self) -> Option<u64> {
         self.next_expiration().map(|ex| ex.deadline)
     }
 
