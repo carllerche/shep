@@ -12,7 +12,7 @@ Unsupported initialization and opcode errors are returned without a fallback.
 | shep-smp2 | Local executor/timer integration, batching policy and eventfd parking |
 
 The io2 crate root denies unsafe code; only its private driver module opts in.
-Lifecycle, operations and buffers each forbid unsafe code. Both higher layers
+Arena, lifecycle, operations and buffers each forbid unsafe code. Both higher layers
 forbid unsafe code too. The three unsafe blocks publish SQEs and adopt owned
 file descriptors. See [the safety boundary](../crates/shep-smp-io2/SAFETY.md).
 Production dependencies have no Tokio runtime. Existing task internals retain
@@ -38,6 +38,11 @@ file descriptors the kernel needs. Successful completions return Count, File,
 Poll or Done; errors preserve the original owned operation and its buffer.
 New opcodes require implementing ownership, completion and cancellation rules;
 arbitrary raw SQEs and SQE flags are not exposed.
+
+The private arena module owns the slab, its records, admission counters, and
+packed Io/operation identities. The lifecycle module defines the per-operation
+Submitted/Waiting/Ignored/Completed states; the arena applies their transitions
+and combines them with kernel-reference counts to decide slot retirement.
 
 OperationHandle is an eight-byte opaque ID, with no Io reference and no Future
 implementation. Use handle.try_complete(&io), handle.poll_complete(&io, cx), or

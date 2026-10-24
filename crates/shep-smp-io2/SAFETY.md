@@ -1,7 +1,7 @@
 # Owned io_uring operation boundary
 
 The crate root denies unsafe code. Only `src/driver.rs` allows it; `buffer`,
-`operation`, and `lifecycle` each forbid it. The file adapter in
+`operation`, `arena`, and `lifecycle` each forbid it. The file adapter in
 shep-smp-fs2 and runtime/eventfd protocol in shep-smp2 also forbid unsafe code.
 Dependencies (including io-uring and rustix) retain their own unsafe internals.
 
@@ -10,7 +10,9 @@ raw descriptors, or unsafe buffer traits. The driver and Io are local, backed
 by one shared Rc. Operation handles contain only an opaque packed ID and do not
 retain the Io. A submitter cannot inspect or mutate a buffer while the kernel
 owns it. Only the private driver constructs SQEs and processes
-CQEs. Lifecycle helpers remain crate-private in the root lifecycle module.
+CQEs. The root arena module owns slab records, packed identities, and retirement
+helpers; the lifecycle module defines their submitter/completion states. Both
+modules remain private to the crate.
 
 ## Publication and memory ownership
 

@@ -2,7 +2,7 @@
 #![allow(unsafe_code)]
 use crate::{
     Operation,
-    lifecycle::{self, IoId, OperationId},
+    arena::{Arena, IoId, OperationId},
 };
 use io_uring::{IoUring, opcode, types};
 use std::{
@@ -84,7 +84,7 @@ struct Shared {
     /// Process-unique owner prefix used to reject handles from another Io.
     id: IoId,
     /// Shared operation state; no borrow may span application waker callbacks.
-    arena: RefCell<lifecycle::Arena>,
+    arena: RefCell<Arena>,
     /// Live kernel queues; None after Driver destruction, even if Io clones remain.
     ring: RefCell<Option<IoUring>>,
 }
@@ -293,7 +293,7 @@ impl Driver {
             io: Io {
                 shared: Rc::new(Shared {
                     id,
-                    arena: RefCell::new(lifecycle::Arena::new(max_in_flight, id)),
+                    arena: RefCell::new(Arena::new(max_in_flight, id)),
                     ring: RefCell::new(Some(ring)),
                 }),
             },
