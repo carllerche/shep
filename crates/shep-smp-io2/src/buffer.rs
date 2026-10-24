@@ -11,14 +11,20 @@ use std::{
 /// takes the whole buffer, preventing access until completion.
 #[derive(Debug)]
 pub struct Buffer {
+    /// Fixed initialized allocation, including alignment padding; never reallocated.
     storage: Box<[u8]>,
+    /// Offset of the aligned data region within storage.
     start: usize,
+    /// Visible byte length exposed by Deref; always initialized.
     len: usize,
+    /// Requested power-of-two byte alignment for the data address.
     alignment: usize,
 }
 
 impl Buffer {
-    /// Allocate zeroed storage. At most alignment - 1 extra bytes are reserved.
+    /// Allocate zeroed stable storage at a nonzero power-of-two alignment.
+    /// Zero-length buffers still reserve an aligned byte; invalid/overflowing
+    /// layouts and allocation failures return errors.
     pub fn new(len: usize, alignment: usize) -> io::Result<Self> {
         if !alignment.is_power_of_two() {
             return Err(io::Error::new(
@@ -44,6 +50,7 @@ impl Buffer {
         })
     }
 
+    /// Copy bytes into a new aligned allocation; propagate layout/allocation errors.
     pub fn from_slice(bytes: &[u8], alignment: usize) -> io::Result<Self> {
         let mut buffer = Self::new(bytes.len(), alignment)?;
         buffer.copy_from_slice(bytes);
@@ -53,11 +60,13 @@ impl Buffer {
     pub fn alignment(&self) -> usize {
         self.alignment
     }
+    /// Maximum length without reallocating; may include spare alignment padding.
     pub fn capacity(&self) -> usize {
         self.storage.len() - self.start
     }
 
-    /// Resize within the stable allocation, zeroing newly exposed bytes.
+    /// Resize without moving storage, zeroing newly exposed bytes. Panics if
+    /// len exceeds capacity; shrinking does not release the allocation.
     pub fn resize(&mut self, len: usize) {
         assert!(len <= self.capacity(), "buffer capacity exceeded");
         let old = self.len;

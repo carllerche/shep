@@ -19,12 +19,17 @@ use std::{
 /// Opcode-specific ownership of a successful completion.
 #[derive(Debug)]
 pub enum Value {
+    /// Number of bytes transferred by a read, write, send, or receive.
     Count(usize),
+    /// Fresh descriptor returned by open, socket, or accept; closed on value drop.
     File(File),
+    /// Ready poll-event bits from a single-shot PollAdd.
     Poll(u32),
+    /// Successful completion of an operation with no returned payload.
     Done,
 }
 impl Value {
+    /// Extract a byte count; panic if this completion belongs to another opcode.
     pub fn into_count(self) -> usize {
         match self {
             Self::Count(n) => n,
@@ -32,14 +37,20 @@ impl Value {
         }
     }
 }
+/// Terminal result and original inputs, transferred out of a Completed record.
 #[derive(Debug)]
 pub struct Completion {
+    /// Typed CQE result, including kernel errors; inputs are returned either way.
     pub result: io::Result<Value>,
+    /// Original owned request, including its reusable buffer when applicable.
     pub operation: Operation,
 }
+/// Admission or publication failed; the caller still owns every unsubmitted input.
 #[derive(Debug)]
 pub struct Rejected {
+    /// Validation, closed-driver, or immediate-capacity error; no waiter is queued.
     pub error: io::Error,
+    /// Original owned request, including its reusable buffer when applicable.
     pub operation: Operation,
 }
 impl std::fmt::Display for Rejected {
@@ -54,28 +65,41 @@ impl std::error::Error for Rejected {}
 #[must_use = "call wake() to notify operation waiters after reaping"]
 #[derive(Debug, Default)]
 pub struct Progress {
+    /// Terminal CQEs reaped in this batch, including cancellation and watch operations.
     pub retired: usize,
+    /// Completion notifications detached from slab IDs, ready to run without arena borrows.
     wakes: Vec<Waker>,
 }
 impl Progress {
+    /// Deliver extracted notifications, containing each panic so others still run.
+    /// Record transitions already happened during reap; this does not access the slab.
     pub fn wake(self) {
         for waker in self.wakes {
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| waker.wake()));
         }
     }
 }
+/// Local ring and lifecycle storage retained by Io clones and active cancel pins.
 struct Shared {
+    /// Process-unique owner prefix used to reject handles from another Io.
     id: IoId,
+    /// Shared operation state; no borrow may span application waker callbacks.
     arena: RefCell<lifecycle::Arena>,
+    /// Live kernel queues; None after Driver destruction, even if Io clones remain.
     ring: RefCell<Option<IoUring>>,
 }
 
 /// Local push-only producer. It never submits, waits, or queues rejected work.
 #[derive(Clone)]
 pub struct Io {
+    /// Shared local ownership of the ring and slab; ordinary operation handles do not clone it.
     shared: Rc<Shared>,
 }
 impl Io {
+    /// Publish owned inputs as a new Submitted record and return its submitter claim.
+    /// No submit syscall, reap, or waiting occurs. Validation/capacity errors return
+    /// the operation; failed SQ push rolls Submitted back to removed. CLOSE transfers
+    /// its unique File into a kernel-owned fd only after successful publication.
     pub fn push(&self, operation: Operation) -> Result<OperationHandle, Rejected> {
         if let Err(error) = validate(&operation, &self.shared) {
             return Err(Rejected { error, operation });
@@ -104,9 +128,12 @@ impl Io {
         }
         Ok(OperationHandle { id: Some(id) })
     }
+    /// Count accepted SQEs whose terminal CQEs have not been reaped; pins and
+    /// retained completed results do not count. Includes the runtime's watch, if any.
     pub fn in_flight(&self) -> usize {
         self.shared.arena.borrow().in_flight()
     }
+    /// Whether published SQEs still await submission; false once the ring is gone.
     pub fn has_pending(&self) -> bool {
         self.shared
             .ring
@@ -114,7 +141,8 @@ impl Io {
             .as_mut()
             .is_some_and(|r| !r.submission().is_empty())
     }
-    /// Stop ordinary admission; cancellation remains possible through its reserve.
+    /// Open admission -> ordinary-closed; cancellation remains possible through
+    /// its reserve. Existing record states and kernel ownership are unchanged.
     pub fn close(&self) {
         self.shared.arena.borrow_mut().close();
     }
@@ -129,9 +157,18 @@ impl Io {
 #[must_use = "consume the result or call release(&Io) to abandon it"]
 #[derive(Debug)]
 pub struct OperationHandle {
+    /// Live submitter claim. None after completion consumption or explicit release;
+    /// the token owns no Io and dropping it alone cannot change the slab.
     id: Option<OperationId>,
 }
 impl OperationHandle {
+    /// Consume an already reaped completion without submitting, reaping, or waiting.
+    /// Submitted/Waiting returns None unchanged and does not install a waker,
+    /// including after unresolved driver failure; poll_complete checks that failure.
+    /// Completed -> Ignored(None) returns Some(Completion), moving out the result
+    /// and original inputs and clearing this handle's claim. Remove the slot only
+    /// if no cancellation pins remain; otherwise retain it until the final unpin.
+    /// Panics if this handle was consumed/released, or io is not its allocating Io.
     pub fn try_complete(&mut self, io: &Io) -> Option<Completion> {
         let id = self.id.expect("operation already consumed");
         id.check(io.shared.id);
@@ -139,6 +176,11 @@ impl OperationHandle {
         self.id = None;
         Some(result)
     }
+    /// Poll the result: Completed is consumed exactly as in [`Self::try_complete`].
+    /// Otherwise Submitted -> Waiting, or replace the existing Waiting waker, then
+    /// recheck after dropping the replaced waker, which may reenter the driver.
+    /// Return Pending while awaiting a CQE; no submit or reap is performed here.
+    /// Panics for a consumed/released handle, wrong Io, or unresolved driver failure.
     pub fn poll_complete(&mut self, io: &Io, cx: &mut Context<'_>) -> Poll<Completion> {
         // Clone outside borrows: custom wakers may reenter the driver.
         let waker = cx.waker().clone();
@@ -156,9 +198,12 @@ impl OperationHandle {
             None => Poll::Pending,
         }
     }
-    /// Release submitter interest, keeping kernel-owned resources alive. Safe
-    /// after result consumption or an earlier release; a wrong Io panics before
-    /// touching either slab and leaves this handle usable with its actual Io.
+    /// Release submitter interest, keeping kernel-owned resources alive.
+    /// An already consumed/released handle is a no-op. With a live claim, a wrong
+    /// Io panics before slab access, leaving the claim usable with its actual Io.
+    /// Submitted/Waiting -> Ignored(None); Completed -> Ignored(Some(result)).
+    /// If no kernel refs remain, remove immediately; otherwise retain the record
+    /// until they retire. Clear the handle's ID in either case. Never cancel I/O.
     pub fn release(&mut self, io: &Io) {
         if let Some(id) = self.id {
             id.check(io.shared.id);
@@ -169,6 +214,8 @@ impl OperationHandle {
     }
     /// Pin this identity until cancellation retires or the unsubmitted token is
     /// dropped. Cancellation tokens retain their Io to release that extra pin.
+    /// Submitted/Waiting/Completed keep their state and gain one identity ref.
+    /// Panics for a consumed/released handle, wrong Io, or reference overflow.
     pub fn cancel_target(&self, io: &Io) -> CancelTarget {
         let id = self.id.expect("operation already consumed");
         id.check(io.shared.id);
@@ -182,7 +229,10 @@ impl OperationHandle {
 
 /// A cancellation target is an owned identity reference, not a reusable integer.
 pub struct CancelTarget {
+    /// Some while the target pin is armed; None after its cancellation CQE is reaped.
+    /// Retains the allocating Io so an unsubmitted token can unpin on drop.
     io: Option<Io>,
+    /// Pinned target identity; its slab index cannot be reused until this pin ends.
     id: OperationId,
 }
 impl std::fmt::Debug for CancelTarget {
@@ -193,11 +243,16 @@ impl std::fmt::Debug for CancelTarget {
     }
 }
 impl CancelTarget {
+    /// At the cancellation CQE, armed Some(Io) -> disarmed None, releasing the Io clone.
+    /// Return the target ID for the driver to unpin after retiring the cancel record;
+    /// this method itself does not unpin. Already disarmed returns None.
     fn disarm(&mut self) -> Option<OperationId> {
         self.io.take().map(|_| self.id)
     }
 }
 impl Drop for CancelTarget {
+    /// Armed -> disarmed and release the target pin; remove an Ignored target
+    /// only if that was its final kernel ref. A retired token is already disarmed.
     fn drop(&mut self) {
         if let Some(io) = self.io.take() {
             let released = io.shared.arena.borrow_mut().unpin(self.id);
@@ -211,9 +266,14 @@ impl Drop for CancelTarget {
 /// Explicitly drain before destruction. Dropping with unresolved work retains
 /// its resources conservatively; it never blocks on an arbitrary socket read.
 pub struct Driver {
+    /// Driver-owned reference to the ring/slab; clones can outlive the driver
+    /// to consume completed records, but cannot submit once the ring is closed.
     io: Io,
 }
 impl Driver {
+    /// Create an empty ring with max_in_flight ordinary slots plus one cancel reserve.
+    /// Fail on invalid capacity (outside 1..=32767), unsupported extended waits,
+    /// ring creation errors, or exhausted process Io IDs.
     pub fn new(max_in_flight: usize) -> io::Result<Self> {
         if !(1..=32767).contains(&max_in_flight) {
             return Err(io::Error::new(
@@ -242,15 +302,21 @@ impl Driver {
     pub fn io(&self) -> &Io {
         &self.io
     }
+    /// Publish through [`Io::push`], with the same admission and lifecycle rules.
     pub fn push(&self, operation: Operation) -> Result<OperationHandle, Rejected> {
         self.io.push(operation)
     }
+    /// Count requests awaiting their original CQEs; see [`Io::in_flight`].
     pub fn in_flight(&self) -> usize {
         self.io.in_flight()
     }
+    /// Whether SQEs await submission; see [`Io::has_pending`].
     pub fn has_pending(&self) -> bool {
         self.io.has_pending()
     }
+    /// Submit the currently published batch; Submitted/Waiting remain unchanged
+    /// until their CQEs are reaped. Empty SQ returns zero. Transient errors retain
+    /// all requests for retry; fatal errors mark failure and extract/wake waiters.
     pub fn submit(&mut self) -> io::Result<usize> {
         let result = {
             let mut ring = self.io.shared.ring.borrow_mut();
@@ -262,6 +328,9 @@ impl Driver {
         };
         self.check(result)
     }
+    /// On a fatal enter error, close all admission and turn Waiting -> Submitted
+    /// while extracting/waking those waiters. Leave their inputs kernel-owned;
+    /// transient errors and ETIME leave both admission and record states unchanged.
     fn check<T>(&self, result: io::Result<T>) -> io::Result<T> {
         if let Err(error) = &result
             && !transient(error)
@@ -274,6 +343,11 @@ impl Driver {
         result
     }
     /// Reap only: never calls submit or runs an application future.
+    /// For each original CQE, Submitted/Waiting -> Completed, or keep Ignored
+    /// until its final ref retires, then remove it. Cancellation CQEs also end
+    /// their target pins. Return extracted wakers for Progress::wake outside
+    /// borrows; abandoned inputs/results are destroyed after the CQ snapshot.
+    /// Panics on invalid identities, duplicate CQEs, or unsupported nonterminal CQEs.
     pub fn reap(&mut self) -> Progress {
         let mut progress = Progress::default();
         let mut discarded = Vec::new();
@@ -320,7 +394,10 @@ impl Driver {
         drop(discarded);
         progress
     }
-    /// Explicit batching + wait. The runtime decides when it is safe to sleep.
+    /// Submit a batch and wait for a CQE/deadline; the runtime decides when to sleep.
+    /// Does not reap or advance record states; call reap to observe completion.
+    /// An expired deadline skips submission. Transient errors return Interrupted;
+    /// fatal errors close admission and wake Waiting records as in submit.
     pub fn submit_and_wait(&mut self, deadline: Option<Instant>) -> io::Result<WaitOutcome> {
         let result = {
             let mut ring = self.io.shared.ring.borrow_mut();
@@ -347,6 +424,9 @@ impl Driver {
     }
     /// Stop admission and drive accepted work to terminal CQEs. Pending watches
     /// and receives must be explicitly canceled by their higher-level owner.
+    /// Repeated reap turns pending records into Completed or removes Ignored
+    /// records after their refs retire. Completed submitter claims remain for
+    /// later consumption. Return enter errors; this can wait indefinitely for I/O.
     pub fn drain(&mut self) -> io::Result<()> {
         self.io.close();
         while self.in_flight() != 0 {
@@ -365,6 +445,10 @@ impl Driver {
     }
 }
 impl Drop for Driver {
+    /// Close admission, reap available CQEs, then mark failed and extract pending
+    /// wakers (Waiting -> Submitted). Retain unretired inputs conservatively and
+    /// set the shared ring to None; no blocking drain occurs. Completed results
+    /// remain available through retained Io clones until consumed/released.
     fn drop(&mut self) {
         self.io.close();
         self.reap().wake();
@@ -377,12 +461,17 @@ impl Drop for Driver {
         Progress { retired: 0, wakes }.wake();
     }
 }
+/// Outcome of one kernel wait attempt; completion records have not yet been reaped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WaitOutcome {
+    /// Kernel wait returned; reap CQEs to observe their results.
     Ready,
+    /// Deadline elapsed; an already-expired deadline skips submission as well.
     TimedOut,
+    /// Transient EINTR/EAGAIN/EBUSY; the caller may service other work and retry.
     Interrupted,
 }
+/// Whether an enter error permits retry without invalidating published requests.
 fn transient(e: &io::Error) -> bool {
     matches!(
         e.raw_os_error(),
@@ -390,6 +479,8 @@ fn transient(e: &io::Error) -> bool {
     )
 }
 
+/// Reject offsets, lengths, spent CLOSEs, and foreign/disarmed cancellation tokens
+/// before admission; on success this does not change lifecycle state.
 fn validate(operation: &Operation, shared: &Rc<Shared>) -> io::Result<()> {
     let invalid = match operation {
         Operation::ReadAt { offset, .. } | Operation::WriteAt { offset, .. } => {
@@ -419,6 +510,8 @@ fn validate(operation: &Operation, shared: &Rc<Shared>) -> io::Result<()> {
     }
     Ok(())
 }
+/// Build an SQE from stable owned inputs. Does not publish or advance lifecycle;
+/// the caller must retain those inputs through the eventual terminal CQE.
 fn entry(operation: &mut Operation) -> io_uring::squeue::Entry {
     match operation {
         Operation::Nop => opcode::Nop::new().build(),
@@ -522,6 +615,8 @@ fn entry(operation: &mut Operation) -> io_uring::squeue::Entry {
         Operation::Cancel(target) => opcode::AsyncCancel::new(target.id.raw()).build(),
     }
 }
+/// Translate a terminal CQE into a typed result, adopting successful fresh fds
+/// even when the submitter abandoned interest. Does not update the arena itself.
 fn value(operation: &Operation, result: i32) -> io::Result<Value> {
     if result < 0 {
         return Err(io::Error::from_raw_os_error(-result));
@@ -540,6 +635,9 @@ fn value(operation: &Operation, result: i32) -> io::Result<Value> {
         _ => Value::Done,
     })
 }
+/// At a CLOSE CQE, submitted Some(fd) -> None. ECANCELED re-adopts and closes
+/// the unexecuted descriptor; other results discard the saved fd number. Never
+/// retry closing it: the kernel may have closed it and reused that number.
 fn finish_close(operation: &mut Operation, result: i32) {
     if let Operation::Close(close) = operation
         && let Some(fd) = close.submitted.take()

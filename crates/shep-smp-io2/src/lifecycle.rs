@@ -9,12 +9,18 @@ const MAX_INDEX: u64 = (1 << INDEX_BITS) - 1;
 const MAX_IO_ID: u32 = (1 << 24) - 1;
 static NEXT_IO_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
 
+/// Process-unique owner identity; never reused after its driver is destroyed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct IoId(u32);
+pub(crate) struct IoId(
+    /// Nonzero owner number fitting in 24 bits.
+    u32,
+);
 impl IoId {
+    /// Allocate an owner ID, or fail permanently once the 24-bit namespace is full.
     pub(crate) fn allocate() -> io::Result<Self> {
         Self::allocate_from(&NEXT_IO_ID)
     }
+    /// Reserve the next ID with relaxed CAS; exhaustion leaves the counter unchanged.
     fn allocate_from(counter: &std::sync::atomic::AtomicU32) -> io::Result<Self> {
         use std::sync::atomic::Ordering::Relaxed;
         let mut next = counter.load(Relaxed);
@@ -30,6 +36,7 @@ impl IoId {
             }
         }
     }
+    /// Pack this owner and a slab index; return None if the index exceeds 40 bits.
     fn operation(self, index: usize) -> Option<OperationId> {
         let index = u64::try_from(index).ok()?;
         if index > MAX_INDEX {
@@ -42,9 +49,14 @@ impl IoId {
     }
 }
 
+/// Owner and slab index packed into the u64 carried by SQEs and CQEs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct OperationId(std::num::NonZeroU64);
+pub(crate) struct OperationId(
+    /// High 24 bits identify the Io; low 40 bits select its slab entry.
+    std::num::NonZeroU64,
+);
 impl OperationId {
+    /// Decode kernel user_data; panic on zero. The caller must also check the owner.
     pub(crate) fn from_raw(raw: u64) -> Self {
         Self(std::num::NonZeroU64::new(raw).expect("nonzero CQE identity"))
     }
@@ -54,6 +66,7 @@ impl OperationId {
     pub(crate) fn belongs_to(self, owner: IoId) -> bool {
         (self.raw() >> INDEX_BITS) == u64::from(owner.0)
     }
+    /// Panic on an owner mismatch before the caller indexes its slab.
     pub(crate) fn check(self, owner: IoId) {
         assert!(
             self.belongs_to(owner),
@@ -65,30 +78,56 @@ impl OperationId {
     }
 }
 
+/// Submitter interest and completion availability, independent of cancellation pins.
+/// A slot is reusable only in Ignored with no remaining kernel references.
 enum Lifecycle {
+    /// Published or awaiting a CQE, with an interested submitter and no waker.
     Submitted,
+    /// Still awaiting a CQE; notify this submitter when it is reaped.
     Waiting(Waker),
+    /// Submitter released its claim. None means no result, or values consumed;
+    /// Some retains an abandoned CQE result until cancellation pins retire.
     Ignored(Option<io::Result<Value>>),
+    /// Original CQE reaped; the submitter has not consumed its owned result yet.
     Completed(io::Result<Value>),
 }
+/// One shared slab entry, retained until both submitter and kernel claims end.
 pub(crate) struct Record {
-    // Values can be consumed after the target CQE while a cancel still pins its ID.
+    /// Owned request inputs. None after consumption while a cancel pins the slot,
+    /// or after fatal cleanup detaches unresolved inputs for conservative retention.
     pub(crate) operation: Option<Operation>,
+    /// Submitter interest, optional result, and the operation-specific waker.
     lifecycle: Lifecycle,
+    /// One reference for the original CQE plus each outstanding CancelTarget pin,
+    /// including tokens not yet published as cancellation SQEs.
     kernel_refs: usize,
+    /// Whether the original terminal CQE has been reaped; pins may still remain.
     pub(crate) own_done: bool,
+    /// Whether this request uses the separate one-operation cancellation reserve.
     cancel: bool,
 }
+/// Owns requests and enforces admission separately from completed-result retention.
+/// Callers validate ID ownership before access and destroy returned records/wakers
+/// after releasing arena borrows.
 pub(crate) struct Arena {
+    /// Owner prefix applied to every newly allocated slab index.
     io_id: IoId,
+    /// Live records, including completed values and cancellation-pinned identities.
     entries: Slab<Record>,
+    /// Accepted operations awaiting their original CQEs, including cancellation SQEs.
+    /// Fatal detachment clears this count without proving kernel retirement.
     active: usize,
+    /// Outstanding cancellation SQEs; at most one, excluded from ordinary capacity.
     cancel_active: usize,
+    /// Maximum ordinary operations awaiting CQEs; completed results do not count.
     capacity: usize,
+    /// Ordinary admission is closed; the cancellation reserve remains usable.
     closed: bool,
+    /// Terminal driver failure; all admission, including cancellation, is rejected.
     failed: bool,
 }
 impl Arena {
+    /// Create an empty arena with ordinary capacity and one reserved cancellation slot.
     pub(crate) fn new(capacity: usize, io_id: IoId) -> Self {
         Self {
             io_id,
@@ -100,6 +139,10 @@ impl Arena {
             failed: false,
         }
     }
+    /// Create Submitted with one original-CQE reference and a submitter claim.
+    /// BrokenPipe rejects closed ordinary admission or any admission after failure;
+    /// WouldBlock rejects exhausted capacity, cancellation reserve, or index space.
+    /// On rejection, return inputs unchanged; no lifecycle entry is created.
     pub(crate) fn insert(&mut self, operation: Operation) -> Result<OperationId, Rejected> {
         let cancel = operation.is_cancel();
         let error = if self.failed || (self.closed && !cancel) {
@@ -136,11 +179,15 @@ impl Arena {
         self.cancel_active += usize::from(cancel);
         Ok(id)
     }
+    /// Borrow a live record; panic if its slot is absent. Owner validation is external.
     pub(crate) fn record(&mut self, id: OperationId) -> &mut Record {
         self.entries
             .get_mut(id.index())
             .expect("live operation identity")
     }
+    /// Roll back Submitted -> removed after SQ push failed to publish the request.
+    /// Requires a fresh, unshared entry: panics unless Submitted with one kernel ref.
+    /// Return its owned inputs and release admission; never use after publication.
     pub(crate) fn reject(&mut self, id: OperationId, error: io::Error) -> Rejected {
         let record = self.entries.remove(id.index());
         assert!(matches!(record.lifecycle, Lifecycle::Submitted));
@@ -152,6 +199,8 @@ impl Arena {
             error,
         }
     }
+    /// Keep a live identity unavailable for reuse by adding a cancellation reference.
+    /// Lifecycle is unchanged; panic on a missing slot or reference-count overflow.
     pub(crate) fn pin(&mut self, id: OperationId) {
         let record = self.record(id);
         record.kernel_refs = record
@@ -159,6 +208,9 @@ impl Arena {
             .checked_add(1)
             .expect("operation reference overflow");
     }
+    /// Release one kernel/identity reference. Ignored -> removed only at zero refs;
+    /// all other states remain resident. Panic on a missing slot or zero ref count.
+    /// Return any removed record for destruction outside the arena borrow.
     pub(crate) fn unpin(&mut self, id: OperationId) -> Option<Record> {
         let record = self.record(id);
         assert!(record.kernel_refs != 0);
@@ -169,6 +221,11 @@ impl Arena {
             None
         }
     }
+    /// Observe the original terminal CQE: Submitted/Waiting -> Completed(result),
+    /// or Ignored(None) -> Ignored(Some(result)); extract any Waiting waker.
+    /// Release admission and the original kernel ref, removing Ignored if no pins
+    /// remain. Panic on a missing slot, duplicate CQE, or incompatible state.
+    /// Return notifications/discards for delivery/destruction outside the borrow.
     pub(crate) fn complete(
         &mut self,
         id: OperationId,
@@ -189,6 +246,10 @@ impl Arena {
         self.active -= 1;
         (wake, self.unpin(id))
     }
+    /// Consume Completed(result) -> Ignored(None), returning both result and inputs.
+    /// Remove the slot if kernel_refs is zero; otherwise keep its now input-free
+    /// record until cancellation pins retire. Return None without mutation for an
+    /// absent slot or any non-Completed state; never install or invoke a waker.
     pub(crate) fn take(&mut self, id: OperationId) -> Option<Completion> {
         let record = self.entries.get_mut(id.index())?;
         if !matches!(record.lifecycle, Lifecycle::Completed(_)) {
@@ -205,6 +266,9 @@ impl Arena {
         }
         Some(Completion { result, operation })
     }
+    /// Register Submitted -> Waiting(waker), or replace Waiting's waker.
+    /// Completed stays Completed and returns the unused new waker; Ignored or a
+    /// missing slot panics. Return replaced wakers for destruction outside the borrow.
     pub(crate) fn wait(&mut self, id: OperationId, waker: Waker) -> Option<Waker> {
         match &mut self.record(id).lifecycle {
             state @ Lifecycle::Submitted => {
@@ -216,6 +280,11 @@ impl Arena {
             Lifecycle::Ignored(_) => unreachable!("submitter released operation"),
         }
     }
+    /// Release the submitter: Submitted/Waiting -> Ignored(None), or Completed ->
+    /// Ignored(Some(result)). With no kernel refs, remove the record immediately.
+    /// Otherwise retain inputs/results until the final unpin. Panic on a missing
+    /// slot or a second release of a retained Ignored record. Return the old waker
+    /// and any removed record for destruction outside the borrow.
     pub(crate) fn abandon(&mut self, id: OperationId) -> (Option<Waker>, Option<Record>) {
         let record = self.record(id);
         if record.kernel_refs == 0 {
@@ -233,9 +302,11 @@ impl Arena {
         };
         (wake, None)
     }
+    /// Close ordinary admission without changing record states; cancellation is allowed.
     pub(crate) fn close(&mut self) {
         self.closed = true;
     }
+    /// Make admission terminally closed, including cancellation; records stay intact.
     pub(crate) fn fail(&mut self) {
         self.closed = true;
         self.failed = true;
@@ -246,6 +317,8 @@ impl Arena {
     pub(crate) fn in_flight(&self) -> usize {
         self.active
     }
+    /// Extract pending wakers with Waiting -> Submitted; leave other states unchanged.
+    /// Failure cleanup uses this to notify waiters outside borrows; no SQE is resubmitted.
     pub(crate) fn wakers(&mut self) -> Vec<Waker> {
         let mut wakes = Vec::new();
         for (_, record) in &mut self.entries {
@@ -260,6 +333,11 @@ impl Arena {
         }
         wakes
     }
+    /// Mark the arena failed and detach inputs whose original CQEs are unobserved.
+    /// Leave lifecycle states and identity refs intact for later token cleanup; reset
+    /// admission counts. Returned inputs remain kernel-owned and must be retained,
+    /// not destroyed, unless retirement is independently established. Driver Drop
+    /// leaks them conservatively; completed records remain consumable through Io.
     pub(crate) fn retain_unresolved(&mut self) -> Vec<Operation> {
         self.fail();
         let operations = self
