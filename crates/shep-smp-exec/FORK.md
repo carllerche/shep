@@ -29,8 +29,10 @@ Changes for Shep:
   its owning thread even if join handles or foreign wakers survive.
 - Release all registry borrows before polling or dropping a future so spawning
   from tasks and shutdown destructors cannot conflict with a `RefCell` borrow.
-- Route same-executor wakes directly to the local queue. Use a standard-library
-  inbox of opaque task IDs and a supplied driver waker for other notifications,
+- Route wakes matching the scoped current executor directly to the local queue.
+  Runtime integration keeps this scope active during I/O/timer callbacks too.
+  Use a standard-library inbox of opaque task IDs for other notifications; only
+  foreign threads invoke the supplied driver waker,
   instead of Monoio's runtime-ID registries, caches, and forwarded raw wakers.
 - Use an explicit turn budget rather than Monoio's queue-length-derived limit.
   Both remote ingestion and queue consumption are bounded. A future still
@@ -43,3 +45,11 @@ The future io_uring runtime will supply the driver's retained wakeup mechanism,
 service the ring and timing wheel between turns, and check `has_ready()` before
 waiting. `shep-smp-exec` adds no alternate I/O backend, blocking loop, thread
 pool, work stealing, timers, or changes to the existing `shep-smp` execution path.
+
+`Executor::enter` selects the scoped owner independently of task polling. The
+separate polling guard continues rejecting recursive run_ready calls. Scope
+restoration and weak TLS ownership remain safe Rust; the crate forbids unsafe
+code. Matching scopes route directly to ready, including callbacks between task
+turns. An absent or different scope on the owner thread routes through the inbox
+without waking the driver. The runtime's parking handshake suppresses foreign
+signals while it is running and coalesces them while preparing to sleep.

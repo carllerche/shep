@@ -190,7 +190,7 @@ fn foreign_ready_work_is_processed_in_bounded_turns() {
 }
 
 #[test]
-fn wakes_outside_a_turn_use_the_foreign_inbox() {
+fn owner_thread_wakes_outside_a_turn_bypass_the_driver() {
     let wake = Arc::new(CountWake(AtomicUsize::new(0)));
     let mut exec = Executor::new(Waker::from(wake.clone()));
     let saved = Rc::new(RefCell::new(None));
@@ -202,7 +202,7 @@ fn wakes_outside_a_turn_use_the_foreign_inbox() {
     assert_eq!(exec.run_ready(1), 1);
     assert!(!exec.has_ready());
     saved.borrow().as_ref().unwrap().wake_by_ref();
-    assert_eq!(wake.0.load(Ordering::Relaxed), 1);
+    assert_eq!(wake.0.load(Ordering::Relaxed), 0);
     assert!(exec.has_ready());
     assert_eq!(exec.run_ready(1), 1);
     drop(join);
@@ -223,7 +223,7 @@ fn a_wake_from_another_executor_reaches_the_owner() {
     other.spawn(async move { saved.borrow_mut().take().unwrap().wake() });
     assert_eq!(other.run_ready(4), 1);
     assert!(other.is_empty());
-    assert_eq!(wake.0.load(Ordering::Relaxed), 1);
+    assert_eq!(wake.0.load(Ordering::Relaxed), 0);
     assert!(owner.has_ready());
     assert_eq!(owner.run_ready(1), 1);
 }

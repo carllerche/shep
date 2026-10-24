@@ -40,6 +40,8 @@
 // Copyright (c) 2021 ihciah, dyxushuai and other Monoio Contributors.
 // Licensed under MIT.
 
+#![forbid(unsafe_code)]
+
 mod context;
 mod scheduler;
 
@@ -56,6 +58,18 @@ pub struct Executor {
     context: Rc<Context>,
 }
 
+/// Scoped owner context for task creation and local wake routing, including
+/// reactor/timer callbacks outside task polling. Guards must be dropped in LIFO
+/// order and cannot cross threads. They weakly reference executor state.
+/// ```compile_fail
+/// fn send<T: Send>() {}
+/// send::<shep_smp_exec::EnterGuard>();
+/// ```
+#[must_use = "keep the guard alive while driving this executor's runtime"]
+pub struct EnterGuard {
+    _scope: Scope,
+}
+
 impl Executor {
     /// Create an executor using `wake` to interrupt its driver's idle wait.
     ///
@@ -67,6 +81,14 @@ impl Executor {
     pub fn new(wake: Waker) -> Self {
         Self {
             context: Rc::new(Context::new(wake)),
+        }
+    }
+
+    /// Enter this executor's context while driving its runtime. Nested context
+    /// scopes restore the previous owner; task polling still rejects recursion.
+    pub fn enter(&self) -> EnterGuard {
+        EnterGuard {
+            _scope: Scope::enter(&self.context),
         }
     }
 
@@ -89,14 +111,13 @@ impl Executor {
     ///
     /// # Panics
     ///
-    /// Panics if an executor is already running on this thread. A future's
+    /// Panics if a task-polling turn is already active on this thread. A future's
     /// panic instead completes its join with [`JoinError::Panicked`].
     pub fn run_ready(&mut self, budget: usize) -> usize {
-        assert!(context::current().is_none(), "cannot run a nested executor");
+        let _scope = Scope::poll(&self.context);
         if self.context.is_closed() {
             return 0;
         }
-        let _scope = Scope::enter(&self.context);
         self.context.import_remote(budget);
         let mut polled = 0;
         for _ in 0..budget {
@@ -148,11 +169,11 @@ impl Drop for Executor {
     }
 }
 
-/// Queue a future on the executor currently polling this task, as in Monoio.
+/// Queue a future on the executor currently entered on this thread.
 ///
 /// # Panics
 ///
-/// Panics when called outside an executor turn or its shutdown scope.
+/// Panics outside an entered runtime, executor turn or shutdown scope.
 pub fn spawn<F>(future: F) -> JoinHandle<F::Output>
 where
     F: Future + 'static,

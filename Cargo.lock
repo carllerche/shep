@@ -1387,6 +1387,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "shep-smp-io2"
+version = "0.1.0"
+dependencies = [
+ "io-uring",
+ "libc",
+ "slab",
+ "tempfile",
+]
+
+[[package]]
 name = "shep-smp-task"
 version = "0.1.0"
 dependencies = [
@@ -1404,6 +1414,18 @@ dependencies = [
  "shep-futures",
  "shep-smp-exec",
  "shep-util-slab",
+]
+
+[[package]]
+name = "shep-smp2"
+version = "0.1.0"
+dependencies = [
+ "criterion",
+ "shep-smp-exec",
+ "shep-smp-io2",
+ "shep-smp-time",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]
