@@ -19,10 +19,12 @@
 mod arena;
 mod buffer;
 mod driver;
+mod io;
 mod lifecycle;
 mod operation;
 pub use buffer::Buffer;
-pub use driver::{
-    CancelTarget, Completion, Driver, Io, OperationHandle, Progress, Rejected, Value, WaitOutcome,
+pub use driver::{Driver, Progress, WaitOutcome};
+pub use io::{Io, Rejected};
+pub use operation::{
+    CancelTarget, Close, Completion, Operation, OperationHandle, SocketAddress, Value,
 };
-pub use operation::{Close, Operation, SocketAddress};

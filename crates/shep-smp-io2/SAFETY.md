@@ -1,7 +1,7 @@
 # Owned io_uring operation boundary
 
 The crate root denies unsafe code. Only `src/driver.rs` allows it; `buffer`,
-`operation`, `arena`, and `lifecycle` each forbid it. The file adapter in
+`io`, `operation`, `arena`, and `lifecycle` each forbid it. The file adapter in
 shep-smp-fs2 and runtime/eventfd protocol in shep-smp2 also forbid unsafe code.
 Dependencies (including io-uring and rustix) retain their own unsafe internals.
 
@@ -10,9 +10,11 @@ raw descriptors, or unsafe buffer traits. The driver and Io are local, backed
 by one shared Rc. Operation handles contain only an opaque packed ID and do not
 retain the Io. A submitter cannot inspect or mutate a buffer while the kernel
 owns it. Only the private driver constructs SQEs and processes
-CQEs. The root arena module owns slab records, packed identities, and retirement
-helpers; the lifecycle module defines their submitter/completion states. Both
-modules remain private to the crate.
+CQEs. The driver owns shared ring storage and DriverId allocation. The io module
+provides the safe producer and Rejected admission errors; operation owns handles,
+cancellation tokens, completion values, and request inputs. Arena owns slab
+records, packed OperationIds, and retirement helpers; lifecycle defines their
+submitter/completion states. These implementation modules are crate-private.
 
 ## Publication and memory ownership
 
@@ -38,7 +40,8 @@ as an internal invariant violation.
 
 ## Shared lifecycle and cancellation identities
 
-Each Io receives a process-unique nonzero 24-bit ID from a static atomic counter.
+Each driver receives a process-unique nonzero 24-bit DriverId from a static
+atomic counter; its Io clones share that identity.
 Allocation stops permanently at exhaustion; IDs never wrap or recycle. The
 OperationId packs that owner into the high 24 bits and the slab index into the
 low 40 bits. NonZeroU64 makes the optional handle exactly eight bytes. Slab

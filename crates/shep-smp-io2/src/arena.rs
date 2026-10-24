@@ -1,61 +1,31 @@
-//! Operation slab ownership, admission, and packed owner/slot identities.
+//! Operation slab ownership, admission, and packed slot identities.
 #![forbid(unsafe_code)]
-use crate::{Completion, Operation, Rejected, Value, lifecycle::Lifecycle};
+use crate::{Completion, Operation, Rejected, Value, driver::DriverId, lifecycle::Lifecycle};
 use slab::Slab;
 use std::{io, task::Waker};
 
 const INDEX_BITS: u32 = 40;
 const MAX_INDEX: u64 = (1 << INDEX_BITS) - 1;
-const MAX_IO_ID: u32 = (1 << 24) - 1;
-static NEXT_IO_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
 
-/// Process-unique owner identity; never reused after its driver is destroyed.
+/// Owner and slab index packed into the u64 carried by SQEs and CQEs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct IoId(
-    /// Nonzero owner number fitting in 24 bits.
-    u32,
+pub(crate) struct OperationId(
+    /// High 24 bits identify the driver; low 40 bits select its slab entry.
+    std::num::NonZeroU64,
 );
-impl IoId {
-    /// Allocate an owner ID, or fail permanently once the 24-bit namespace is full.
-    pub(crate) fn allocate() -> io::Result<Self> {
-        Self::allocate_from(&NEXT_IO_ID)
-    }
-    /// Reserve the next ID with relaxed CAS; exhaustion leaves the counter unchanged.
-    fn allocate_from(counter: &std::sync::atomic::AtomicU32) -> io::Result<Self> {
-        use std::sync::atomic::Ordering::Relaxed;
-        let mut next = counter.load(Relaxed);
-        loop {
-            if next > MAX_IO_ID {
-                return Err(io::Error::other(
-                    "process io_uring identity limit exhausted",
-                ));
-            }
-            match counter.compare_exchange_weak(next, next + 1, Relaxed, Relaxed) {
-                Ok(_) => return Ok(Self(next)),
-                Err(actual) => next = actual,
-            }
-        }
-    }
+impl OperationId {
     /// Pack this owner and a slab index; return None if the index exceeds 40 bits.
-    fn operation(self, index: usize) -> Option<OperationId> {
+    pub(crate) fn new(owner: DriverId, index: usize) -> Option<OperationId> {
         let index = u64::try_from(index).ok()?;
         if index > MAX_INDEX {
             return None;
         }
         Some(OperationId(
-            std::num::NonZeroU64::new((u64::from(self.0) << INDEX_BITS) | index)
+            std::num::NonZeroU64::new((u64::from(owner.raw()) << INDEX_BITS) | index)
                 .expect("nonzero I/O identity"),
         ))
     }
-}
 
-/// Owner and slab index packed into the u64 carried by SQEs and CQEs.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct OperationId(
-    /// High 24 bits identify the Io; low 40 bits select its slab entry.
-    std::num::NonZeroU64,
-);
-impl OperationId {
     /// Decode kernel user_data; panic on zero. The caller must also check the owner.
     pub(crate) fn from_raw(raw: u64) -> Self {
         Self(std::num::NonZeroU64::new(raw).expect("nonzero CQE identity"))
@@ -63,11 +33,11 @@ impl OperationId {
     pub(crate) fn raw(self) -> u64 {
         self.0.get()
     }
-    pub(crate) fn belongs_to(self, owner: IoId) -> bool {
-        (self.raw() >> INDEX_BITS) == u64::from(owner.0)
+    pub(crate) fn belongs_to(self, owner: DriverId) -> bool {
+        (self.raw() >> INDEX_BITS) == u64::from(owner.raw())
     }
     /// Panic on an owner mismatch before the caller indexes its slab.
-    pub(crate) fn check(self, owner: IoId) {
+    pub(crate) fn check(self, owner: DriverId) {
         assert!(
             self.belongs_to(owner),
             "operation belongs to a different Io"
@@ -98,7 +68,7 @@ pub(crate) struct Record {
 /// after releasing arena borrows.
 pub(crate) struct Arena {
     /// Owner prefix applied to every newly allocated slab index.
-    io_id: IoId,
+    driver_id: DriverId,
     /// Live records, including completed values and cancellation-pinned identities.
     entries: Slab<Record>,
     /// Accepted operations awaiting their original CQEs, including cancellation SQEs.
@@ -115,9 +85,9 @@ pub(crate) struct Arena {
 }
 impl Arena {
     /// Create an empty arena with ordinary capacity and one reserved cancellation slot.
-    pub(crate) fn new(capacity: usize, io_id: IoId) -> Self {
+    pub(crate) fn new(capacity: usize, driver_id: DriverId) -> Self {
         Self {
-            io_id,
+            driver_id,
             entries: Slab::with_capacity(capacity + 1),
             active: 0,
             cancel_active: 0,
@@ -149,7 +119,7 @@ impl Arena {
             });
         }
         let entry = self.entries.vacant_entry();
-        let Some(id) = self.io_id.operation(entry.key()) else {
+        let Some(id) = OperationId::new(self.driver_id, entry.key()) else {
             return Err(Rejected {
                 operation,
                 error: io::ErrorKind::WouldBlock.into(),
@@ -362,7 +332,7 @@ mod tests {
     }
     #[test]
     fn completion_first_keeps_values_until_the_future_consumes_them() {
-        let mut arena = Arena::new(1, IoId::allocate().unwrap());
+        let mut arena = Arena::new(1, DriverId::allocate().unwrap());
         let token = arena.insert(operation()).unwrap();
         assert!(arena.take(token).is_none());
         let (wake, discard) = arena.complete(token, Ok(Value::Count(3)));
@@ -377,7 +347,7 @@ mod tests {
     }
     #[test]
     fn future_drop_first_retains_resources_until_the_terminal_cqe() {
-        let mut arena = Arena::new(1, IoId::allocate().unwrap());
+        let mut arena = Arena::new(1, DriverId::allocate().unwrap());
         let operation = operation();
         let Operation::ReadAt { file, .. } = &operation else {
             unreachable!()
@@ -396,7 +366,7 @@ mod tests {
     }
     #[test]
     fn waiting_completion_extracts_waker_before_removing_a_completed_entry() {
-        let mut arena = Arena::new(1, IoId::allocate().unwrap());
+        let mut arena = Arena::new(1, DriverId::allocate().unwrap());
         let token = arena.insert(operation()).unwrap();
         assert!(arena.wait(token, Waker::noop().clone()).is_none());
         assert!(arena.wait(token, Waker::noop().clone()).is_some());
@@ -408,7 +378,7 @@ mod tests {
     }
     #[test]
     fn dropping_a_waiting_future_releases_its_waker_but_not_its_operation() {
-        let mut arena = Arena::new(1, IoId::allocate().unwrap());
+        let mut arena = Arena::new(1, DriverId::allocate().unwrap());
         let token = arena.insert(operation()).unwrap();
         arena.wait(token, Waker::noop().clone());
         let (wake, discarded) = arena.abandon(token);
@@ -420,7 +390,7 @@ mod tests {
     }
     #[test]
     fn dropping_a_completed_future_removes_the_entry() {
-        let mut arena = Arena::new(1, IoId::allocate().unwrap());
+        let mut arena = Arena::new(1, DriverId::allocate().unwrap());
         let token = arena.insert(operation()).unwrap();
         arena.complete(token, Ok(Value::Count(0)));
         assert!(arena.abandon(token).1.is_some());
@@ -428,7 +398,7 @@ mod tests {
     }
     #[test]
     fn completed_results_do_not_consume_kernel_capacity() {
-        let mut arena = Arena::new(1, IoId::allocate().unwrap());
+        let mut arena = Arena::new(1, DriverId::allocate().unwrap());
         let first = arena.insert(operation()).unwrap();
         arena.complete(first, Ok(Value::Count(0)));
         let second = arena.insert(operation()).unwrap();
@@ -441,7 +411,7 @@ mod tests {
     }
     #[test]
     fn rejection_and_closure_preserve_unaccepted_values() {
-        let mut arena = Arena::new(1, IoId::allocate().unwrap());
+        let mut arena = Arena::new(1, DriverId::allocate().unwrap());
         let first = arena.insert(operation()).unwrap();
         assert_eq!(
             arena.insert(operation()).unwrap_err().error.kind(),
@@ -458,7 +428,7 @@ mod tests {
 
     #[test]
     fn consumed_completion_keeps_identity_until_cancel_reference_retires() {
-        let mut arena = Arena::new(1, IoId::allocate().unwrap());
+        let mut arena = Arena::new(1, DriverId::allocate().unwrap());
         let first = arena.insert(Operation::Nop).unwrap();
         arena.pin(first);
         arena.complete(first, Ok(Value::Done));
@@ -473,7 +443,7 @@ mod tests {
     }
     #[test]
     fn cancel_reference_retiring_first_preserves_original_kernel_ownership() {
-        let mut arena = Arena::new(1, IoId::allocate().unwrap());
+        let mut arena = Arena::new(1, DriverId::allocate().unwrap());
         let id = arena.insert(Operation::Nop).unwrap();
         arena.pin(id);
         arena.abandon(id);
@@ -484,7 +454,7 @@ mod tests {
     }
     #[test]
     fn ignored_fd_result_is_owned_until_the_final_kernel_reference() {
-        let mut arena = Arena::new(1, IoId::allocate().unwrap());
+        let mut arena = Arena::new(1, DriverId::allocate().unwrap());
         let id = arena.insert(Operation::Nop).unwrap();
         arena.pin(id);
         arena.abandon(id);
@@ -497,7 +467,7 @@ mod tests {
     }
     #[test]
     fn fatal_retention_preserves_identity_for_handles_outliving_driver() {
-        let mut arena = Arena::new(1, IoId::allocate().unwrap());
+        let mut arena = Arena::new(1, DriverId::allocate().unwrap());
         let id = arena.insert(Operation::Nop).unwrap();
         arena.pin(id);
         let payloads = arena.retain_unresolved();
@@ -509,24 +479,16 @@ mod tests {
 
     #[test]
     fn packed_ids_keep_all_24_owner_bits_and_40_slot_bits() {
-        let owner = IoId(MAX_IO_ID);
-        let id = owner.operation(MAX_INDEX as usize).unwrap();
-        assert_eq!(id.raw(), u64::MAX);
+        let owner = DriverId::allocate().unwrap();
+        let id = OperationId::new(owner, MAX_INDEX as usize).unwrap();
+        assert_eq!(id.raw(), (u64::from(owner.raw()) << INDEX_BITS) | MAX_INDEX);
         assert_eq!(id.index() as u64, MAX_INDEX);
         assert!(id.belongs_to(owner));
-        assert!(!id.belongs_to(IoId(1)));
-        assert!(owner.operation((MAX_INDEX + 1) as usize).is_none());
-        assert_eq!(IoId(1).operation(0).unwrap().raw(), 1 << INDEX_BITS);
-    }
-    #[test]
-    fn exhausted_owner_counter_never_wraps_or_reuses_an_id() {
-        use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
-        let counter = AtomicU32::new(MAX_IO_ID);
-        assert_eq!(IoId::allocate_from(&counter).unwrap(), IoId(MAX_IO_ID));
-        assert_eq!(counter.load(Relaxed), MAX_IO_ID + 1);
-        for _ in 0..3 {
-            assert!(IoId::allocate_from(&counter).is_err());
-        }
-        assert_eq!(counter.load(Relaxed), MAX_IO_ID + 1);
+        assert!(!id.belongs_to(DriverId::allocate().unwrap()));
+        assert!(OperationId::new(owner, (MAX_INDEX + 1) as usize).is_none());
+        assert_eq!(
+            OperationId::new(owner, 0).unwrap().raw(),
+            u64::from(owner.raw()) << INDEX_BITS
+        );
     }
 }

@@ -12,7 +12,7 @@ Unsupported initialization and opcode errors are returned without a fallback.
 | shep-smp2 | Local executor/timer integration, batching policy and eventfd parking |
 
 The io2 crate root denies unsafe code; only its private driver module opts in.
-Arena, lifecycle, operations and buffers each forbid unsafe code. Both higher layers
+Io, arena, lifecycle, operations and buffers each forbid unsafe code. Both higher layers
 forbid unsafe code too. The three unsafe blocks publish SQEs and adopt owned
 file descriptors. See [the safety boundary](../crates/shep-smp-io2/SAFETY.md).
 Production dependencies have no Tokio runtime. Existing task internals retain
@@ -39,10 +39,13 @@ Poll or Done; errors preserve the original owned operation and its buffer.
 New opcodes require implementing ownership, completion and cancellation rules;
 arbitrary raw SQEs and SQE flags are not exposed.
 
-The private arena module owns the slab, its records, admission counters, and
-packed Io/operation identities. The lifecycle module defines the per-operation
-Submitted/Waiting/Ignored/Completed states; the arena applies their transitions
-and combines them with kernel-reference counts to decide slot retirement.
+The private driver module owns the ring, shared storage, and DriverId allocator.
+The io module exposes the safe producer and admission errors. Operation owns
+requests, handles, cancellation tokens, and typed completion values. Arena owns
+the slab, its records, admission counters, and packed OperationId keys.
+Lifecycle defines the per-operation Submitted/Waiting/Ignored/Completed states;
+the arena combines their transitions with kernel-reference counts to decide
+slot retirement.
 
 OperationHandle is an eight-byte opaque ID, with no Io reference and no Future
 implementation. Use handle.try_complete(&io), handle.poll_complete(&io, cx), or
@@ -53,8 +56,8 @@ A bare token drop retains its slab claim until Io destruction. The registered
 waker belongs to the operation's slab record; no per-request Rc clone or
 Rc/RefCell mailbox is needed for ordinary operations.
 
-A static atomic allocates nonzero 24-bit Io IDs once per driver, never recycling
-or wrapping them. The CQE's u64 packs that owner ID above a 40-bit slab index
+A static atomic allocates nonzero 24-bit DriverIds once per driver, never
+recycling or wrapping them. Io clones share their driver's identity. The CQE's u64 packs that owner ID above a 40-bit slab index
 (24 + 40 = 64). Passing a token to the wrong Io panics before accessing the
 slab. Cancellation tokens retain their allocating Io while their pin is active;
 retirement releases that reference.

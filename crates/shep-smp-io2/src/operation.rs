@@ -1,13 +1,15 @@
 //! Explicit owned requests; no caller supplies raw SQEs or kernel pointers.
 #![forbid(unsafe_code)]
 
-use crate::{Buffer, CancelTarget};
+use crate::{Buffer, Io, arena::OperationId, driver::DriverId};
 use std::{
     ffi::CString,
     fs::File,
+    io,
     net::{Shutdown, SocketAddr},
     os::fd::RawFd,
     sync::Arc,
+    task::{Context, Poll},
 };
 
 /// A supported io_uring opcode and all resources needed to issue it safely.
@@ -223,6 +225,157 @@ impl SocketAddress {
                 (&**a as *const libc::sockaddr_in6).cast(),
                 size_of::<libc::sockaddr_in6>() as _,
             ),
+        }
+    }
+}
+
+/// Opcode-specific ownership of a successful completion.
+#[derive(Debug)]
+pub enum Value {
+    /// Number of bytes transferred by a read, write, send, or receive.
+    Count(usize),
+    /// Fresh descriptor returned by open, socket, or accept; closed on value drop.
+    File(File),
+    /// Ready poll-event bits from a single-shot PollAdd.
+    Poll(u32),
+    /// Successful completion of an operation with no returned payload.
+    Done,
+}
+impl Value {
+    /// Extract a byte count; panic if this completion belongs to another opcode.
+    pub fn into_count(self) -> usize {
+        match self {
+            Self::Count(n) => n,
+            _ => panic!("completion is not a byte count"),
+        }
+    }
+}
+/// Terminal result and original inputs, transferred out of a Completed record.
+#[derive(Debug)]
+pub struct Completion {
+    /// Typed CQE result, including kernel errors; inputs are returned either way.
+    pub result: io::Result<Value>,
+    /// Original owned request, including its reusable buffer when applicable.
+    pub operation: Operation,
+}
+/// Submitter's claim on an operation stored in an Io's slab. Not a Future.
+/// Pass the allocating Io to access or explicitly release this claim. Dropping
+/// the token alone does not release it; adapters must release on cancellation.
+#[must_use = "consume the result or call release(&Io) to abandon it"]
+#[derive(Debug)]
+pub struct OperationHandle {
+    /// Live submitter claim. None after completion consumption or explicit release;
+    /// the token owns no Io and dropping it alone cannot change the slab.
+    id: Option<OperationId>,
+}
+impl OperationHandle {
+    /// Attach the submitter's claim to a freshly published Submitted record.
+    pub(crate) fn new(id: OperationId) -> Self {
+        Self { id: Some(id) }
+    }
+
+    /// Consume an already reaped completion without submitting, reaping, or waiting.
+    /// Submitted/Waiting returns None unchanged and does not install a waker,
+    /// including after unresolved driver failure; poll_complete checks that failure.
+    /// Completed -> Ignored(None) returns Some(Completion), moving out the result
+    /// and original inputs and clearing this handle's claim. Remove the slot only
+    /// if no cancellation pins remain; otherwise retain it until the final unpin.
+    /// Panics if this handle was consumed/released, or io is not its allocating Io.
+    pub fn try_complete(&mut self, io: &Io) -> Option<Completion> {
+        let id = self.id.expect("operation already consumed");
+        id.check(io.shared.id);
+        let result = io.shared.arena.borrow_mut().take(id)?;
+        self.id = None;
+        Some(result)
+    }
+    /// Poll the result: Completed is consumed exactly as in [`Self::try_complete`].
+    /// Otherwise Submitted -> Waiting, or replace the existing Waiting waker, then
+    /// recheck after dropping the replaced waker, which may reenter the driver.
+    /// Return Pending while awaiting a CQE; no submit or reap is performed here.
+    /// Panics for a consumed/released handle, wrong Io, or unresolved driver failure.
+    pub fn poll_complete(&mut self, io: &Io, cx: &mut Context<'_>) -> Poll<Completion> {
+        // Clone outside borrows: custom wakers may reenter the driver.
+        let waker = cx.waker().clone();
+        if let Some(result) = self.try_complete(io) {
+            return Poll::Ready(result);
+        }
+        assert!(
+            !io.is_failed(),
+            "io_uring driver failed with unresolved resources"
+        );
+        let old = io.shared.arena.borrow_mut().wait(self.id.unwrap(), waker);
+        drop(old);
+        match self.try_complete(io) {
+            Some(result) => Poll::Ready(result),
+            None => Poll::Pending,
+        }
+    }
+    /// Release submitter interest, keeping kernel-owned resources alive.
+    /// An already consumed/released handle is a no-op. With a live claim, a wrong
+    /// Io panics before slab access, leaving the claim usable with its actual Io.
+    /// Submitted/Waiting -> Ignored(None); Completed -> Ignored(Some(result)).
+    /// If no kernel refs remain, remove immediately; otherwise retain the record
+    /// until they retire. Clear the handle's ID in either case. Never cancel I/O.
+    pub fn release(&mut self, io: &Io) {
+        if let Some(id) = self.id {
+            id.check(io.shared.id);
+            self.id = None;
+            let released = io.shared.arena.borrow_mut().abandon(id);
+            drop(released);
+        }
+    }
+    /// Pin this identity until cancellation retires or the unsubmitted token is
+    /// dropped. Cancellation tokens retain their Io to release that extra pin.
+    /// Submitted/Waiting/Completed keep their state and gain one identity ref.
+    /// Panics for a consumed/released handle, wrong Io, or reference overflow.
+    pub fn cancel_target(&self, io: &Io) -> CancelTarget {
+        let id = self.id.expect("operation already consumed");
+        id.check(io.shared.id);
+        io.shared.arena.borrow_mut().pin(id);
+        CancelTarget {
+            io: Some(io.clone()),
+            id,
+        }
+    }
+}
+
+/// A cancellation target is an owned identity reference, not a reusable integer.
+pub struct CancelTarget {
+    /// Some while the target pin is armed; None after its cancellation CQE is reaped.
+    /// Retains the allocating Io so an unsubmitted token can unpin on drop.
+    io: Option<Io>,
+    /// Pinned target identity; its slab index cannot be reused until this pin ends.
+    id: OperationId,
+}
+impl std::fmt::Debug for CancelTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CancelTarget")
+            .field("id", &self.id)
+            .finish()
+    }
+}
+impl CancelTarget {
+    /// Whether this token still owns a pin in the specified driver.
+    pub(crate) fn is_active_for(&self, driver: DriverId) -> bool {
+        self.io.is_some() && self.id.belongs_to(driver)
+    }
+    pub(crate) fn id(&self) -> OperationId {
+        self.id
+    }
+    /// At the cancellation CQE, armed Some(Io) -> disarmed None, releasing the Io clone.
+    /// Return the target ID for the driver to unpin after retiring the cancel record;
+    /// this method itself does not unpin. Already disarmed returns None.
+    pub(crate) fn disarm(&mut self) -> Option<OperationId> {
+        self.io.take().map(|_| self.id)
+    }
+}
+impl Drop for CancelTarget {
+    /// Armed -> disarmed and release the target pin; remove an Ignored target
+    /// only if that was its final kernel ref. A retired token is already disarmed.
+    fn drop(&mut self) {
+        if let Some(io) = self.io.take() {
+            let released = io.shared.arena.borrow_mut().unpin(self.id);
+            drop(released);
         }
     }
 }

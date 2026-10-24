@@ -1,8 +1,8 @@
-//! The unsafe SQ publication and descriptor-adoption boundary.
+//! The unsafe SQ publication, ring-driving, and descriptor-adoption boundary.
 #![allow(unsafe_code)]
 use crate::{
-    Operation,
-    arena::{Arena, IoId, OperationId},
+    Io, Operation, OperationHandle, Rejected, Value,
+    arena::{Arena, OperationId},
 };
 use io_uring::{IoUring, opcode, types};
 use std::{
@@ -12,53 +12,44 @@ use std::{
     net::Shutdown,
     os::fd::{AsRawFd, FromRawFd, IntoRawFd},
     rc::Rc,
-    task::{Context, Poll, Waker},
+    task::Waker,
     time::Instant,
 };
 
-/// Opcode-specific ownership of a successful completion.
-#[derive(Debug)]
-pub enum Value {
-    /// Number of bytes transferred by a read, write, send, or receive.
-    Count(usize),
-    /// Fresh descriptor returned by open, socket, or accept; closed on value drop.
-    File(File),
-    /// Ready poll-event bits from a single-shot PollAdd.
-    Poll(u32),
-    /// Successful completion of an operation with no returned payload.
-    Done,
-}
-impl Value {
-    /// Extract a byte count; panic if this completion belongs to another opcode.
-    pub fn into_count(self) -> usize {
-        match self {
-            Self::Count(n) => n,
-            _ => panic!("completion is not a byte count"),
+const MAX_DRIVER_ID: u32 = (1 << 24) - 1;
+static NEXT_DRIVER_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+
+/// Process-unique owner identity; never reused after its driver is destroyed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DriverId(
+    /// Nonzero owner number fitting in 24 bits.
+    u32,
+);
+impl DriverId {
+    /// Allocate an owner ID, or fail permanently once the 24-bit namespace is full.
+    pub(crate) fn allocate() -> io::Result<Self> {
+        Self::allocate_from(&NEXT_DRIVER_ID)
+    }
+    /// Reserve the next ID with relaxed CAS; exhaustion leaves the counter unchanged.
+    fn allocate_from(counter: &std::sync::atomic::AtomicU32) -> io::Result<Self> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let mut next = counter.load(Relaxed);
+        loop {
+            if next > MAX_DRIVER_ID {
+                return Err(io::Error::other(
+                    "process io_uring identity limit exhausted",
+                ));
+            }
+            match counter.compare_exchange_weak(next, next + 1, Relaxed, Relaxed) {
+                Ok(_) => return Ok(Self(next)),
+                Err(actual) => next = actual,
+            }
         }
     }
-}
-/// Terminal result and original inputs, transferred out of a Completed record.
-#[derive(Debug)]
-pub struct Completion {
-    /// Typed CQE result, including kernel errors; inputs are returned either way.
-    pub result: io::Result<Value>,
-    /// Original owned request, including its reusable buffer when applicable.
-    pub operation: Operation,
-}
-/// Admission or publication failed; the caller still owns every unsubmitted input.
-#[derive(Debug)]
-pub struct Rejected {
-    /// Validation, closed-driver, or immediate-capacity error; no waiter is queued.
-    pub error: io::Error,
-    /// Original owned request, including its reusable buffer when applicable.
-    pub operation: Operation,
-}
-impl std::fmt::Display for Rejected {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.error.fmt(f)
+    pub(crate) fn raw(self) -> u32 {
+        self.0
     }
 }
-impl std::error::Error for Rejected {}
 
 /// All results have entered lifecycle state before callbacks are invoked.
 /// Notification never looks up an old slab index.
@@ -80,38 +71,29 @@ impl Progress {
     }
 }
 /// Local ring and lifecycle storage retained by Io clones and active cancel pins.
-struct Shared {
+pub(crate) struct Shared {
     /// Process-unique owner prefix used to reject handles from another Io.
-    id: IoId,
+    pub(crate) id: DriverId,
     /// Shared operation state; no borrow may span application waker callbacks.
-    arena: RefCell<Arena>,
+    pub(crate) arena: RefCell<Arena>,
     /// Live kernel queues; None after Driver destruction, even if Io clones remain.
     ring: RefCell<Option<IoUring>>,
 }
 
-/// Local push-only producer. It never submits, waits, or queues rejected work.
-#[derive(Clone)]
-pub struct Io {
-    /// Shared local ownership of the ring and slab; ordinary operation handles do not clone it.
-    shared: Rc<Shared>,
-}
-impl Io {
-    /// Publish owned inputs as a new Submitted record and return its submitter claim.
-    /// No submit syscall, reap, or waiting occurs. Validation/capacity errors return
-    /// the operation; failed SQ push rolls Submitted back to removed. CLOSE transfers
-    /// its unique File into a kernel-owned fd only after successful publication.
-    pub fn push(&self, operation: Operation) -> Result<OperationHandle, Rejected> {
-        if let Err(error) = validate(&operation, &self.shared) {
+impl Shared {
+    /// Validate and publish a Submitted request, rolling it back if SQ push fails.
+    pub(crate) fn push(&self, operation: Operation) -> Result<OperationHandle, Rejected> {
+        if let Err(error) = validate(&operation, self) {
             return Err(Rejected { error, operation });
         }
-        let mut ring = self.shared.ring.borrow_mut();
+        let mut ring = self.ring.borrow_mut();
         let Some(ring) = ring.as_mut() else {
             return Err(Rejected {
                 operation,
                 error: io::ErrorKind::BrokenPipe.into(),
             });
         };
-        let mut arena = self.shared.arena.borrow_mut();
+        let mut arena = self.arena.borrow_mut();
         let id = arena.insert(operation)?;
         let operation = arena.record(id).operation.as_mut().unwrap();
         let entry = entry(operation).user_data(id.raw());
@@ -126,138 +108,14 @@ impl Io {
             // it cannot close an unrelated fd reused before the CLOSE CQE.
             close.submitted = Some(close.file.take().unwrap().into_raw_fd());
         }
-        Ok(OperationHandle { id: Some(id) })
+        Ok(OperationHandle::new(id))
     }
-    /// Count accepted SQEs whose terminal CQEs have not been reaped; pins and
-    /// retained completed results do not count. Includes the runtime's watch, if any.
-    pub fn in_flight(&self) -> usize {
-        self.shared.arena.borrow().in_flight()
-    }
-    /// Whether published SQEs still await submission; false once the ring is gone.
-    pub fn has_pending(&self) -> bool {
-        self.shared
-            .ring
+    /// Whether this live ring has published SQEs awaiting submission.
+    pub(crate) fn has_pending(&self) -> bool {
+        self.ring
             .borrow_mut()
             .as_mut()
             .is_some_and(|r| !r.submission().is_empty())
-    }
-    /// Open admission -> ordinary-closed; cancellation remains possible through
-    /// its reserve. Existing record states and kernel ownership are unchanged.
-    pub fn close(&self) {
-        self.shared.arena.borrow_mut().close();
-    }
-    pub fn is_failed(&self) -> bool {
-        self.shared.arena.borrow().is_failed()
-    }
-}
-
-/// Submitter's claim on an operation stored in an Io's slab. Not a Future.
-/// Pass the allocating Io to access or explicitly release this claim. Dropping
-/// the token alone does not release it; adapters must release on cancellation.
-#[must_use = "consume the result or call release(&Io) to abandon it"]
-#[derive(Debug)]
-pub struct OperationHandle {
-    /// Live submitter claim. None after completion consumption or explicit release;
-    /// the token owns no Io and dropping it alone cannot change the slab.
-    id: Option<OperationId>,
-}
-impl OperationHandle {
-    /// Consume an already reaped completion without submitting, reaping, or waiting.
-    /// Submitted/Waiting returns None unchanged and does not install a waker,
-    /// including after unresolved driver failure; poll_complete checks that failure.
-    /// Completed -> Ignored(None) returns Some(Completion), moving out the result
-    /// and original inputs and clearing this handle's claim. Remove the slot only
-    /// if no cancellation pins remain; otherwise retain it until the final unpin.
-    /// Panics if this handle was consumed/released, or io is not its allocating Io.
-    pub fn try_complete(&mut self, io: &Io) -> Option<Completion> {
-        let id = self.id.expect("operation already consumed");
-        id.check(io.shared.id);
-        let result = io.shared.arena.borrow_mut().take(id)?;
-        self.id = None;
-        Some(result)
-    }
-    /// Poll the result: Completed is consumed exactly as in [`Self::try_complete`].
-    /// Otherwise Submitted -> Waiting, or replace the existing Waiting waker, then
-    /// recheck after dropping the replaced waker, which may reenter the driver.
-    /// Return Pending while awaiting a CQE; no submit or reap is performed here.
-    /// Panics for a consumed/released handle, wrong Io, or unresolved driver failure.
-    pub fn poll_complete(&mut self, io: &Io, cx: &mut Context<'_>) -> Poll<Completion> {
-        // Clone outside borrows: custom wakers may reenter the driver.
-        let waker = cx.waker().clone();
-        if let Some(result) = self.try_complete(io) {
-            return Poll::Ready(result);
-        }
-        assert!(
-            !io.is_failed(),
-            "io_uring driver failed with unresolved resources"
-        );
-        let old = io.shared.arena.borrow_mut().wait(self.id.unwrap(), waker);
-        drop(old);
-        match self.try_complete(io) {
-            Some(result) => Poll::Ready(result),
-            None => Poll::Pending,
-        }
-    }
-    /// Release submitter interest, keeping kernel-owned resources alive.
-    /// An already consumed/released handle is a no-op. With a live claim, a wrong
-    /// Io panics before slab access, leaving the claim usable with its actual Io.
-    /// Submitted/Waiting -> Ignored(None); Completed -> Ignored(Some(result)).
-    /// If no kernel refs remain, remove immediately; otherwise retain the record
-    /// until they retire. Clear the handle's ID in either case. Never cancel I/O.
-    pub fn release(&mut self, io: &Io) {
-        if let Some(id) = self.id {
-            id.check(io.shared.id);
-            self.id = None;
-            let released = io.shared.arena.borrow_mut().abandon(id);
-            drop(released);
-        }
-    }
-    /// Pin this identity until cancellation retires or the unsubmitted token is
-    /// dropped. Cancellation tokens retain their Io to release that extra pin.
-    /// Submitted/Waiting/Completed keep their state and gain one identity ref.
-    /// Panics for a consumed/released handle, wrong Io, or reference overflow.
-    pub fn cancel_target(&self, io: &Io) -> CancelTarget {
-        let id = self.id.expect("operation already consumed");
-        id.check(io.shared.id);
-        io.shared.arena.borrow_mut().pin(id);
-        CancelTarget {
-            io: Some(io.clone()),
-            id,
-        }
-    }
-}
-
-/// A cancellation target is an owned identity reference, not a reusable integer.
-pub struct CancelTarget {
-    /// Some while the target pin is armed; None after its cancellation CQE is reaped.
-    /// Retains the allocating Io so an unsubmitted token can unpin on drop.
-    io: Option<Io>,
-    /// Pinned target identity; its slab index cannot be reused until this pin ends.
-    id: OperationId,
-}
-impl std::fmt::Debug for CancelTarget {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CancelTarget")
-            .field("id", &self.id)
-            .finish()
-    }
-}
-impl CancelTarget {
-    /// At the cancellation CQE, armed Some(Io) -> disarmed None, releasing the Io clone.
-    /// Return the target ID for the driver to unpin after retiring the cancel record;
-    /// this method itself does not unpin. Already disarmed returns None.
-    fn disarm(&mut self) -> Option<OperationId> {
-        self.io.take().map(|_| self.id)
-    }
-}
-impl Drop for CancelTarget {
-    /// Armed -> disarmed and release the target pin; remove an Ignored target
-    /// only if that was its final kernel ref. A retired token is already disarmed.
-    fn drop(&mut self) {
-        if let Some(io) = self.io.take() {
-            let released = io.shared.arena.borrow_mut().unpin(self.id);
-            drop(released);
-        }
     }
 }
 
@@ -273,7 +131,7 @@ pub struct Driver {
 impl Driver {
     /// Create an empty ring with max_in_flight ordinary slots plus one cancel reserve.
     /// Fail on invalid capacity (outside 1..=32767), unsupported extended waits,
-    /// ring creation errors, or exhausted process Io IDs.
+    /// ring creation errors, or exhausted process DriverIds.
     pub fn new(max_in_flight: usize) -> io::Result<Self> {
         if !(1..=32767).contains(&max_in_flight) {
             return Err(io::Error::new(
@@ -288,7 +146,7 @@ impl Driver {
                 "extended io_uring waits required",
             ));
         }
-        let id = IoId::allocate()?;
+        let id = DriverId::allocate()?;
         Ok(Self {
             io: Io {
                 shared: Rc::new(Shared {
@@ -481,7 +339,7 @@ fn transient(e: &io::Error) -> bool {
 
 /// Reject offsets, lengths, spent CLOSEs, and foreign/disarmed cancellation tokens
 /// before admission; on success this does not change lifecycle state.
-fn validate(operation: &Operation, shared: &Rc<Shared>) -> io::Result<()> {
+fn validate(operation: &Operation, shared: &Shared) -> io::Result<()> {
     let invalid = match operation {
         Operation::ReadAt { offset, .. } | Operation::WriteAt { offset, .. } => {
             *offset > i64::MAX as u64
@@ -495,7 +353,7 @@ fn validate(operation: &Operation, shared: &Rc<Shared>) -> io::Result<()> {
         }
         Operation::Ftruncate { len, .. } => *len > i64::MAX as u64,
         Operation::Close(close) => close.file.is_none() || close.submitted.is_some(),
-        Operation::Cancel(target) => target.io.is_none() || !target.id.belongs_to(shared.id),
+        Operation::Cancel(target) => !target.is_active_for(shared.id),
         _ => false,
     };
     if invalid
@@ -612,7 +470,7 @@ fn entry(operation: &mut Operation) -> io_uring::squeue::Entry {
         Operation::PollAdd { file, events } => {
             opcode::PollAdd::new(types::Fd(file.as_raw_fd()), *events).build()
         }
-        Operation::Cancel(target) => opcode::AsyncCancel::new(target.id.raw()).build(),
+        Operation::Cancel(target) => opcode::AsyncCancel::new(target.id().raw()).build(),
     }
 }
 /// Translate a terminal CQE into a typed result, adopting successful fresh fds
@@ -646,5 +504,27 @@ fn finish_close(operation: &mut Operation, result: i32) {
         // SAFETY: A canceled CLOSE never executed. Its unique fd was transferred
         // at publication and has no other safe owner. Re-adopt it exactly once.
         drop(unsafe { File::from_raw_fd(fd) });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![forbid(unsafe_code)]
+    use super::*;
+    #[test]
+    fn exhausted_owner_counter_never_wraps_or_reuses_an_id() {
+        use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
+        let counter = AtomicU32::new(MAX_DRIVER_ID);
+        let owner = DriverId::allocate_from(&counter).unwrap();
+        assert_eq!(owner, DriverId(MAX_DRIVER_ID));
+        assert_eq!(
+            OperationId::new(owner, (1usize << 40) - 1).unwrap().raw(),
+            u64::MAX
+        );
+        assert_eq!(counter.load(Relaxed), MAX_DRIVER_ID + 1);
+        for _ in 0..3 {
+            assert!(DriverId::allocate_from(&counter).is_err());
+        }
+        assert_eq!(counter.load(Relaxed), MAX_DRIVER_ID + 1);
     }
 }
