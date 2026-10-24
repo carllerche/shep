@@ -485,3 +485,120 @@ fn stale_notifications_cannot_identify_a_new_task() {
     assert_ne!(old_id, new.id());
     assert_eq!(ready.try_recv().unwrap(), old_id);
 }
+
+#[test]
+fn a_future_can_detach_its_own_join_while_polling() {
+    let (queue, _) = queue();
+    let slot = Rc::new(RefCell::new(None));
+    let inner = slot.clone();
+    let (mut task, join) = new_task(
+        poll_fn(move |_| {
+            drop(inner.borrow_mut().take());
+            Poll::Ready(7)
+        }),
+        queue,
+    );
+    *slot.borrow_mut() = Some(join);
+    assert!(task.run());
+    assert!(slot.borrow().is_none());
+}
+
+#[test]
+fn pinned_pending_future_is_dropped_in_place_on_cancellation() {
+    struct Pinned {
+        address: Cell<*const Pinned>,
+        dropped: Rc<Cell<bool>>,
+        _pin: PhantomPinned,
+    }
+    impl Future for Pinned {
+        type Output = ();
+        fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<()> {
+            self.address.set(&*self);
+            Poll::Pending
+        }
+    }
+    impl Drop for Pinned {
+        fn drop(&mut self) {
+            assert_eq!(self.address.get(), self as *const Self);
+            self.dropped.set(true);
+        }
+    }
+    let (queue, _) = queue();
+    let dropped = Rc::new(Cell::new(false));
+    let (mut task, join) = new_task(
+        Pinned {
+            address: Cell::new(std::ptr::null()),
+            dropped: dropped.clone(),
+            _pin: PhantomPinned,
+        },
+        queue,
+    );
+    assert!(!task.run());
+    drop(task);
+    assert!(dropped.get());
+    assert_eq!(block_on(join), Err(JoinError::Cancelled));
+}
+
+#[test]
+fn foreign_wakes_can_race_with_cancellation_and_deallocation() {
+    let (queue, _) = queue();
+    let saved = Rc::new(RefCell::new(None));
+    let save = saved.clone();
+    let (mut task, join) = new_task(
+        poll_fn(move |cx| {
+            *save.borrow_mut() = Some(cx.waker().clone());
+            Poll::<()>::Pending
+        }),
+        queue,
+    );
+    assert!(!task.run());
+    let waker = saved.borrow_mut().take().unwrap();
+    let start = Arc::new(std::sync::Barrier::new(2));
+    thread::scope(|scope| {
+        let start_remote = start.clone();
+        scope.spawn(move || {
+            start_remote.wait();
+            for _ in 0..1000 {
+                waker.wake_by_ref();
+            }
+            waker.wake();
+        });
+        start.wait();
+        drop(task);
+        assert_eq!(block_on(join), Err(JoinError::Cancelled));
+    });
+}
+
+#[test]
+fn panicking_join_waker_drop_keeps_replacement_storage_valid() {
+    struct PanicsOnDrop;
+    // The Arc destructor is the behavior under test; Waker::noop has none.
+    #[allow(clippy::manual_noop_waker)]
+    impl Wake for PanicsOnDrop {
+        fn wake(self: Arc<Self>) {}
+    }
+    impl Drop for PanicsOnDrop {
+        fn drop(&mut self) {
+            panic!("waker drop panic");
+        }
+    }
+    let (queue, _) = queue();
+    let (mut task, mut join) = new_task(async { 42 }, queue);
+    let waker = Waker::from(Arc::new(PanicsOnDrop));
+    assert!(
+        Pin::new(&mut join)
+            .poll(&mut Context::from_waker(&waker))
+            .is_pending()
+    );
+    drop(waker);
+    // Replacement stores the new waker before dropping the previous one.
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = poll(&mut join);
+        }))
+        .is_err()
+    );
+    assert!(poll(&mut join).is_pending());
+    assert!(task.run());
+    assert_eq!(block_on(join), Ok(42));
+}

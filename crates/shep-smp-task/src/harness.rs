@@ -25,16 +25,22 @@ impl<T: Future> Harness<T> {
         Self { cell: ptr.cast() }
     }
 
+    fn cell(&self) -> &Cell<T> {
+        // SAFETY: from_raw's caller supplies the matching vtable type and
+        // retains a local owner until this operation finishes.
+        unsafe { self.cell.as_ref() }
+    }
+
     fn header(&self) -> &Header {
-        unsafe { &self.cell.as_ref().header }
+        &self.cell().header
     }
 
     fn trailer(&self) -> &Trailer {
-        unsafe { &self.cell.as_ref().trailer }
+        &self.cell().trailer
     }
 
     fn core(&self) -> &Core<T> {
-        unsafe { &self.cell.as_ref().core }
+        &self.cell().core
     }
 
     /// Called only by the owner's unique Task handle. Shared wakers update
@@ -66,6 +72,8 @@ impl<T: Future> Harness<T> {
     }
 
     pub(super) fn dealloc(self) {
+        // SAFETY: The last of the two local owners releases the original Box.
+        // Wakers own only Notification; no local cell access follows this call.
         unsafe { drop(Box::from_raw(self.cell.as_ptr())) }
     }
 
@@ -135,11 +143,7 @@ fn can_read_output(header: &Header, trailer: &Trailer, waker: &Waker) -> bool {
             // There already is a waker stored in the struct. If it matches
             // the provided waker, then there is no further work to do.
             // Otherwise, the waker must be swapped.
-            let will_wake = unsafe {
-                // Safety: when `JOIN_INTEREST` is set, only `JOIN_HANDLE`
-                // may mutate the `waker` field.
-                trailer.will_wake(waker)
-            };
+            let will_wake = trailer.will_wake(waker);
 
             if will_wake {
                 // The task is not complete **and** the waker is up to date,
@@ -183,20 +187,14 @@ fn set_join_waker(
     assert!(snapshot.is_join_interested());
     assert!(!snapshot.has_join_waker());
 
-    // Safety: Only the `JoinHandle` may set the `waker` field. When
-    // `JOIN_INTEREST` is **not** set, nothing else will touch the field.
-    unsafe {
-        trailer.set_waker(Some(waker));
-    }
+    trailer.set_waker(waker);
 
     // Update the `JoinWaker` state accordingly
     let res = header.shared.state.set_join_waker();
 
     // If the state could not be updated, then clear the join waker
     if res.is_err() {
-        unsafe {
-            trailer.set_waker(None);
-        }
+        drop(trailer.take_waker());
     }
 
     res

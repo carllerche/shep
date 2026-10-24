@@ -38,12 +38,13 @@
 // Copyright (c) 2021 ihciah, dyxushuai and other Monoio Contributors.
 // Portions Copyright (c) 2021 Tokio Contributors. Licensed under MIT.
 
+#![deny(unsafe_op_in_unsafe_fn)]
+
 mod core;
 mod harness;
 mod join;
 mod raw;
 mod state;
-mod utils;
 mod waker;
 
 pub use join::JoinHandle;

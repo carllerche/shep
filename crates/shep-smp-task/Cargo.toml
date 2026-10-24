@@ -9,6 +9,11 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[[bench]]
+name = "tasks"
+harness = false
+
 [dev-dependencies]
+criterion.workspace = true
 shep-futures.workspace = true
 tokio = { version = "1", default-features = false, features = ["sync"] }

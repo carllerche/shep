@@ -1390,6 +1390,7 @@ dependencies = [
 name = "shep-smp-task"
 version = "0.1.0"
 dependencies = [
+ "criterion",
  "shep-futures",
  "tokio",
 ]

@@ -41,3 +41,13 @@ This is the first component of the future `shep-smp-*` runtime. The existing
 `shep-smp` continues to use Tokio while task scheduling, the io_uring reactor,
 and the hashed timing wheel are introduced incrementally. Buffer ownership and
 io_uring buffer-pool integration belong in later I/O components.
+
+Further unsafe reduction is documented in [SAFETY.md](SAFETY.md). The local join
+waker now uses `Cell<Option<Waker>>`; raw stage access is confined to one private
+closure helper, and the pinning operation has an explicit invariant. Header,
+core and trailer access share one checked-by-construction pointer boundary.
+Construction uses `Box::leak`/`NonNull::from` instead of unchecked null handling.
+The generic UnsafeCell extension helpers were removed. The public API,
+allocation count and cross-thread notification state protocol are preserved.
+See [the benchmarks](benches/README.md) for timing boundaries and measured
+alternatives rejected because of their performance cost.

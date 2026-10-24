@@ -2,6 +2,8 @@
 // Copyright (c) 2021 ihciah, dyxushuai and other Monoio Contributors.
 // Portions Copyright (c) 2021 Tokio Contributors. Licensed under MIT.
 
+#![forbid(unsafe_code)]
+
 use std::{
     fmt,
     sync::atomic::{
