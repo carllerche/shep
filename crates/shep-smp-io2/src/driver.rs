@@ -16,6 +16,9 @@ use std::{
     time::Instant,
 };
 
+// Zero cannot be an OperationId. Used only for one teardown cancellation at a time.
+const SHUTDOWN_CANCEL: u64 = 0;
+
 const MAX_DRIVER_ID: u32 = (1 << 24) - 1;
 static NEXT_DRIVER_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
 
@@ -142,14 +145,18 @@ impl Shared {
 
 /// Single-owner ring driver. Push, submit, reap and wait are separate phases.
 /// The configured bound excludes one reserved cancellation operation.
-/// Explicitly drain before destruction. Dropping with unresolved work retains
-/// its resources conservatively; it never blocks on an arbitrary socket read.
+/// Destruction closes admission, cancels outstanding requests, and blocks until
+/// all terminal completions are reaped. Completed results remain available via
+/// retained Io clones. A fatal teardown error aborts the process rather than
+/// releasing resources that the kernel may still access.
 pub struct Driver {
     /// Driver-owned reference to the ring/slab; clones can outlive the driver
     /// to consume completed records, but cannot submit once the ring is closed.
     io: Io,
     /// Removed records destroyed after releasing ring and arena borrows.
     discarded: Vec<Record>,
+    /// One internal cancellation, outside the public admission reserve.
+    shutdown_cancel_pending: bool,
 }
 impl Driver {
     /// Create an empty ring with max_in_flight ordinary slots plus one cancel reserve.
@@ -172,6 +179,7 @@ impl Driver {
         let id = DriverId::allocate()?;
         Ok(Self {
             discarded: Vec::new(),
+            shutdown_cancel_pending: false,
             io: Io {
                 shared: Rc::new(Shared {
                     id,
@@ -250,6 +258,21 @@ impl Driver {
             }
             let mut arena = self.io.shared.arena.borrow_mut();
             for cqe in &mut completions {
+                if cqe.user_data() == SHUTDOWN_CANCEL {
+                    assert!(
+                        self.shutdown_cancel_pending,
+                        "unexpected shutdown cancellation"
+                    );
+                    assert_eq!(cqe.flags(), 0, "nonterminal shutdown cancellation");
+                    self.shutdown_cancel_pending = false;
+                    let result = cqe.result();
+                    assert!(
+                        result == 0 || result == -libc::ENOENT || result == -libc::EALREADY,
+                        "shutdown cancellation failed: {result}"
+                    );
+                    retired += 1;
+                    continue;
+                }
                 let id = OperationId::from_raw(cqe.user_data());
                 id.check(self.io.shared.id);
                 // No exposed opcode produces MORE/NOTIF CQEs. Extensions must
@@ -335,28 +358,97 @@ impl Driver {
         }
         Ok(())
     }
+    /// Drive teardown without the normal fatal-error callback path. All waiter
+    /// notifications remain deferred until every original request has retired.
+    fn shutdown_enter(&mut self, progress: &mut Progress, wait: bool) -> io::Result<()> {
+        let result = {
+            let mut ring = self.io.shared.ring.borrow_mut();
+            let ring = ring.as_mut().expect("live driver");
+            if wait {
+                ring.submit_and_wait(1)
+            } else {
+                ring.submit()
+            }
+        };
+        self.reap_into(progress);
+        match result {
+            Ok(_) => Ok(()),
+            Err(error) if transient(&error) => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn cancel_and_drain(&mut self, progress: &mut Progress) -> io::Result<()> {
+        // Also reject public cancellation submissions from reentrant destructors.
+        self.io.shared.arena.borrow_mut().fail();
+        self.reap_into(progress);
+        // Ensure every accepted SQE precedes its cancellation in submission order.
+        while self.has_pending() {
+            self.shutdown_enter(progress, false)?;
+        }
+        let mut cursor = 0;
+        loop {
+            let target = self
+                .io
+                .shared
+                .arena
+                .borrow()
+                .next_cancel_target(&mut cursor);
+            let Some(target) = target else { break };
+            let entry = opcode::AsyncCancel::new(target.raw())
+                .build()
+                .user_data(SHUTDOWN_CANCEL);
+            {
+                let mut ring = self.io.shared.ring.borrow_mut();
+                let ring = ring.as_mut().expect("live driver");
+                // SAFETY: This SQE contains only the target's identity, no user
+                // pointers. Admission is failed, so slots cannot be reused. All
+                // prior SQEs were submitted, and each internal cancel is reaped
+                // before publishing the next, leaving space even if the public
+                // cancellation reserve was occupied at shutdown.
+                unsafe { ring.submission().push(&entry) }.expect("shutdown SQ space");
+            }
+            self.shutdown_cancel_pending = true;
+            while self.shutdown_cancel_pending {
+                self.shutdown_enter(progress, true)?;
+            }
+        }
+        // Cancel success is not proof of original-request retirement. In
+        // particular, EALREADY means we must wait for natural completion.
+        while self.in_flight() != 0 {
+            self.shutdown_enter(progress, true)?;
+        }
+        Ok(())
+    }
 }
 impl Drop for Driver {
-    /// Close admission, reap available CQEs, then mark failed and extract pending
-    /// wakers (Waiting -> Submitted). Retain unretired inputs conservatively and
-    /// set the shared ring to None; no blocking drain occurs. Completed results
-    /// remain available through retained Io clones until consumed/released.
+    /// Cancel and reap all accepted work before releasing the ring. This can
+    /// block indefinitely for an operation that cannot finish or be canceled.
+    /// Fatal errors or panics before retirement abort instead of freeing live
+    /// kernel inputs. Notifications run after retirement and ring destruction.
     fn drop(&mut self) {
-        self.io.close();
+        let mut guard = RetirementGuard { retired: false };
         let mut progress = Progress::default();
-        self.reap_into(&mut progress);
-        progress.wake();
-        self.io
-            .shared
-            .arena
-            .borrow_mut()
-            .wakers_into(&mut progress.wakes);
-        let unresolved = self.io.shared.arena.borrow_mut().retain_unresolved();
-        // Closing a ring isn't used as proof that userspace memory is retired.
-        std::mem::forget(unresolved);
+        if let Err(error) = self.cancel_and_drain(&mut progress) {
+            eprintln!("io_uring teardown failed before request retirement: {error}");
+            std::process::abort();
+        }
+        guard.retired = true;
         let ring = self.io.shared.ring.borrow_mut().take();
         drop(ring);
         progress.wake();
+    }
+}
+
+/// Prevent unwinding from destroying kernel-owned inputs during failed teardown.
+struct RetirementGuard {
+    retired: bool,
+}
+impl Drop for RetirementGuard {
+    fn drop(&mut self) {
+        if !self.retired {
+            std::process::abort();
+        }
     }
 }
 /// Outcome of one kernel wait attempt; completion records have not yet been reaped.

@@ -13,7 +13,7 @@ Unsupported initialization and opcode errors are returned without a fallback.
 
 The io2 crate root denies unsafe code; only its private driver module opts in.
 Io, arena, lifecycle, operations and buffers each forbid unsafe code. Both higher layers
-forbid unsafe code too. The three unsafe blocks publish SQEs and adopt owned
+forbid unsafe code too. The four unsafe blocks publish operation/cancellation SQEs and adopt owned
 file descriptors. See [the safety boundary](../crates/shep-smp-io2/SAFETY.md).
 Production dependencies have no Tokio runtime. Existing task internals retain
 their separate unsafe implementation and upstream attribution.
@@ -77,11 +77,14 @@ request. One cancellation can be admitted beyond the ordinary in-flight limit.
 Cancellation is explicit and does not promise that the target had no effect.
 
 Driver::drain stops ordinary admission and waits for accepted operations;
-non-completing receives/watches must first be explicitly canceled. Bare driver
-drop reaps available CQEs and conservatively retains unresolved memory before
-closing the ring, without waiting on arbitrary I/O. Drain explicitly to avoid
-that fallback. Fatal driver errors wake waiters; unresolved results cannot
-safely return their inputs and panic if polled afterward.
+non-completing receives/watches must first be explicitly canceled. Driver drop
+instead closes all admission, submits queued work, cancels outstanding requests,
+and blocks until their terminal CQEs have been reaped. It then closes the ring
+and wakes waiters; completed results remain available through retained Io clones.
+Destruction does not intentionally leak unresolved inputs and may wait indefinitely
+for operations that cannot finish or be canceled. Fatal teardown errors abort the
+process rather than freeing kernel-owned inputs. Fatal driver errors during normal
+operation wake waiters; unresolved results panic if polled before retirement.
 
 ## Higher layers
 

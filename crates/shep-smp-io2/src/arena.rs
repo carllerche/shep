@@ -50,8 +50,7 @@ impl OperationId {
 
 /// One shared slab entry, retained until both submitter and kernel claims end.
 pub(crate) struct Record {
-    /// Owned request inputs. None after consumption while a cancel pins the slot,
-    /// or after fatal cleanup detaches unresolved inputs for conservative retention.
+    /// Owned request inputs. None after consumption while a cancel pins the slot.
     pub(crate) operation: Option<Operation>,
     /// Submitter interest, optional result, and the operation-specific waker.
     lifecycle: Lifecycle,
@@ -72,7 +71,6 @@ pub(crate) struct Arena {
     /// Live records, including completed values and cancellation-pinned identities.
     entries: Slab<Record>,
     /// Accepted operations awaiting their original CQEs, including cancellation SQEs.
-    /// Fatal detachment clears this count without proving kernel retirement.
     active: usize,
     /// Outstanding cancellation SQEs; at most one, excluded from ordinary capacity.
     cancel_active: usize,
@@ -288,27 +286,23 @@ impl Arena {
             }
         }
     }
-    /// Mark the arena failed and detach inputs whose original CQEs are unobserved.
-    /// Leave lifecycle states and identity refs intact for later token cleanup; reset
-    /// admission counts. Returned inputs remain kernel-owned and must be retained,
-    /// not destroyed, unless retirement is independently established. Driver Drop
-    /// leaks them conservatively; completed records remain consumable through Io.
-    pub(crate) fn retain_unresolved(&mut self) -> Vec<Operation> {
-        self.fail();
-        let operations = self
-            .entries
-            .iter_mut()
-            .filter_map(|(_, record)| {
-                if !record.own_done {
-                    record.operation.take()
-                } else {
-                    None
-                }
-            })
-            .collect();
-        self.active = 0;
-        self.cancel_active = 0;
-        operations
+    /// Find the next original request to cancel during driver destruction.
+    /// Admission must be failed first so no slot can be reused while the cursor
+    /// advances. Cancellation requests themselves are reaped without canceling.
+    /// The cursor scans allocated storage once, without collecting identities.
+    pub(crate) fn next_cancel_target(&self, cursor: &mut usize) -> Option<OperationId> {
+        assert!(self.failed);
+        while *cursor < self.entries.capacity() {
+            let index = *cursor;
+            *cursor += 1;
+            if let Some(record) = self.entries.get(index)
+                && !record.own_done
+                && !record.cancel
+            {
+                return Some(OperationId::new(self.driver_id, index).unwrap());
+            }
+        }
+        None
     }
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
@@ -464,15 +458,26 @@ mod tests {
         ));
     }
     #[test]
-    fn fatal_retention_preserves_identity_for_handles_outliving_driver() {
-        let mut arena = Arena::new(1, DriverId::allocate().unwrap());
-        let id = arena.insert(Operation::Nop).unwrap();
-        arena.pin(id);
-        let payloads = arena.retain_unresolved();
-        assert_eq!(payloads.len(), 1);
-        assert!(arena.abandon(id).1.is_none());
-        assert!(arena.unpin(id).is_none());
-        assert!(arena.is_failed());
+    fn shutdown_scan_skips_completed_records_and_preserves_external_pins() {
+        let mut arena = Arena::new(2, DriverId::allocate().unwrap());
+        let completed = arena.insert(Operation::Nop).unwrap();
+        arena.complete(completed, Ok(Value::Done));
+        let pending = arena.insert(Operation::Nop).unwrap();
+        arena.pin(pending);
+        arena.fail();
+        let mut cursor = 0;
+        assert_eq!(arena.next_cancel_target(&mut cursor), Some(pending));
+        assert_eq!(arena.next_cancel_target(&mut cursor), None);
+        arena.abandon(pending);
+        assert!(
+            arena
+                .complete(pending, Err(io::Error::from_raw_os_error(libc::ECANCELED)))
+                .1
+                .is_none()
+        );
+        assert!(arena.unpin(pending).is_some());
+        assert_eq!(arena.in_flight(), 0);
+        assert!(arena.take(completed).is_some());
     }
 
     #[test]

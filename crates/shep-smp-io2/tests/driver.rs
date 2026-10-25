@@ -661,3 +661,172 @@ fn handles_do_not_keep_the_driver_alive_and_new_drivers_reject_old_ids() {
     finish(&mut driver, &mut current).result.unwrap();
     driver.drain().unwrap();
 }
+
+#[test]
+fn drop_cancels_queued_and_submitted_work_at_full_capacity() {
+    use std::{
+        os::unix::net::UnixStream,
+        sync::atomic::{AtomicUsize, Ordering::Relaxed},
+    };
+    struct Count(AtomicUsize);
+    impl std::task::Wake for Count {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Relaxed);
+        }
+    }
+    // A teardown regression must fail the test rather than hang the test runner.
+    let (done, finished) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        for submitted in [false, true] {
+            let (socket, peer) = UnixStream::pair().unwrap();
+            let socket = Arc::new(File::from(OwnedFd::from(socket)));
+            let weak = Arc::downgrade(&socket);
+            let mut driver = Driver::new(3).unwrap();
+            let io = driver.io().clone();
+            let mut receive = driver
+                .push(Operation::Recv {
+                    socket: socket.clone(),
+                    buffer: Buffer::new(8, 1).unwrap(),
+                })
+                .unwrap();
+            let mut ignored = driver
+                .push(Operation::Recv {
+                    socket: socket.clone(),
+                    buffer: Buffer::new(8, 1).unwrap(),
+                })
+                .unwrap();
+            let mut watch = driver
+                .push(Operation::PollAdd {
+                    file: socket.clone(),
+                    events: libc::POLLIN as u32,
+                })
+                .unwrap();
+            drop(socket);
+            // Occupy the public cancellation reserve too. Teardown must still
+            // cancel the other receive and watch, without data from the peer.
+            let mut cancellation = driver
+                .push(Operation::Cancel(receive.cancel_target(&io)))
+                .unwrap();
+            let pin = ignored.cancel_target(&io);
+            ignored.release(&io);
+            let count = Arc::new(Count(AtomicUsize::new(0)));
+            let waker = Waker::from(count.clone());
+            let mut cx = Context::from_waker(&waker);
+            assert!(receive.poll_complete(&io, &mut cx).is_pending());
+            assert!(watch.poll_complete(&io, &mut cx).is_pending());
+            if submitted {
+                driver.submit().unwrap();
+            }
+            drop(driver);
+            assert_eq!(io.in_flight(), 0);
+            assert!(!io.has_pending());
+            assert_eq!(count.0.load(Relaxed), 2);
+            assert_eq!(
+                io.push(Operation::Nop).unwrap_err().error.kind(),
+                std::io::ErrorKind::BrokenPipe
+            );
+            for mut handle in [receive, watch] {
+                let result = handle.try_complete(&io).expect("drop reaped original CQE");
+                assert_eq!(
+                    result.result.unwrap_err().raw_os_error(),
+                    Some(libc::ECANCELED)
+                );
+            }
+            let result = cancellation
+                .try_complete(&io)
+                .expect("public cancel retired")
+                .result;
+            assert!(
+                result.is_ok()
+                    || matches!(
+                        result.unwrap_err().raw_os_error(),
+                        Some(libc::ENOENT | libc::EALREADY)
+                    )
+            );
+            // An external cancellation identity still pins the ignored record;
+            // releasing it after Driver destruction must reclaim its resources.
+            assert!(weak.upgrade().is_some());
+            drop(pin);
+            assert!(weak.upgrade().is_none());
+            drop(peer);
+        }
+        done.send(()).unwrap();
+    });
+    finished
+        .recv_timeout(Duration::from_secs(5))
+        .expect("blocking teardown did not finish");
+    worker.join().unwrap();
+}
+
+#[test]
+fn drop_submits_queued_file_io_and_reaps_close_without_retaining_resources() {
+    let driver = Driver::new(2).unwrap();
+    let io = driver.io().clone();
+    let file = Arc::new(tempfile::tempfile().unwrap());
+    let weak = Arc::downgrade(&file);
+    let mut write = driver
+        .push(Operation::WriteAt {
+            file,
+            buffer: Buffer::from_slice(b"queued", 1).unwrap(),
+            offset: 0,
+        })
+        .unwrap();
+    let close_file = tempfile::NamedTempFile::new().unwrap();
+    driver
+        .push(Operation::close(close_file.reopen().unwrap()))
+        .unwrap()
+        .release(&io);
+    assert_eq!(descriptors_for(close_file.path()), 2);
+    drop(driver);
+    assert_eq!(io.in_flight(), 0);
+    assert_eq!(descriptors_for(close_file.path()), 1);
+    let completion = write.try_complete(&io).expect("queued write retired");
+    // Cancellation may lose to ordinary completion.
+    match completion.result {
+        Ok(Value::Count(n)) => assert_eq!(n, 6),
+        Err(error) => assert_eq!(error.raw_os_error(), Some(libc::ECANCELED)),
+        result => panic!("unexpected write result: {result:?}"),
+    }
+    drop(completion.operation);
+    assert!(weak.upgrade().is_none());
+}
+
+#[test]
+fn drop_notifies_waiters_after_all_results_retire_and_ring_is_closed() {
+    use std::cell::RefCell;
+    thread_local! { static CALLBACK: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) }; }
+    struct Reenter;
+    impl std::task::Wake for Reenter {
+        fn wake(self: Arc<Self>) {
+            CALLBACK.with(|slot| slot.borrow_mut().take()).unwrap()();
+        }
+    }
+    let driver = Driver::new(2).unwrap();
+    let io = driver.io().clone();
+    let mut first = driver.push(Operation::Nop).unwrap();
+    let mut second = driver.push(Operation::Nop).unwrap();
+    let observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let output = observed.clone();
+    let callback_io = io.clone();
+    CALLBACK.with(|slot| {
+        *slot.borrow_mut() = Some(Box::new(move || {
+            assert_eq!(callback_io.in_flight(), 0);
+            assert!(!callback_io.has_pending());
+            assert!(second.try_complete(&callback_io).is_some());
+            assert_eq!(
+                callback_io.push(Operation::Nop).unwrap_err().error.kind(),
+                std::io::ErrorKind::BrokenPipe
+            );
+            output.store(true, std::sync::atomic::Ordering::Relaxed);
+        }))
+    });
+    let waker = Waker::from(Arc::new(Reenter));
+    assert!(
+        first
+            .poll_complete(&io, &mut Context::from_waker(&waker))
+            .is_pending()
+    );
+    drop(driver);
+    assert!(observed.load(std::sync::atomic::Ordering::Relaxed));
+    assert!(first.try_complete(&io).is_some());
+}

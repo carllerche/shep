@@ -48,7 +48,8 @@ low 40 bits. NonZeroU64 makes the optional handle exactly eight bytes. Slab
 index overflow rejects admission before publication. All handle methods that
 access the slab validate the supplied Io before indexing, including release and
 cancel_target; a mismatch panics without consuming the original claim. CQE
-identities are checked too. The index remains protected by the lifecycle and
+identities are checked too. Zero is reserved for the driver's single internal
+teardown cancellation; it never indexes the slab. The index remains protected by the lifecycle and
 cancellation pins; owner bits are not per-slot generations.
 
 Each slab record owns its operation, lifecycle state, and count of remaining
@@ -86,6 +87,9 @@ results and cancellation pins can keep additional slab entries occupied.
 One cancellation SQE has reserved capacity so cancellation can make progress at
 the ordinary limit. A second concurrent cancellation is rejected immediately.
 The physical SQ and default CQ accommodate this single-shot outstanding bound.
+During teardown, after pending SQEs have been submitted and admission has
+failed, one additional internal cancellation may be outstanding. The default
+CQ also accommodates that extra completion.
 There are no admission waiters or software submission backlogs.
 
 The driver retires an entire CQ snapshot and extracts owned wakers before
@@ -100,11 +104,10 @@ notify registered waiters; wake drains notifications while retaining allocation.
 Removed records are collected in driver-owned scratch storage and cleared only
 after ring and arena borrows end.
 
-## Three unsafe sites
+## Four unsafe sites
 
 1. SQ push publishes pointers into already-owned, stable operation data. Slab
-   ownership and lifecycle references retain it until terminal completion or
-   conservative failure retention.
+   ownership and lifecycle references retain it until terminal completion.
 2. Successful OpenAt/Socket/Accept results adopt fresh descriptors using
    File::from_raw_fd. Adoption occurs even for ignored operations, so the owned
    result is closed when its last lifecycle reference is released.
@@ -115,6 +118,12 @@ after ring and arena borrows end.
    never close it again. ECANCELED means CLOSE did not run; that descriptor is
    re-adopted and closed. Other close results follow Linux close ownership
    semantics and are not retried.
+
+4. Teardown publishes pointer-free cancellation SQEs directly. Admission has
+   failed, so no target identity can be reused. Previously queued SQEs are
+   submitted first, and only one internal cancellation is outstanding at a time.
+   Its reserved zero user_data is handled without a slab lookup. The original
+   requests retain their records and inputs until their own terminal CQEs.
 
 There are no unsafe Send/Sync implementations, custom allocation operations,
 unchecked projections, raw wakers, or public mutable kernel pointers. The
@@ -129,15 +138,23 @@ drain intentionally waits for terminal CQEs. It does not imply fsync, resource
 close, or application flush semantics. Runtime parking cancels its own eventfd
 watch through ordinary Cancel before draining.
 
-Bare Driver drop is nonblocking with respect to arbitrary pending I/O. It reaps
-available completions, then conservatively leaks unresolved owned payloads
-before closing the ring. Ring close is not used as proof that userspace memory
-has retired. Identity metadata remains accessible through a retained Io or an
-unsubmitted cancellation token. Already completed results remain consumable
-through their handles and an explicitly retained Io after Driver destruction. Polling an unresolved operation
-after terminal driver failure panics rather than returning kernel-owned memory.
-Normal users should explicitly drain; unresolved-drop retention is a safety
-fallback, including queued but unsubmitted work, not a background I/O service.
+Driver drop fails all admission, including public cancellations, and submits
+queued SQEs before issuing targeted cancellations. It scans slab storage once
+without allocating an identity vector, skipping completed and cancellation
+records. Internal cancellations use their own SQEs even if the public reserve
+is occupied. Each cancellation CQE is reaped before issuing the next; ENOENT
+and EALREADY are allowed because original completion can race cancellation.
+After issuing cancellations, drop blocks until every original terminal CQE has
+been reaped, including accepted public cancellation requests. Cancel completion
+alone never proves that a target's inputs can be freed.
+
+Only after retirement does drop close the ring and deliver accumulated waiter
+notifications outside borrows. Completed results remain consumable through
+retained Io clones, and unsubmitted CancelTargets can release their remaining
+identity pins afterward. There is no intentional unresolved-payload leak.
+Destruction may block indefinitely if an operation cannot finish or be canceled.
+A fatal enter/cancel error or panic before retirement aborts the process; it
+must not unwind and free kernel-owned inputs. Transient enter errors are retried.
 Fatal enter failures are not currently fault-injected in native tests.
 
 The runtime's RUNNING/PARKING/NOTIFIED/CLOSED atomic handshake, owner-thread
