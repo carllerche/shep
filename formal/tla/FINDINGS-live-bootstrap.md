@@ -138,6 +138,11 @@ LB5 is superseded by the token model.
 
 ## Controller founding (`Bootstrap.tla` at design level, `BootstrapFound.tla` as implemented)
 
+**Resumed 2026-10-22:** [FINDINGS-founding-resume.md](FINDINGS-founding-resume.md)
+adds short BF1/BF2 implementation counterexamples, reduced-bound candidate
+checks and a Lean check of the pledge candidate's restart limitation.
+The corresponding open implementation bugs are indexed in root `BUGS.md`.
+
 The old system-partition model is now `BootstrapSysPart.tla` (superseded). LB2 and LB6 carry over, with production's registry replacing `sys_prod`.
 
 | # | Severity | Finding | Config |

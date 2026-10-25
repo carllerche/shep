@@ -3,6 +3,12 @@
 Models of the protocols in `docs/design.md` §8–§13. Findings, counterexamples,
 and proposed design changes are in [FINDINGS.md](FINDINGS.md).
 
+The resumed implementation investigation is in
+[FINDINGS-founding-resume.md](FINDINGS-founding-resume.md); confirmed bugs
+are indexed in [../../BUGS.md](../../BUGS.md). Run `./check_founding.sh` for
+the focused founding regressions. The tables below describe the earlier
+design models, not the complete current suite.
+
 | Spec | Design sections | What it models |
 |---|---|---|
 | `DotFrontier.tla` | §9.1–§9.4, §10.3 | One PG node: `nextval`, log-row insert, commit/abort/crash at every step, the void fence with Postgres primary-key semantics, fast-path void, the frontier advancer, snapshot versions, tokens, `at_least` reads, token compaction |
@@ -30,6 +36,9 @@ export TLA2TOOLS=/path/to/tla2tools.jar
 
 `run.sh` runs `java -XX:+UseParallelGC -cp $TLA2TOOLS tlc2.TLC -workers auto
 -deadlock ...` (terminal states are expected, so deadlock checking is off).
+It serializes runs with `flock` on Linux or `lockf` on BSD. Set `TLC_WORKERS`
+to limit workers (the resumed runs use 8). A nonzero TLC exit is preserved;
+the state directory is removed after successful, failing, or terminated runs.
 `check_all.sh` prints, for each config, whether TLC's result matched the
 expected one.
 

@@ -1,5 +1,38 @@
 # Formal verification status
 
+## Resumed implementation checks (2026-10-22)
+
+Resumed from the paused handoff below against implementation `759122e`.
+The historical statement that everything was uncommitted no longer applies:
+the inherited formal artifacts are tracked in this checkout.
+
+- Confirmed BF1 with a 22-transition scripted trace: stale HELLO replies
+  allow two different founding decisions after a seed-list correction.
+- Strengthened BF2/B2 with a 23-transition trace: one wiped seed, unchanged
+  seed lists and no second initialize still lose a committed founding
+  decision. A 14-transition trace also checks ungated readmission.
+- Recorded both open implementation bugs in root `BUGS.md` (MODEL-1/2).
+- Added `BootstrapFoundTrace.tla`, a restriction to existing guarded
+  actions; `check_founding.sh` checks exact expected failing invariants,
+  reduced candidate safety, and founding reachability.
+- Restored TLC with the inherited jar hash. `run.sh` now supports Linux
+  `flock` while retaining serialization, cleanup and TLC exit codes.
+- Completed `BootstrapFound_typo_connpromise`: 20,798,540 distinct states,
+  7m29s, no violations (two terms, one crash/configuration change, no wipe).
+- The focused founding runner completed all nine checks with their expected
+  results; both reduced candidates have founding reachability witnesses.
+- Removed the resumed session's temporary logs and empty TLC extraction
+  directories. The runner now contains Java temporary files and model state
+  in one disposable directory; checked cleanup on passing and failing runs.
+- Restored pinned Lean/Mathlib and built all 1079 targets successfully.
+  New `ShepZSet/Founding.lean` checks the pledge uniqueness and vote-amnesia
+  arguments. It also proves the unlanded promise candidate strands an
+  initializer after restart, since `prop` is volatile and `pledge` persists.
+- Detailed results, bounds, limitations and remaining runs:
+  `tla/FINDINGS-founding-resume.md`.
+
+## Historical handoff
+
 The state of the TLA+ models (`tla/`) and Lean proofs (`lean/`) as of 2026-10-22, when all checking was paused.
 
 - **Findings:** the `tla/FINDINGS-*.md` files and `lean/FINDINGS.md`.

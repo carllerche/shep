@@ -5,6 +5,12 @@ as Z-sets of facts (§10.1), nested documents (§10.2), versions as sets of dots
 change queries (§11), DBSP incrementalization (§11.5), and materialized queries (§12).
 The results, and the design changes they suggest, are in [FINDINGS.md](FINDINGS.md).
 
+`ShepZSet/Founding.lean` accompanies the resumed implementation investigation
+in [../tla/FINDINGS-founding-resume.md](../tla/FINDINGS-founding-resume.md).
+It proves uniqueness under overlapping stable pledges and checks witnesses
+for disk/vote amnesia and the unlanded pledge candidate's restart stall.
+These are abstract protocol results, not a Rust refinement proof.
+
 There is no `sorry` and there are no new axioms. Every theorem depends only on Lean's
 standard axioms (`propext`, `Classical.choice`, `Quot.sound`). You can confirm this with
 `#print axioms`, as shown below.

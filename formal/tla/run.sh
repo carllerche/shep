@@ -11,16 +11,27 @@ fi
 SPEC="${1%.tla}"; shift
 CFG="${1:-$SPEC.cfg}"; [ $# -gt 0 ] && shift
 DIR="$(cd "$(dirname "$0")" && pwd)"
-META="${TMPDIR:-/tmp}/tlc-states-$$"
+SCRATCH=$(mktemp -d "${TMPDIR:-/tmp}/shep-tlc-XXXXXX")
+META="$SCRATCH/states"
 cd "$DIR"
 # One TLC at a time per machine: concurrent runs each take every core and a
-# large heap, and swap. lockf waits for the previous run to finish.
+# large heap, and swap. flock (Linux) or lockf (BSD) waits for the previous run.
 LOCK="${TLC_LOCK:-$DIR/.tlc.lock}"
 # TLC's -cleanup skips the states directory when a run fails or is killed, and
 # large runs leave gigabytes behind, so remove it ourselves however we exit.
-trap 'rm -rf "$META"' EXIT
+# Java's extracted standard modules also live here, rather than leaving
+# separate tlc-* directories behind in the system temporary directory.
+trap 'rm -rf "$SCRATCH"' EXIT
 trap 'exit 130' INT TERM HUP
 set +e
-/usr/bin/lockf -k "$LOCK" java -Xmx${TLC_HEAP:-6g} -XX:+UseParallelGC -cp "$JAR" tlc2.TLC -workers auto -deadlock -cleanup -noGenerateSpecTE \
+set -- java -Djava.io.tmpdir="$SCRATCH" -Xmx${TLC_HEAP:-6g} -XX:+UseParallelGC -cp "$JAR" tlc2.TLC -workers "${TLC_WORKERS:-auto}" -deadlock -cleanup -noGenerateSpecTE \
   -metadir "$META" -config "$CFG" "$@" "$SPEC.tla"
+if command -v flock >/dev/null 2>&1; then
+  flock "$LOCK" "$@"
+elif command -v lockf >/dev/null 2>&1; then
+  lockf -k "$LOCK" "$@"
+else
+  echo "flock or lockf is required to serialize TLC runs" >&2
+  exit 1
+fi
 exit $?
