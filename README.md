@@ -27,6 +27,7 @@ replicates.
 | `crates/shep-smp-io-scheduler` | Weighted admission with shared physical-device capacity and per-class metrics |
 | `crates/shep-smp-io2` | Safe owned-operation io_uring driver with explicit batching, completion lifecycle and cancellation; unsafe isolated in its private driver module |
 | `crates/shep-smp-fs2` | Positional owned-buffer file adapter over the native io_uring driver |
+| `crates/shep-smp-net` | Local TCP over the native driver: owned buffers, exclusive read/write halves, bounded transfers, and terminal cancellation |
 | `crates/shep-smp2` | Parallel single-core native runtime combining tasks, timers, and io_uring; see [design](docs/io2.md) |
 | `crates/shep-append` | Format-independent buffered append files with explicit written and durable positions |
 | `crates/shep-storage` | Per-core storage, after Redpanda's: segmented logs with coalesced fsync and crash recovery, and a key-value store |

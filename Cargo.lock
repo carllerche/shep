@@ -1406,6 +1406,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "shep-smp-net"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "rustix",
+ "shep-smp-io2",
+ "shep-smp2",
+]
+
+[[package]]
 name = "shep-smp-task"
 version = "0.1.0"
 dependencies = [

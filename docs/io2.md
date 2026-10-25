@@ -9,6 +9,7 @@ Unsupported initialization and opcode errors are returned without a fallback.
 |---|---|
 | shep-smp-io2 | Safe owned operations, ring push/submit/reap, completion lifecycle and cancellation |
 | shep-smp-fs2 | Positional owned-buffer file adapter and operation-completion futures |
+| shep-smp-net | TCP listener/stream adapter, bounded transfers, serialized directions and socket shutdown |
 | shep-smp2 | Local executor/timer integration, batching policy and eventfd parking |
 
 The io2 crate root denies unsafe code; only its private driver module opts in.
@@ -100,9 +101,14 @@ protocol must first account for its outstanding operations.
 The driver owns no write backlog, resource-readiness waiter collection,
 durability frontier or background error policy. File writers can retain eager
 handles to track concurrent completion, contiguous progress and durability above
-it. TCP serialization, write capacity, flush, graceful close, and background
-drop cleanup belong in a future net2 adapter. A resource registry can likewise
-be added without moving operation waiters out of the operation slab.
+it. The [shep-smp-net adapter](../crates/shep-smp-net/README.md) provides TCP
+serialization through exclusive read/write halves, bounded transfers, flush,
+half-close, and cleanup on dropped futures. It has no background write queue:
+every write awaits completion. Dropping an admitted socket future shuts down
+the resource and requests cancellation; cancellation is terminal for that
+listener or connection. Socket shutdown also retires outstanding work when
+the cancellation reserve is full. A resource registry can likewise be added
+without moving operation waiters out of the operation slab.
 
 Current Send/Recv are ordinary single-shot owned-buffer operations. Provided
 buffer pools, buffer selection, multishot and zero-copy notifications remain
@@ -160,8 +166,8 @@ sleep before rechecking pending work. It does not copy their unsafe driver
 cell or systemwide memory-barrier mechanisms.
 
 ```sh
-cargo test -p shep-smp-io2 -p shep-smp-fs2 -p shep-smp2
-cargo clippy -p shep-smp-io2 -p shep-smp-fs2 -p shep-smp2 --all-targets -- -D warnings
+cargo test -p shep-smp-io2 -p shep-smp-fs2 -p shep-smp-net -p shep-smp2
+cargo clippy -p shep-smp-io2 -p shep-smp-fs2 -p shep-smp-net -p shep-smp2 --all-targets -- -D warnings
 MIRIFLAGS='-Zmiri-disable-isolation -Zmiri-tree-borrows' cargo +nightly-2026-10-22 miri test -p shep-smp-io2 --lib
 ```
 
@@ -175,5 +181,5 @@ archives retain their original source paths and hashes, including the former
 io2-core crate and former core module. They are measurement records.
 
 Remaining steps before production migration include buffer-pool networking,
-resource close/flush APIs, filesystem metadata policy, thread-per-core
+filesystem resource close/flush APIs, filesystem metadata policy, thread-per-core
 startup/shutdown and submit_to, RPC integration, and shep-smp-io-scheduler2.

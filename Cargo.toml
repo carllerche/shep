@@ -23,6 +23,7 @@ shep-smp = { path = "crates/shep-smp" }
 shep-smp2 = { path = "crates/shep-smp2" }
 shep-smp-io2 = { path = "crates/shep-smp-io2" }
 shep-smp-fs2 = { path = "crates/shep-smp-fs2" }
+shep-smp-net = { path = "crates/shep-smp-net" }
 shep-smp-exec = { path = "crates/shep-smp-exec" }
 shep-smp-task = { path = "crates/shep-smp-task" }
 shep-smp-time = { path = "crates/shep-smp-time" }

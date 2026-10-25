@@ -1,6 +1,6 @@
 //! Native single-core runtime: bounded task turns, io_uring, and timer deadlines.
 //! This parallel implementation leaves shep-smp and its consumers unchanged.
-//! Thread-per-core orchestration and networking are subsequent components.
+//! TCP adapters live in shep-smp-net; thread-per-core orchestration is subsequent.
 //! ```compile_fail
 //! fn send<T: Send>() {}
 //! send::<shep_smp2::Runtime>();
