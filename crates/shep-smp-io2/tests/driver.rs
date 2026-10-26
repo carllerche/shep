@@ -23,6 +23,21 @@ fn finish(driver: &mut Driver, handle: &mut OperationHandle) -> Completion {
     }
 }
 
+// Linux removes the descriptor before reporting a filesystem flush error.
+// vwsim explores these outcomes for regular files by default.
+fn assert_close_result(result: std::io::Result<Value>) {
+    if let Err(error) = result {
+        let errno = error.raw_os_error();
+        assert!(
+            matches!(
+                errno,
+                Some(libc::ECANCELED | libc::EIO | libc::ENOSPC | libc::EINTR)
+            ),
+            "unexpected CLOSE errno: {errno:?}"
+        );
+    }
+}
+
 #[test]
 fn progress_accumulates_across_reaps_and_can_be_reused_after_waking() {
     use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
@@ -267,7 +282,8 @@ fn open_allocate_truncate_sync_and_close() {
         .push(Operation::close(Arc::try_unwrap(file).unwrap()))
         .unwrap();
     let done = finish(&mut driver, &mut close);
-    done.result.unwrap();
+    assert_close_result(done.result);
+    assert_eq!(descriptors_for(&dir.path().join("created")), 0);
     assert!(driver.push(done.operation).is_err());
     driver.drain().unwrap();
 }
@@ -433,6 +449,55 @@ fn close_completion_never_closes_a_reused_descriptor() {
 }
 
 #[test]
+fn close_flush_error_never_closes_a_reused_descriptor() {
+    use std::os::fd::AsRawFd;
+
+    let mut driver = Driver::new(1).unwrap();
+    // Unlike /dev/null, a regular file lets vwsim explore filesystem flush
+    // errors, including ECANCELED after CLOSE has already removed the fd.
+    // No cancellation is requested in this test.
+    let file = tempfile::tempfile().unwrap();
+    let fd = file.as_raw_fd();
+    let mut close = driver.push(Operation::close(file)).unwrap();
+    driver.submit_and_wait(None).unwrap();
+
+    // Leave the CLOSE CQE unreaped while another owner acquires its fd number.
+    let mut replacements = Vec::new();
+    for _ in 0..64 {
+        let replacement = File::open("/dev/null").unwrap();
+        let reused = replacement.as_raw_fd() == fd;
+        replacements.push(replacement);
+        if reused {
+            break;
+        }
+    }
+    let index = replacements
+        .iter()
+        .position(|file| file.as_raw_fd() == fd)
+        .expect("could not reuse fd before reaping CLOSE");
+    let replacement = replacements.swap_remove(index);
+    assert!(replacement.metadata().is_ok());
+
+    let result = finish(&mut driver, &mut close).result;
+    let close_errno = result.as_ref().err().and_then(std::io::Error::raw_os_error);
+    let replacement_status = replacement.metadata();
+    let replacement_errno = replacement_status
+        .as_ref()
+        .err()
+        .and_then(std::io::Error::raw_os_error);
+    if replacement_status.is_err() {
+        // The bug has already closed this File's fd. Avoid a second close (or
+        // an IO-safety abort during unwinding) obscuring the actual assertion.
+        std::mem::forget(replacement);
+    }
+    assert!(
+        replacement_status.is_ok(),
+        "CLOSE errno {close_errno:?} closed the unrelated replacement fd {fd}; replacement errno {replacement_errno:?}"
+    );
+    driver.drain().unwrap();
+}
+
+#[test]
 fn retained_results_grow_slab_without_moving_kernel_buffers() {
     let mut driver = Driver::new(1).unwrap();
     let file = Arc::new(tempfile::tempfile().unwrap());
@@ -548,34 +613,37 @@ fn ignored_open_output_is_closed_when_its_cqe_is_reaped() {
 }
 
 #[test]
-fn close_cancel_race_releases_descriptor_with_or_without_a_submitter() {
-    for abandon in [false, true] {
-        let original = tempfile::NamedTempFile::new().unwrap();
-        let mut driver = Driver::new(1).unwrap();
-        let mut close = driver
-            .push(Operation::close(File::open(original.path()).unwrap()))
-            .unwrap();
-        let mut cancel = driver
-            .push(Operation::Cancel(close.cancel_target(driver.io())))
-            .unwrap();
-        if abandon {
-            close.release(driver.io());
-        } else {
-            let result = finish(&mut driver, &mut close).result;
-            assert!(result.is_ok() || result.unwrap_err().raw_os_error() == Some(libc::ECANCELED));
+fn close_rejects_cancellation_and_finishes_during_teardown() {
+    for submitted in [false, true] {
+        for abandon in [false, true] {
+            let original = tempfile::NamedTempFile::new().unwrap();
+            let mut driver = Driver::new(1).unwrap();
+            let io = driver.io().clone();
+            let mut close = driver
+                .push(Operation::close(File::open(original.path()).unwrap()))
+                .unwrap();
+            if submitted {
+                driver.submit().unwrap();
+            }
+            let rejected = driver
+                .push(Operation::Cancel(close.cancel_target(&io)))
+                .unwrap_err();
+            assert_eq!(rejected.error.kind(), std::io::ErrorKind::Unsupported);
+            assert_eq!(driver.in_flight(), 1);
+            // Dropping the returned cancellation token must release its pin.
+            drop(rejected);
+            if abandon {
+                close.release(&io);
+            }
+            drop(driver);
+            assert_eq!(io.in_flight(), 0);
+            if !abandon {
+                let done = close.try_complete(&io).expect("teardown reaped CLOSE");
+                assert_close_result(done.result);
+            }
+            // Teardown must run CLOSE even if it was queued or abandoned.
+            assert_eq!(descriptors_for(original.path()), 1);
         }
-        let result = finish(&mut driver, &mut cancel).result;
-        assert!(
-            result.is_ok()
-                || matches!(
-                    result.unwrap_err().raw_os_error(),
-                    Some(libc::ENOENT | libc::EALREADY)
-                )
-        );
-        driver.drain().unwrap();
-        // Either CLOSE ran, or cancellation won and the driver recovered its fd.
-        // Both paths leave only the original tempfile's independently owned fd.
-        assert_eq!(descriptors_for(original.path()), 1);
     }
 }
 

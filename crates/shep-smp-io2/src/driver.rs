@@ -128,9 +128,10 @@ impl Shared {
             return Err(arena.reject(id, io::ErrorKind::WouldBlock.into()));
         }
         if let Operation::Close(close) = operation {
-            // CLOSE now owns the descriptor. Suppress std File's destructor so
-            // it cannot close an unrelated fd reused before the CLOSE CQE.
-            close.submitted = Some(close.file.take().unwrap().into_raw_fd());
+            // CLOSE now owns the descriptor and cannot be canceled through this
+            // driver. Never recover the number from a CQE error: even ECANCELED
+            // can come from flush after the fd was removed and reused.
+            let _ = close.file.take().unwrap().into_raw_fd();
         }
         Ok(OperationHandle::new(id))
     }
@@ -283,7 +284,6 @@ impl Driver {
                 );
                 let record = arena.record(id);
                 let operation = record.operation.as_mut().expect("kernel-owned operation");
-                finish_close(operation, cqe.result());
                 let dependency = match operation {
                     Operation::Cancel(target) => target.disarm(),
                     _ => None,
@@ -484,7 +484,7 @@ fn validate(operation: &Operation, shared: &Shared) -> io::Result<()> {
                     .is_none_or(|end| end > i64::MAX as u64)
         }
         Operation::Ftruncate { len, .. } => *len > i64::MAX as u64,
-        Operation::Close(close) => close.file.is_none() || close.submitted.is_some(),
+        Operation::Close(close) => close.file.is_none(),
         Operation::Cancel(target) => !target.is_active_for(shared.id),
         _ => false,
     };
@@ -496,6 +496,17 @@ fn validate(operation: &Operation, shared: &Shared) -> io::Result<()> {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "invalid owned operation arguments",
+        ));
+    }
+    if let Operation::Cancel(target) = operation
+        && matches!(
+            shared.arena.borrow_mut().record(target.id()).operation,
+            Some(Operation::Close(_))
+        )
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "accepted CLOSE operations cannot be canceled",
         ));
     }
     Ok(())
@@ -625,20 +636,6 @@ fn value(operation: &Operation, result: i32) -> io::Result<Value> {
         _ => Value::Done,
     })
 }
-/// At a CLOSE CQE, submitted Some(fd) -> None. ECANCELED re-adopts and closes
-/// the unexecuted descriptor; other results discard the saved fd number. Never
-/// retry closing it: the kernel may have closed it and reused that number.
-fn finish_close(operation: &mut Operation, result: i32) {
-    if let Operation::Close(close) = operation
-        && let Some(fd) = close.submitted.take()
-        && result == -libc::ECANCELED
-    {
-        // SAFETY: A canceled CLOSE never executed. Its unique fd was transferred
-        // at publication and has no other safe owner. Re-adopt it exactly once.
-        drop(unsafe { File::from_raw_fd(fd) });
-    }
-}
-
 #[cfg(test)]
 mod tests {
     #![forbid(unsafe_code)]

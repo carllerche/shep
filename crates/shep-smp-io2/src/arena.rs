@@ -288,7 +288,8 @@ impl Arena {
     }
     /// Find the next original request to cancel during driver destruction.
     /// Admission must be failed first so no slot can be reused while the cursor
-    /// advances. Cancellation requests themselves are reaped without canceling.
+    /// advances. Cancellation requests and CLOSEs finish without cancellation;
+    /// a CLOSE's ECANCELED result cannot distinguish cancellation from flush.
     /// The cursor scans allocated storage once, without collecting identities.
     pub(crate) fn next_cancel_target(&self, cursor: &mut usize) -> Option<OperationId> {
         assert!(self.failed);
@@ -298,6 +299,7 @@ impl Arena {
             if let Some(record) = self.entries.get(index)
                 && !record.own_done
                 && !record.cancel
+                && !matches!(record.operation, Some(Operation::Close(_)))
             {
                 return Some(OperationId::new(self.driver_id, index).unwrap());
             }

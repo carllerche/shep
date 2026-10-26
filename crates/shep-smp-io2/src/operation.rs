@@ -7,7 +7,6 @@ use std::{
     fs::File,
     io,
     net::{Shutdown, SocketAddr},
-    os::fd::RawFd,
     sync::Arc,
     task::{Context, Poll},
 };
@@ -75,6 +74,8 @@ pub enum Operation {
         mode: u32,
     },
     /// Close a uniquely owned descriptor; its ownership phases are tracked by Close.
+    /// Once accepted, it cannot be canceled, including during driver destruction.
+    /// Flush errors are returned without retrying the close or reclaiming its fd.
     Close(Close),
     /// Create one socket and return an owned descriptor with CLOEXEC.
     Socket {
@@ -126,16 +127,14 @@ pub enum Operation {
         events: u32,
     },
     /// Request cancellation of a pinned same-Io identity; success does not undo I/O.
+    /// Targeting an unconsumed CLOSE is rejected with Unsupported.
     Cancel(CancelTarget),
 }
 impl Operation {
     /// Build an unpublished CLOSE retaining its unique File. Successful push
-    /// transfers File -> raw fd; its terminal CQE clears that transferred state.
+    /// transfers ownership to the kernel permanently, even if its CQE is an error.
     pub fn close(file: File) -> Self {
-        Self::Close(Close {
-            file: Some(file),
-            submitted: None,
-        })
+        Self::Close(Close { file: Some(file) })
     }
     /// Borrow this owned request's input/output buffer, if its opcode has one.
     pub fn buffer(&self) -> Option<&Buffer> {
@@ -169,9 +168,6 @@ impl Operation {
 pub struct Close {
     /// Some before SQ publication; None once descriptor ownership is transferred.
     pub(crate) file: Option<File>,
-    /// Some after publication until its CQE; no File destructor owns this fd.
-    /// A canceled CLOSE re-adopts/closes it; other CQEs leave closure to the kernel.
-    pub(crate) submitted: Option<RawFd>,
 }
 
 /// Stable, owned socket-address storage for CONNECT.

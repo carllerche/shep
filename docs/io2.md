@@ -14,7 +14,7 @@ Unsupported initialization and opcode errors are returned without a fallback.
 
 The io2 crate root denies unsafe code; only its private driver module opts in.
 Io, arena, lifecycle, operations and buffers each forbid unsafe code. Both higher layers
-forbid unsafe code too. The four unsafe blocks publish operation/cancellation SQEs and adopt owned
+forbid unsafe code too. The three unsafe blocks publish operation/cancellation SQEs and adopt owned
 file descriptors. See [the safety boundary](../crates/shep-smp-io2/SAFETY.md).
 Production dependencies have no Tokio runtime. Existing task internals retain
 their separate unsafe implementation and upstream attribution.
@@ -76,6 +76,10 @@ its cancellation CQE arrives. The original operation may complete and its
 values may be consumed first; its slot still cannot be reused for another
 request. One cancellation can be admitted beyond the ordinary in-flight limit.
 Cancellation is explicit and does not promise that the target had no effect.
+Accepted Close operations run to completion: canceling an unconsumed Close
+returns Unsupported, and teardown waits without canceling it. The kernel owns
+its descriptor after publication. Even ECANCELED can be a flush error after
+removal, so no close error causes the driver to reclaim or retry that fd.
 
 Driver::drain stops ordinary admission and waits for accepted operations;
 non-completing receives/watches must first be explicitly canceled. Driver drop
