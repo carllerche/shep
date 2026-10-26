@@ -166,7 +166,7 @@ sleep before rechecking pending work. It does not copy their unsafe driver
 cell or systemwide memory-barrier mechanisms.
 
 ```sh
-cargo test -p shep-smp-io2 -p shep-smp-fs2 -p shep-smp-net -p shep-smp2
+cargo nextest run -p shep-smp-io2 -p shep-smp-fs2 -p shep-smp-net -p shep-smp2
 cargo clippy -p shep-smp-io2 -p shep-smp-fs2 -p shep-smp-net -p shep-smp2 --all-targets -- -D warnings
 MIRIFLAGS='-Zmiri-disable-isolation -Zmiri-tree-borrows' cargo +nightly-2026-10-22 miri test -p shep-smp-io2 --lib
 ```

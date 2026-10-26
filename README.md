@@ -49,8 +49,12 @@ span many components go in `tests/test-<aspect>` crates.
 ## Running
 
 ```sh
-cargo test --workspace
+cargo nextest run --workspace
 ```
+
+Use `cargo nextest run --workspace --profile ci` in CI. Nextest terminates hung
+tests after 2 minutes locally or 5 minutes in CI. Plain `cargo test` still works,
+but provides no hang protection.
 
 A single server is a complete deployment, without replication:
 
