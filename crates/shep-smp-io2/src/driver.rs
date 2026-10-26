@@ -163,6 +163,8 @@ impl Driver {
     /// Create an empty ring with max_in_flight ordinary slots plus one cancel reserve.
     /// Fail on invalid capacity (outside 1..=32767), unsupported extended waits,
     /// ring creation errors, or exhausted process DriverIds.
+    /// Does not probe support for every opcode or flag; unsupported operations
+    /// report kernel errors through their completions.
     pub fn new(max_in_flight: usize) -> io::Result<Self> {
         if !(1..=32767).contains(&max_in_flight) {
             return Err(io::Error::new(
@@ -469,8 +471,8 @@ fn transient(e: &io::Error) -> bool {
     )
 }
 
-/// Reject offsets, lengths, spent CLOSEs, and foreign/disarmed cancellation tokens
-/// before admission; on success this does not change lifecycle state.
+/// Reject offsets, lengths, spent CLOSEs, and foreign/disarmed
+/// cancellation tokens before admission; success does not change lifecycle state.
 fn validate(operation: &Operation, shared: &Shared) -> io::Result<()> {
     let invalid = match operation {
         Operation::ReadAt { offset, .. } | Operation::WriteAt { offset, .. } => {
@@ -537,6 +539,9 @@ fn entry(operation: &mut Operation) -> io_uring::squeue::Entry {
             buffer.len() as u32,
         )
         .offset(*offset)
+        // Override append per request, including changes after SQ publication.
+        // Unsupported kernels must fail the write; never retry without this flag.
+        .rw_flags(libc::RWF_NOAPPEND)
         .build(),
         Operation::Fsync { file, data_only } => opcode::Fsync::new(types::Fd(file.as_raw_fd()))
             .flags(if *data_only {

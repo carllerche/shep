@@ -3,8 +3,8 @@
 use shep_smp_io2::{Buffer, Completion, Driver, Operation, OperationHandle, Progress, Value};
 use std::{
     ffi::CString,
-    fs::File,
-    io::{Read, Seek, SeekFrom},
+    fs::{File, OpenOptions},
+    io::{Read, Seek, SeekFrom, Write},
     net::{SocketAddr, TcpListener},
     os::fd::OwnedFd,
     sync::Arc,
@@ -114,6 +114,60 @@ fn full_admission_rejects_immediately_with_original_buffer() {
     assert_eq!(rejected.error.kind(), std::io::ErrorKind::WouldBlock);
     assert_eq!(rejected.operation.buffer().unwrap().as_ptr(), address);
     finish(&mut driver, &mut first).result.unwrap();
+    driver.drain().unwrap();
+}
+
+#[test]
+fn write_at_overrides_append_mode_without_changing_shared_flags() {
+    check_write_at_append(false);
+}
+
+#[test]
+fn write_at_overrides_append_enabled_after_push() {
+    check_write_at_append(true);
+}
+
+fn check_write_at_append(enable_after_push: bool) {
+    use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
+
+    let mut driver = Driver::new(1).unwrap();
+    let temp = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(temp.path(), b"abc").unwrap();
+    let file = Arc::new(
+        OpenOptions::new()
+            .write(true)
+            .append(!enable_after_push)
+            .open(temp.path())
+            .unwrap(),
+    );
+    let mut alias = file.try_clone().unwrap();
+    let buffer = Buffer::from_slice(b"X", 1).unwrap();
+    let ptr = buffer.as_ptr();
+    let mut handle = driver
+        .push(Operation::WriteAt {
+            file: file.clone(),
+            buffer,
+            offset: 0,
+        })
+        .unwrap();
+    if enable_after_push {
+        // Deterministically exercise the check-then-submit race through a clone
+        // sharing the open file description, before the kernel sees the SQE.
+        let flags = fcntl_getfl(&alias).unwrap();
+        assert!(!flags.contains(OFlags::APPEND));
+        fcntl_setfl(&alias, flags | OFlags::APPEND).unwrap();
+    }
+    let flags = fcntl_getfl(&alias).unwrap();
+    assert!(flags.contains(OFlags::APPEND));
+    let done = finish(&mut driver, &mut handle);
+    assert_eq!(done.result.unwrap().into_count(), 1);
+    assert_eq!(done.operation.buffer().unwrap().as_ptr(), ptr);
+    assert_eq!(std::fs::read(temp.path()).unwrap(), b"Xbc");
+    assert_eq!(alias.stream_position().unwrap(), 0);
+    assert_eq!(fcntl_getfl(&alias).unwrap(), flags);
+    // The override is per request; ordinary writes through the clone still append.
+    alias.write_all(b"Y").unwrap();
+    assert_eq!(std::fs::read(temp.path()).unwrap(), b"XbcY");
     driver.drain().unwrap();
 }
 

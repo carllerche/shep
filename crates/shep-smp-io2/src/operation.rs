@@ -29,6 +29,11 @@ pub enum Operation {
         offset: u64,
     },
     /// Write once at an explicit file offset; a short write is returned to the caller.
+    ///
+    /// Always requests `RWF_NOAPPEND` (Linux 6.9+), honoring the offset even if
+    /// the descriptor has `O_APPEND` set or its append flag changes concurrently.
+    /// Does not change the descriptor's shared flags. Unsupported kernels report
+    /// an error through the completion; the driver never retries without the flag.
     WriteAt {
         /// Descriptor retained until the write CQE.
         file: Arc<File>,

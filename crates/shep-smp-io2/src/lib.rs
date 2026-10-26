@@ -1,5 +1,10 @@
 //! Safe, local io_uring building blocks for Shep.
 //!
+//! Requires Linux 6.9 or newer. Positional writes always use `RWF_NOAPPEND`;
+//! unsupported flags or operations fail through their completions, without a
+//! fallback that weakens positional semantics. [`Driver::new`] does not check
+//! the kernel version or probe support for every operation.
+//!
 //! [`Io::push`] owns and publishes an [`Operation`] without submitting it.
 //! [`Driver::submit`] submits a batch; [`Driver::reap_into`] only processes CQEs.
 //! [`OperationHandle::poll_complete`] observes an operation's shared lifecycle.
