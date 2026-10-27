@@ -267,7 +267,7 @@ pub struct Completion {
 pub struct OperationHandle {
     /// Live submitter claim. None after completion consumption or explicit release;
     /// the token owns no Io and dropping it alone cannot change the slab.
-    id: Option<OperationId>,
+    pub(crate) id: Option<OperationId>,
 }
 impl OperationHandle {
     /// Attach the submitter's claim to a freshly published Submitted record.

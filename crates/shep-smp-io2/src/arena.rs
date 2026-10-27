@@ -52,6 +52,8 @@ impl OperationId {
 pub(crate) struct Record {
     /// Owned request inputs. None after consumption while a cancel pins the slot.
     pub(crate) operation: Option<Operation>,
+    /// Adapter resources held until the terminal CQE, independent of submitter interest.
+    pub(crate) completion_guard: Option<Box<dyn std::any::Any>>,
     /// Submitter interest, optional result, and the operation-specific waker.
     lifecycle: Lifecycle,
     /// One reference for the original CQE plus each outstanding CancelTarget pin,
@@ -125,6 +127,7 @@ impl Arena {
         };
         entry.insert(Record {
             operation: Some(operation),
+            completion_guard: None,
             lifecycle: Lifecycle::Submitted,
             kernel_refs: 1,
             own_done: false,

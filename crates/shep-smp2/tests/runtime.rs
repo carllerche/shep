@@ -249,3 +249,45 @@ fn saturated_runtime_returns_owned_operation_without_an_admission_waiter() {
         .unwrap();
     runtime.shutdown().unwrap();
 }
+
+#[test]
+fn filesystem_metadata_worker_wakes_native_runtime_and_shutdown_drains_files() {
+    use shep_smp_fs2::{Fs, OpenOptions};
+    let mut runtime = Runtime::new(Default::default()).unwrap();
+    let fs = Fs::new(runtime.io(), Default::default()).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    runtime
+        .block_on(async move {
+            let work = async {
+                let path = dir.path().join("native-fs");
+                fs.create_dir_all(&path).await.unwrap();
+                let file = fs
+                    .open(
+                        path.join("data"),
+                        OpenOptions {
+                            create_new: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .unwrap();
+                file.allocate(0, 4096).await.unwrap();
+                assert_eq!(file.len().await.unwrap(), 0);
+                let (result, _) = file
+                    .write_at(Buffer::from_slice(b"native", 1).unwrap(), 0)
+                    .await;
+                assert_eq!(result.unwrap(), 6);
+                assert_eq!(file.len().await.unwrap(), 6);
+                file.sync_data().await.unwrap();
+                fs.sync_dir(&path).await.unwrap();
+                assert_eq!(fs.read_dir(&path).await.unwrap().len(), 1);
+                file.close().await.unwrap();
+                fs.shutdown().await;
+            };
+            shep_smp2::timeout(Duration::from_secs(5), work)
+                .await
+                .expect("metadata worker must wake parked runtime");
+        })
+        .unwrap();
+    runtime.shutdown().unwrap();
+}

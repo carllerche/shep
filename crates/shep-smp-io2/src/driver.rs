@@ -77,10 +77,20 @@ impl DriverId {
 /// # }
 /// ```
 #[must_use = "call wake() to notify operation waiters after reaping"]
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct Progress {
     /// Completion notifications detached from slab IDs, ready to run without arena borrows.
     wakes: Vec<Waker>,
+    /// Adapter guards are released with notifications, never during teardown borrows.
+    guards: Vec<Box<dyn std::any::Any>>,
+}
+impl std::fmt::Debug for Progress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Progress")
+            .field("wakes", &self.wakes.len())
+            .field("guards", &self.guards.len())
+            .finish()
+    }
 }
 impl Progress {
     /// Notify all accumulated waiters, retaining notification storage for reuse.
@@ -89,6 +99,9 @@ impl Progress {
     /// notification is delivered even if another waiter panics. This does not
     /// access operation storage.
     pub fn wake(&mut self) {
+        for guard in self.guards.drain(..) {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(guard)));
+        }
         for waker in self.wakes.drain(..) {
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| waker.wake()));
         }
@@ -291,6 +304,9 @@ impl Driver {
                     _ => None,
                 };
                 let result = value(operation, cqe.result());
+                if let Some(guard) = record.completion_guard.take() {
+                    progress.guards.push(guard);
+                }
                 let (wake, released) = arena.complete(id, result);
                 if let Some(wake) = wake {
                     progress.wakes.push(wake);

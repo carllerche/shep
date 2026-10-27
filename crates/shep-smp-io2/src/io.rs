@@ -32,6 +32,25 @@ impl Io {
     pub fn push(&self, operation: Operation) -> Result<OperationHandle, Rejected> {
         self.shared.push(operation)
     }
+    /// Publish a request with adapter resources retained until its terminal CQE.
+    /// The guard is dropped outside driver borrows by Progress::wake after
+    /// reaping (or when that Progress is dropped), even if the
+    /// submitter releases its handle. On rejection it is dropped immediately.
+    /// Guards must not panic in Drop. This does not retain resources until the
+    /// result is consumed, nor until cancellation identity pins are released.
+    pub fn push_with_guard<G: 'static>(
+        &self,
+        operation: Operation,
+        guard: G,
+    ) -> Result<OperationHandle, Rejected> {
+        let handle = self.push(operation)?;
+        self.shared
+            .arena
+            .borrow_mut()
+            .record(handle.id.unwrap())
+            .completion_guard = Some(Box::new(guard));
+        Ok(handle)
+    }
     /// Count accepted SQEs whose terminal CQEs have not been reaped; pins and
     /// retained completed results do not count. Includes the runtime's watch, if any.
     pub fn in_flight(&self) -> usize {

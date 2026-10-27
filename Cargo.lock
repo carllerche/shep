@@ -1370,6 +1370,8 @@ dependencies = [
 name = "shep-smp-fs2"
 version = "0.1.0"
 dependencies = [
+ "libc",
+ "rustix",
  "shep-smp-io2",
  "tempfile",
 ]

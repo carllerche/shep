@@ -30,6 +30,17 @@ SQ push fails, the unsubmitted operation is returned with its owned inputs.
 After successful publication, an enter error does not justify freeing inputs.
 The ring uses no SQPOLL. Submit and reap are separate explicit phases.
 
+`Io::push_with_guard` additionally retains adapter-owned resources independently
+of the submitter claim. Rejected publication drops the guard immediately. The
+terminal CQE moves an accepted guard out of the slab into `Progress`; `wake`
+releases it outside all driver borrows, before notifying operation waiters.
+Dropping that Progress also releases its guards. Cancellation identity pins and
+unconsumed results do not retain these guards after terminal completion. During
+driver destruction guard release is deferred with the other notifications until
+kernel retirement and ring destruction. Guards must not panic in Drop; wake
+isolates a panicking guard so subsequent notifications can still run. The fs2
+adapter uses guards to keep file/domain activity counted after waiter abandonment.
+
 The supported operations are Nop, positional ReadAt/WriteAt, Fsync, Fallocate,
 Ftruncate, OpenAt, Close, Socket, Accept, Connect, Send, Recv, Shutdown, PollAdd,
 and Cancel. They produce one terminal CQE each. No public flags enable

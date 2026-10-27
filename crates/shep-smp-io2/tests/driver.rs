@@ -938,3 +938,46 @@ fn drop_notifies_waiters_after_all_results_retire_and_ring_is_closed() {
     assert!(observed.load(std::sync::atomic::Ordering::Relaxed));
     assert!(first.try_complete(&io).is_some());
 }
+
+#[test]
+fn completion_guards_outlive_claims_and_release_outside_borrows() {
+    use std::{cell::Cell, rc::Rc};
+    struct Guard {
+        io: shep_smp_io2::Io,
+        drops: Rc<Cell<usize>>,
+    }
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            // Reenter the arena; no kernel/arena borrow may span this callback.
+            let _ = self.io.in_flight();
+            self.drops.set(self.drops.get() + 1);
+        }
+    }
+    let mut driver = Driver::new(1).unwrap();
+    let io = driver.io().clone();
+    let drops = Rc::new(Cell::new(0));
+    let guard = || Guard {
+        io: io.clone(),
+        drops: drops.clone(),
+    };
+    let mut handle = io.push_with_guard(Operation::Nop, guard()).unwrap();
+    assert!(io.push_with_guard(Operation::Nop, guard()).is_err());
+    assert_eq!(drops.get(), 1, "rejection releases guard immediately");
+    handle.release(&io);
+    assert_eq!(drops.get(), 1, "abandonment must retain guard");
+    let mut progress = shep_smp_io2::Progress::default();
+    // A successful wait attempt is not proof of completion. Reap until the
+    // request retires, keeping guard release deferred until progress.wake().
+    while io.in_flight() != 0 {
+        driver.submit_and_wait(None).unwrap();
+        driver.reap_into(&mut progress);
+    }
+    assert_eq!(io.in_flight(), 0);
+    assert_eq!(drops.get(), 1, "notifications remain deferred");
+    progress.wake();
+    assert_eq!(drops.get(), 2);
+    let mut pending = io.push_with_guard(Operation::Nop, guard()).unwrap();
+    pending.release(&io);
+    drop(driver);
+    assert_eq!(drops.get(), 3, "driver teardown releases guards");
+}
