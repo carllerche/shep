@@ -1,16 +1,15 @@
 //! The unsafe SQ publication, ring-driving, and descriptor-adoption boundary.
 #![allow(unsafe_code)]
 use crate::{
-    Io, Operation, OperationHandle, Rejected, Value,
+    Fd, Io, Operation, OperationHandle, Rejected, Value,
     arena::{Arena, OperationId, Record},
 };
 use io_uring::{IoUring, opcode, types};
 use std::{
     cell::RefCell,
-    fs::File,
     io,
     net::Shutdown,
-    os::fd::{AsRawFd, FromRawFd, IntoRawFd},
+    os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd},
     rc::Rc,
     task::Waker,
     time::Instant,
@@ -141,9 +140,10 @@ impl Shared {
             return Err(arena.reject(id, io::ErrorKind::WouldBlock.into()));
         }
         if let Operation::Close(close) = operation {
-            // CLOSE now owns the descriptor and cannot be canceled through this
-            // driver. Never recover the number from a CQE error: even ECANCELED
-            // can come from flush after the fd was removed and reused.
+            // Fd excludes ring descriptors, which CLOSE would reject before
+            // removing them. CLOSE now owns this descriptor and cannot be
+            // canceled through this driver. Never recover the number from a CQE
+            // error: even ECANCELED can come from flush after removal and reuse.
             let _ = close.file.take().unwrap().into_raw_fd();
         }
         Ok(OperationHandle::new(id))
@@ -646,8 +646,9 @@ fn value(operation: &Operation, result: i32) -> io::Result<Value> {
     Ok(match operation {
         Operation::OpenAt { .. } | Operation::Socket { .. } | Operation::Accept { .. } => {
             // SAFETY: These constructors return a fresh, exclusively owned fd on
-            // success. Adopt it even for ignored operations so it cannot leak.
-            Value::File(unsafe { File::from_raw_fd(result) })
+            // success, never an io_uring instance. Adopt it without revalidation
+            // even for ignored operations so it cannot leak.
+            Value::File(unsafe { Fd::from_owned_fd_unchecked(OwnedFd::from_raw_fd(result)) })
         }
         Operation::ReadAt { .. }
         | Operation::WriteAt { .. }

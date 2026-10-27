@@ -10,8 +10,8 @@
 #![doc = include_str!("../README.md")]
 
 pub use shep_smp_io2::Buffer;
-use shep_smp_io2::{Completion, Io, Operation, OperationHandle, Value};
-use std::{cell::Cell, fs::File, future::poll_fn, io, net::SocketAddr, os::fd::OwnedFd, sync::Arc};
+use shep_smp_io2::{Completion, Fd, Io, Operation, OperationHandle, Value};
+use std::{cell::Cell, future::poll_fn, io, net::SocketAddr, os::fd::OwnedFd, sync::Arc};
 
 /// Bound on each owned read/write and each temporary write_all chunk.
 #[derive(Clone, Copy, Debug)]
@@ -39,13 +39,13 @@ impl Config {
 
 struct Socket {
     io: Io,
-    file: Arc<File>,
+    file: Arc<Fd>,
     closed: Cell<bool>,
     write_closed: Cell<bool>,
     config: Config,
 }
 impl Socket {
-    fn new(io: Io, file: File, config: Config) -> Self {
+    fn new(io: Io, file: Fd, config: Config) -> Self {
         Self {
             io,
             file: Arc::new(file),
@@ -163,7 +163,7 @@ impl TcpListener {
         let address = listener.local_addr()?;
         let fd: OwnedFd = listener.into();
         Ok(Self {
-            socket: Socket::new(io, fd.into(), config),
+            socket: Socket::new(io, Fd::new(fd)?, config),
             address,
         })
     }
@@ -214,7 +214,7 @@ impl TcpStream {
             SocketFlags::CLOEXEC | SocketFlags::NONBLOCK,
             None,
         )?;
-        let socket = Socket::new(io, fd.into(), config);
+        let socket = Socket::new(io, Fd::new(fd)?, config);
         match rustix::net::connect(&*socket.file, &address) {
             Ok(()) => {}
             Err(rustix::io::Errno::INPROGRESS) => {
@@ -240,7 +240,7 @@ impl TcpStream {
         stream.set_nonblocking(false)?;
         let fd: OwnedFd = stream.into();
         Ok(Self {
-            socket: Socket::new(io, fd.into(), config),
+            socket: Socket::new(io, Fd::new(fd)?, config),
         })
     }
     /// Borrow independent exclusive directions for full duplex I/O.

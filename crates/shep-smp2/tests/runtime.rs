@@ -17,7 +17,7 @@ fn nested_local_tasks_and_file_io_run_without_tokio_runtime() {
         task_budget: 2,
     })
     .unwrap();
-    let file = File::from_std(runtime.io(), tempfile::tempfile().unwrap());
+    let file = File::from_std(runtime.io(), tempfile::tempfile().unwrap()).unwrap();
     let local = Rc::new(42);
     let expected = local.clone();
     let result = runtime
@@ -122,7 +122,7 @@ fn shutdown_cancels_tasks_and_drains_detached_kernel_work() {
     let mut runtime = Runtime::new(Config::default()).unwrap();
     let io = runtime.io();
     let original = tempfile::NamedTempFile::new().unwrap();
-    let file = File::from_std(io.clone(), original.reopen().unwrap());
+    let file = File::from_std(io.clone(), original.reopen().unwrap()).unwrap();
     let dropped = Rc::new(Cell::new(false));
     let probe = Dropped(dropped.clone());
     let join = runtime.spawn(async move {
@@ -151,7 +151,7 @@ fn io_and_timers_progress_under_sustained_task_load() {
         max_in_flight: 64,
     })
     .unwrap();
-    let file = File::from_std(runtime.io(), tempfile::tempfile().unwrap());
+    let file = File::from_std(runtime.io(), tempfile::tempfile().unwrap()).unwrap();
     runtime
         .block_on(async move {
             let mut tasks = Vec::new();
@@ -195,7 +195,7 @@ fn invalid_operation_does_not_consume_admission() {
         max_in_flight: 1,
     })
     .unwrap();
-    let file = File::from_std(runtime.io(), tempfile::tempfile().unwrap());
+    let file = File::from_std(runtime.io(), tempfile::tempfile().unwrap()).unwrap();
     runtime
         .block_on(async move {
             let bad = file.clone();
@@ -229,7 +229,7 @@ fn saturated_runtime_returns_owned_operation_without_an_admission_waiter() {
         task_budget: 8,
     })
     .unwrap();
-    let file = File::from_std(runtime.io(), tempfile::tempfile().unwrap());
+    let file = File::from_std(runtime.io(), tempfile::tempfile().unwrap()).unwrap();
     runtime
         .block_on(async move {
             let mut first = file

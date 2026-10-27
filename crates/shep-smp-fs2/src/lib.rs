@@ -12,7 +12,7 @@ mod helper;
 
 use activity::{Activity, Guard};
 pub use shep_smp_io2::Buffer;
-use shep_smp_io2::{Completion, Io, Operation, OperationHandle, Rejected, Value};
+use shep_smp_io2::{Completion, Fd, Io, Operation, OperationHandle, Rejected, Value};
 use std::{
     cell::RefCell,
     ffi::CString,
@@ -166,7 +166,7 @@ impl Fs {
         let alignment = if options.direct {
             let query = file.clone();
             self.domain
-                .metadata(move || direct_alignment(&query))?
+                .metadata(move || direct_alignment(query.as_file()))?
                 .await?
         } else {
             1
@@ -182,17 +182,17 @@ impl Fs {
     /// Import a descriptor after querying its flags and, for O_DIRECT, alignment.
     /// Do not retain aliases that change flags or perform conflicting I/O.
     pub async fn from_std(&self, file: std::fs::File) -> io::Result<File> {
-        let file = Arc::new(file);
-        let query = file.clone();
-        let alignment = self
+        let (file, alignment) = self
             .domain
             .metadata(move || {
-                let flags = rustix::fs::fcntl_getfl(&*query)?;
-                if flags.contains(rustix::fs::OFlags::DIRECT) {
-                    direct_alignment(&query)
+                let file = Fd::new(file)?;
+                let flags = rustix::fs::fcntl_getfl(&file)?;
+                let alignment = if flags.contains(rustix::fs::OFlags::DIRECT) {
+                    direct_alignment(file.as_file())?
                 } else {
-                    Ok(1)
-                }
+                    1
+                };
+                Ok((Arc::new(file), alignment))
             })?
             .await?;
         Ok(File::new(
@@ -281,7 +281,7 @@ pub trait FileIo: Clone + 'static {
 }
 
 struct FileInner {
-    descriptor: Arc<std::fs::File>,
+    descriptor: Arc<Fd>,
     activity: Arc<Activity>,
     path: PathBuf,
     alignment: usize,
@@ -294,13 +294,7 @@ pub struct File {
     inner: Rc<FileInner>,
 }
 impl File {
-    fn new(
-        io: Io,
-        domain: Rc<Domain>,
-        file: Arc<std::fs::File>,
-        path: PathBuf,
-        alignment: usize,
-    ) -> Self {
+    fn new(io: Io, domain: Rc<Domain>, file: Arc<Fd>, path: PathBuf, alignment: usize) -> Self {
         Self {
             io,
             domain,
@@ -316,15 +310,16 @@ impl File {
         &self.io
     }
     /// Import a buffered descriptor without starting a helper. For O_DIRECT use
-    /// Fs::from_std instead. Aliases must not change descriptor flags.
-    pub fn from_std(io: Io, file: std::fs::File) -> Self {
-        Self::new(
+    /// Fs::from_std instead. Validates io2 descriptor eligibility synchronously.
+    /// Aliases must not change descriptor flags.
+    pub fn from_std(io: Io, file: std::fs::File) -> io::Result<Self> {
+        Ok(Self::new(
             io,
             Domain::new(Config::default()),
-            Arc::new(file),
+            Arc::new(Fd::new(file)?),
             PathBuf::new(),
             1,
-        )
+        ))
     }
     /// Original open path; empty for imported descriptors, unchanged by rename.
     pub fn path(&self) -> &Path {
@@ -411,7 +406,7 @@ impl File {
             ),
         }
     }
-    async fn execute(&self, make: impl FnOnce(Arc<std::fs::File>) -> Operation) -> io::Result<()> {
+    async fn execute(&self, make: impl FnOnce(Arc<Fd>) -> Operation) -> io::Result<()> {
         let guard = self.begin()?;
         let handle = self
             .io
@@ -453,7 +448,7 @@ impl File {
         self.domain
             .metadata(move || {
                 let _guard = guard;
-                Ok(file.metadata()?.len())
+                Ok(file.as_file().metadata()?.len())
             })?
             .await
     }

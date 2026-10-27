@@ -28,7 +28,7 @@ impl Io {
     /// Publish owned inputs as a new Submitted record and return its submitter claim.
     /// No submit syscall, reap, or waiting occurs. Validation/capacity errors return
     /// the operation; failed SQ push rolls Submitted back to removed. CLOSE transfers
-    /// its unique File into a kernel-owned fd only after successful publication.
+    /// its unique Fd into a kernel-owned fd only after successful publication.
     pub fn push(&self, operation: Operation) -> Result<OperationHandle, Rejected> {
         self.shared.push(operation)
     }

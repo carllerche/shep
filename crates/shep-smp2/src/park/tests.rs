@@ -122,7 +122,7 @@ fn shutdown_retires_an_existing_cancel_before_canceling_its_watch() {
     let (socket, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
     let mut receive = io
         .push(Operation::Recv {
-            socket: Arc::new(File::from(OwnedFd::from(socket))),
+            socket: Arc::new(shep_smp_io2::Fd::new(File::from(OwnedFd::from(socket))).unwrap()),
             buffer: Buffer::new(8, 1).unwrap(),
         })
         .unwrap();

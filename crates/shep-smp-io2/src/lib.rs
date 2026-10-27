@@ -5,6 +5,10 @@
 //! fallback that weakens positional semantics. [`Driver::new`] does not check
 //! the kernel version or probe support for every operation.
 //!
+//! [`Fd`] owns a descriptor validated for io2. Generic imports validate once;
+//! CLOSE admission performs no descriptor validation syscall. Standard File and
+//! socket wrappers use checked conversions because they can contain arbitrary fds.
+//!
 //! [`Io::push`] owns and publishes an [`Operation`] without submitting it.
 //! [`Driver::submit`] submits a batch; [`Driver::reap_into`] only processes CQEs.
 //! [`OperationHandle::poll_complete`] observes an operation's shared lifecycle.
@@ -24,11 +28,13 @@
 mod arena;
 mod buffer;
 mod driver;
+mod fd;
 mod io;
 mod lifecycle;
 mod operation;
 pub use buffer::Buffer;
 pub use driver::{Driver, Progress, WaitOutcome};
+pub use fd::Fd;
 pub use io::{Io, Rejected};
 pub use operation::{
     CancelTarget, Close, Completion, Operation, OperationHandle, SocketAddress, Value,

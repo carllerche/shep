@@ -1,6 +1,6 @@
 # Owned io_uring operation boundary
 
-The crate root denies unsafe code. Only `src/driver.rs` allows it; `buffer`,
+The crate root denies unsafe code. `src/driver.rs` and `src/fd.rs` allow it; `buffer`,
 `io`, `operation`, `arena`, and `lifecycle` each forbid it. The file adapter in
 shep-smp-fs2 and runtime/eventfd protocol in shep-smp2 also forbid unsafe code.
 Dependencies (including io-uring and rustix) retain their own unsafe internals.
@@ -20,7 +20,7 @@ submitter/completion states. These implementation modules are crate-private.
 
 `Io::push` stores an owned operation in the slab before publishing its SQE.
 Buffer backing allocations, CString paths and boxed socket addresses remain
-stable across operation moves and slab growth. Arc<File> retains input
+stable across operation moves and slab growth. Arc<Fd> retains input
 file descriptors. Buffer storage is initialized, so short reads and errors
 never expose uninitialized memory. Lengths fit the kernel's signed result size;
 positional offsets reject the current-position sentinel and signed overflow.
@@ -115,12 +115,13 @@ notify registered waiters; wake drains notifications while retaining allocation.
 Removed records are collected in driver-owned scratch storage and cleared only
 after ring and arena borrows end.
 
-## Three unsafe sites
+## Unsafe boundaries
 
 1. SQ push publishes pointers into already-owned, stable operation data. Slab
    ownership and lifecycle references retain it until terminal completion.
 2. Successful OpenAt/Socket/Accept results adopt fresh descriptors using
-   File::from_raw_fd. Adoption occurs even for ignored operations, so the owned
+   OwnedFd::from_raw_fd and Fd::from_owned_fd_unchecked. Adoption occurs even
+   for ignored operations, so the owned
    result is closed when its last lifecycle reference is released.
 3. Teardown publishes pointer-free cancellation SQEs directly. Admission has
    failed, so no target identity can be reused. Previously queued SQEs are
@@ -128,7 +129,22 @@ after ring and arena borrows end.
    Its reserved zero user_data is handled without a slab lookup. The original
    requests retain their records and inputs until their own terminal CQEs.
 
-Close accepts a unique File and transfers it with into_raw_fd after successful
+4. Fd imports call fstat with writable struct storage, reading it only after
+   success. The public unchecked constructor transfers the non-ring invariant
+   to its caller; no validation occurs on that path.
+
+Fd owns a live descriptor that does not refer to an io_uring instance. Generic
+imports (including std File and socket wrappers) validate this once with fstat,
+then inspect /proc/self/fd for anonymous inodes. Ring descriptors are rejected
+and dropped; eventfd and epoll remain supported. If inspection fails, import
+fails closed. The unchecked constructor requires the caller to guarantee this
+invariant. No mutable File/OwnedFd reference is exposed that could replace the
+descriptor. Duplicating an Fd preserves its classification without revalidation.
+Successful open/socket/accept CQEs return fresh non-ring descriptors, so the
+unsafe adoption boundary constructs Fd directly without a validation syscall.
+All descriptor-bearing operations take Fd (shared through Arc where needed).
+
+Close accepts a unique Fd and transfers it with into_raw_fd after successful
 SQ publication, suppressing its destructor. The driver retains no raw fd to
 reclaim: even ECANCELED may be a filesystem flush error after the descriptor
 has been removed and reused. Public cancellation of an unconsumed Close is

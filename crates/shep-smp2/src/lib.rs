@@ -177,7 +177,7 @@ mod tests {
             task_budget: 8,
             closed: false,
         };
-        let file = File::from_std(runtime.io(), tempfile::tempfile().unwrap());
+        let file = File::from_std(runtime.io(), tempfile::tempfile().unwrap()).unwrap();
         runtime
             .block_on(async move {
                 let (send, recv) = tokio::sync::oneshot::channel();

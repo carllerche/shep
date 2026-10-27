@@ -1,7 +1,6 @@
 //! Runtime-owned eventfd notification protocol.
 #![forbid(unsafe_code)]
 use std::{
-    fs::File,
     io::{self, Read, Write},
     sync::{Arc, Weak},
     task::{Wake, Waker},
@@ -11,7 +10,7 @@ use std::{
 use super::state::ParkState;
 
 pub(super) struct Event {
-    file: Arc<File>,
+    file: Arc<shep_smp_io2::Fd>,
     state: ParkState,
     owner: ThreadId,
 }
@@ -22,7 +21,7 @@ impl Event {
             rustix::event::EventfdFlags::CLOEXEC | rustix::event::EventfdFlags::NONBLOCK,
         )?;
         Ok(Arc::new(Self {
-            file: Arc::new(File::from(fd)),
+            file: Arc::new(shep_smp_io2::Fd::new(fd)?),
             state: ParkState::new(),
             owner: thread::current().id(),
         }))
@@ -32,7 +31,7 @@ impl Event {
         // One eventfd read drains the whole counter (not semaphore mode). Do
         // not loop on successful reads: a wake storm must not starve the core.
         loop {
-            match (&*self.file).read(&mut bytes) {
+            match self.file.as_file().read(&mut bytes) {
                 Ok(8) => return Ok(()),
                 Ok(_) => return Err(io::Error::other("short eventfd read")),
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
@@ -55,7 +54,7 @@ impl Event {
     pub(super) fn finish(&self) {
         self.state.finish();
     }
-    pub(super) fn file(&self) -> Arc<File> {
+    pub(super) fn file(&self) -> Arc<shep_smp_io2::Fd> {
         self.file.clone()
     }
 }
@@ -81,7 +80,7 @@ impl WakeHandle {
             return Ok(true);
         }
         loop {
-            match (&*event.file).write(&1u64.to_ne_bytes()) {
+            match event.file.as_file().write(&1u64.to_ne_bytes()) {
                 Ok(8) => return Ok(true),
                 Ok(_) => return Err(io::Error::other("short eventfd write")),
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
@@ -111,7 +110,7 @@ mod tests {
     use std::time::{Duration, Instant};
     fn counter(event: &Event) -> io::Result<u64> {
         let mut bytes = [0; 8];
-        (&*event.file).read_exact(&mut bytes)?;
+        event.file.as_file().read_exact(&mut bytes)?;
         Ok(u64::from_ne_bytes(bytes))
     }
     fn assert_no_write(event: &Event) {

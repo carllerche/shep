@@ -322,7 +322,7 @@ mod tests {
     use std::{fs::File, sync::Arc};
     fn operation() -> Operation {
         Operation::ReadAt {
-            file: Arc::new(File::open("/dev/null").unwrap()),
+            file: Arc::new(crate::Fd::new(File::open("/dev/null").unwrap()).unwrap()),
             buffer: Buffer::new(8, 8).unwrap(),
             offset: 0,
         }
@@ -455,7 +455,12 @@ mod tests {
         let id = arena.insert(Operation::Nop).unwrap();
         arena.pin(id);
         arena.abandon(id);
-        arena.complete(id, Ok(Value::File(File::open("/dev/null").unwrap())));
+        arena.complete(
+            id,
+            Ok(Value::File(
+                crate::Fd::new(File::open("/dev/null").unwrap()).unwrap(),
+            )),
+        );
         let record = arena.unpin(id).unwrap();
         assert!(matches!(
             record.lifecycle,

@@ -19,7 +19,7 @@ fn futures_are_lazy_and_saturation_returns_owned_buffer_immediately() {
     let mut reactor = Driver::new(1).unwrap();
     let io = reactor.io().clone();
     let temp = tempfile::tempfile().unwrap();
-    let file = File::from_std(io.clone(), temp);
+    let file = File::from_std(io.clone(), temp).unwrap();
     let first = file.write_at(Buffer::from_slice(b"first", 1).unwrap(), 0);
     let mut first = pin!(first);
     assert_eq!(io.in_flight(), 0);
@@ -54,7 +54,7 @@ fn dropping_a_handle_before_submission_keeps_accepted_work_until_drain() {
     let mut reactor = Driver::new(2).unwrap();
     let io = reactor.io().clone();
     let mut original = tempfile::tempfile().unwrap();
-    let file = File::from_std(io.clone(), original.try_clone().unwrap());
+    let file = File::from_std(io.clone(), original.try_clone().unwrap()).unwrap();
     {
         let mut write = pin!(file.write_at(Buffer::from_slice(b"detached", 1).unwrap(), 0));
         assert!(poll(write.as_mut()).is_pending());
@@ -73,7 +73,7 @@ fn submitted_waiter_can_be_dropped_and_remaining_operations_complete() {
     let mut progress = shep_smp_io2::Progress::default();
     let mut reactor = Driver::new(2).unwrap();
     let io = reactor.io().clone();
-    let file = File::from_std(io.clone(), tempfile::tempfile().unwrap());
+    let file = File::from_std(io.clone(), tempfile::tempfile().unwrap()).unwrap();
     {
         let mut write = pin!(file.write_at(Buffer::from_slice(b"submitted", 1).unwrap(), 0));
         assert!(poll(write.as_mut()).is_pending());
@@ -108,7 +108,7 @@ fn a_panicking_completion_waker_does_not_strand_other_completions() {
     }
     let mut reactor = Driver::new(2).unwrap();
     let io = reactor.io().clone();
-    let file = File::from_std(io.clone(), tempfile::tempfile().unwrap());
+    let file = File::from_std(io.clone(), tempfile::tempfile().unwrap()).unwrap();
     let mut first = pin!(file.write_at(Buffer::new(1, 1).unwrap(), 0));
     let mut second = pin!(file.write_at(Buffer::new(1, 1).unwrap(), 1));
     let bad = Waker::from(std::sync::Arc::new(Bad));
@@ -129,7 +129,7 @@ fn a_panicking_completion_waker_does_not_strand_other_completions() {
 fn completed_result_survives_dropping_the_reactor_owner() {
     let mut reactor = Driver::new(1).unwrap();
     let io = reactor.io().clone();
-    let file = File::from_std(io.clone(), tempfile::tempfile().unwrap());
+    let file = File::from_std(io.clone(), tempfile::tempfile().unwrap()).unwrap();
     let mut write = pin!(file.write_at(Buffer::from_slice(b"survives", 1).unwrap(), 0));
     assert!(poll(write.as_mut()).is_pending());
     reactor.drain().unwrap();
@@ -270,7 +270,7 @@ fn close_and_domain_drain_track_released_eager_handles_and_retained_results() {
 #[test]
 fn dropping_async_write_and_canceling_close_does_not_reopen_gate() {
     let mut driver = Driver::new(4).unwrap();
-    let file = File::from_std(driver.io().clone(), tempfile::tempfile().unwrap());
+    let file = File::from_std(driver.io().clone(), tempfile::tempfile().unwrap()).unwrap();
     let mut write = Box::pin(file.write_at(Buffer::new(4096, 1).unwrap(), 0));
     assert!(poll(write.as_mut()).is_pending());
     drop(write);
