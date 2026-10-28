@@ -52,7 +52,12 @@ fn native_connect_accept_and_full_duplex_half_close() {
                 let mut stream = listener.accept().await.unwrap();
                 let (mut reader, mut writer) = stream.split();
                 // Both directions remain independently usable; writes are chunked.
-                writer.write_all(b"greeting").await.unwrap();
+                let buffer = Buffer::from_slice(b"greeting", 64).unwrap();
+                let ptr = buffer.as_ptr();
+                let (result, buffer) = writer.write_all(buffer).await;
+                result.unwrap();
+                assert_eq!(buffer.as_ptr(), ptr);
+                assert_eq!(&*buffer, b"greeting");
                 writer.shutdown().await.unwrap();
                 let mut received = Vec::new();
                 loop {
@@ -69,8 +74,11 @@ fn native_connect_accept_and_full_duplex_half_close() {
                 .await
                 .unwrap();
             client
-                .write_all(b"a message larger than the buffer limit")
+                .write_all(
+                    Buffer::from_slice(b"a message larger than the buffer limit", 1).unwrap(),
+                )
                 .await
+                .0
                 .unwrap();
             client.flush().await.unwrap();
             client.shutdown().await.unwrap();
@@ -286,7 +294,12 @@ fn short_writes_and_write_all_preserve_byte_order_under_backpressure() {
                 "expected a short send, got {sent}"
             );
             assert_eq!(&*buffer, &bytes);
-            stream.write_all(&bytes[sent..]).await.unwrap();
+            let buffer = Buffer::from_slice(&bytes[sent..], 64).unwrap();
+            let ptr = buffer.as_ptr();
+            let (result, buffer) = stream.write_all(buffer).await;
+            result.unwrap();
+            assert_eq!(buffer.as_ptr(), ptr);
+            assert_eq!(&*buffer, &bytes[sent..]);
             stream.close().await.unwrap();
         })
         .unwrap();
@@ -314,7 +327,7 @@ fn dropping_blocked_sends_retires_without_cancellation_capacity() {
     }
     let (first, second) = streams.split_at_mut(1);
     let mut a = Box::pin(first[0].write(Buffer::new(65536, 1).unwrap()));
-    let mut b = Box::pin(second[0].write(Buffer::new(65536, 1).unwrap()));
+    let mut b = Box::pin(second[0].write_all(Buffer::new(65536, 1).unwrap()));
     let mut cx = Context::from_waker(Waker::noop());
     assert!(a.as_mut().poll(&mut cx).is_pending());
     assert!(b.as_mut().poll(&mut cx).is_pending());
@@ -337,5 +350,36 @@ fn dropping_connect_waits_at_full_capacity_retires_all_work() {
     assert!(b.as_mut().poll(&mut cx).is_pending());
     drop(a);
     drop(b);
+    drain(&mut driver);
+}
+
+#[test]
+fn write_all_returns_owned_buffer_on_rejection_and_handles_empty_buffers() {
+    let mut driver = Driver::new(1).unwrap();
+    let (client, _peer) = pair();
+    let mut stream =
+        TcpStream::from_std(driver.io(), client, Config { max_buffer_size: 2 }).unwrap();
+    let mut cx = Context::from_waker(Waker::noop());
+    let buffer = Buffer::new(0, 64).unwrap();
+    let ptr = buffer.as_ptr();
+    let mut empty = Box::pin(stream.write_all(buffer));
+    let std::task::Poll::Ready((result, buffer)) = empty.as_mut().poll(&mut cx) else {
+        panic!("empty write must complete immediately")
+    };
+    result.unwrap();
+    assert_eq!(buffer.as_ptr(), ptr);
+    drop(empty);
+    let mut occupied = driver.push(Operation::Nop).unwrap();
+    let buffer = Buffer::from_slice(b"more than the send limit", 64).unwrap();
+    let ptr = buffer.as_ptr();
+    let mut write = Box::pin(stream.write_all(buffer));
+    let std::task::Poll::Ready((result, buffer)) = write.as_mut().poll(&mut cx) else {
+        panic!("admission rejection must complete immediately")
+    };
+    assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+    assert_eq!(buffer.as_ptr(), ptr);
+    assert_eq!(&*buffer, b"more than the send limit");
+    drop(write);
+    occupied.release(driver.io());
     drain(&mut driver);
 }

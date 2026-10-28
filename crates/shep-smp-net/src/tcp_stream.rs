@@ -59,13 +59,13 @@ impl TcpStream {
     pub async fn write(&mut self, buffer: Buffer) -> (io::Result<usize>, Buffer) {
         self.socket.transfer(buffer, true).await
     }
-    /// Send all bytes with bounded temporary storage. Errors may follow partial
+    /// Send all owned bytes without copying and return the buffer. Errors may follow partial
     /// sends; do not retry the whole message without an application protocol.
-    pub async fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
+    pub async fn write_all(&mut self, buffer: Buffer) -> (io::Result<()>, Buffer) {
         WriteHalf {
             socket: &self.socket,
         }
-        .write_all(bytes)
+        .write_all(buffer)
         .await
     }
     pub async fn flush(&mut self) -> io::Result<()> {

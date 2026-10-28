@@ -1,6 +1,6 @@
 use std::io;
 
-/// Bound on each owned read/write and each temporary write_all chunk.
+/// Bound on each owned read/write and each write_all send.
 #[derive(Clone, Copy, Debug)]
 pub struct Config {
     pub max_buffer_size: usize,

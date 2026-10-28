@@ -1014,3 +1014,40 @@ fn completion_guards_outlive_claims_and_release_outside_borrows() {
     drop(driver);
     assert_eq!(drops.get(), 3, "driver teardown releases guards");
 }
+
+#[test]
+fn send_range_validates_bounds_and_returns_original_buffer() {
+    let mut driver = Driver::new(1).unwrap();
+    let (sender, mut receiver) = std::os::unix::net::UnixStream::pair().unwrap();
+    let sender = std::rc::Rc::new(Fd::new(sender).unwrap());
+    let mut buffer = Buffer::from_slice(b"prefixPAYLOADsuffix", 64).unwrap();
+    let ptr = buffer.as_ptr();
+    for (start, end) in [(4, 3), (0, 100), (usize::MAX, usize::MAX)] {
+        let rejected = driver
+            .push(Operation::SendRange {
+                socket: sender.clone(),
+                buffer,
+                range: start..end,
+            })
+            .unwrap_err();
+        assert_eq!(rejected.error.kind(), std::io::ErrorKind::InvalidInput);
+        buffer = rejected.operation.into_buffer().unwrap();
+        assert_eq!(buffer.as_ptr(), ptr);
+        assert_eq!(driver.io().in_flight(), 0);
+    }
+    let mut handle = driver
+        .push(Operation::SendRange {
+            socket: sender,
+            buffer,
+            range: 6..13,
+        })
+        .unwrap();
+    let completion = finish(&mut driver, &mut handle);
+    assert_eq!(completion.result.unwrap().into_count(), 7);
+    let buffer = completion.operation.into_buffer().unwrap();
+    assert_eq!(buffer.as_ptr(), ptr);
+    assert_eq!(&*buffer, b"prefixPAYLOADsuffix");
+    let mut bytes = [0; 7];
+    receiver.read_exact(&mut bytes).unwrap();
+    assert_eq!(&bytes, b"PAYLOAD");
+}

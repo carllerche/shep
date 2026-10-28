@@ -13,9 +13,11 @@ let mut listener = TcpListener::bind(
 )?;
 runtime.block_on(async move {
     let mut stream = listener.accept().await?;
-    let (result, buffer) = stream.read(Buffer::new(4096, 1)?).await;
+    let (result, mut buffer) = stream.read(Buffer::new(4096, 1)?).await;
     let n = result?;
-    stream.write_all(&buffer[..n]).await?;
+    buffer.resize(n);
+    let (result, _buffer) = stream.write_all(buffer).await;
+    result?;
     stream.close().await
 })??;
 # Ok::<(), std::io::Error>(())
@@ -24,10 +26,12 @@ runtime.block_on(async move {
 - `read` and `write` return `(Result<usize>, Buffer)`, including on rejection
   or kernel errors. Short transfers are exposed; a nonempty read returning zero
   means EOF. Zero-length transfers return immediately.
-- `write_all` borrows bytes and sends bounded chunks, handling partial sends.
+- `write_all` takes an owned `Buffer` and returns `(Result<()>, Buffer)`.
+  It sends bounded ranges without copying, handling partial sends.
   Errors can follow partial progress, as with standard TCP `write_all`.
 - `Config::max_buffer_size` defaults to 64 KiB and bounds each transfer and
-  temporary chunk allocation. Oversized owned transfers return `InvalidInput`.
+  send in `write_all` (the whole buffer may exceed the limit). Oversized buffers
+  passed to `read` or `write` return `InvalidInput`.
   Driver admission saturation returns `WouldBlock`, preserving the input buffer.
   There is no admission waiter, background write queue, or buffer pool.
 - `split` borrows one exclusive reader and one exclusive writer. They can run

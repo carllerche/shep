@@ -502,6 +502,7 @@ fn validate(operation: &Operation, shared: &Shared) -> io::Result<()> {
                     .is_none_or(|end| end > i64::MAX as u64)
         }
         Operation::Ftruncate { len, .. } => *len > i64::MAX as u64,
+        Operation::SendRange { buffer, range, .. } => buffer.get(range.clone()).is_none(),
         Operation::Close(close) => close.file.is_none(),
         Operation::Cancel(target) => !target.is_active_for(shared.id),
         _ => false,
@@ -616,6 +617,20 @@ fn entry(operation: &mut Operation) -> io_uring::squeue::Entry {
         )
         .flags(libc::MSG_NOSIGNAL)
         .build(),
+        Operation::SendRange {
+            socket,
+            buffer,
+            range,
+        } => {
+            let bytes = &buffer[range.clone()];
+            opcode::Send::new(
+                types::Fd(socket.as_raw_fd()),
+                bytes.as_ptr(),
+                bytes.len() as u32,
+            )
+            .flags(libc::MSG_NOSIGNAL)
+            .build()
+        }
         Operation::Recv { socket, buffer } => opcode::Recv::new(
             types::Fd(socket.as_raw_fd()),
             buffer.as_mut_ptr(),
@@ -653,6 +668,7 @@ fn value(operation: &Operation, result: i32) -> io::Result<Value> {
         Operation::ReadAt { .. }
         | Operation::WriteAt { .. }
         | Operation::Send { .. }
+        | Operation::SendRange { .. }
         | Operation::Recv { .. } => Value::Count(result as usize),
         Operation::PollAdd { .. } => Value::Poll(result as u32),
         _ => Value::Done,

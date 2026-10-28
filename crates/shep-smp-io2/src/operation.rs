@@ -109,6 +109,13 @@ pub enum Operation {
         /// Owned source bytes for an ordinary copying send, without zero-copy notifications.
         buffer: Buffer,
     },
+    /// Send a checked range without copying or changing the owned buffer.
+    SendRange {
+        socket: Rc<Fd>,
+        buffer: Buffer,
+        /// Byte range within the buffer; invalid ranges are rejected before publication.
+        range: std::ops::Range<usize>,
+    },
     /// Receive once into an owned buffer; returns the actual byte count or EOF.
     Recv {
         /// Descriptor retained until the receive CQE, including while waiting for data.
@@ -148,6 +155,7 @@ impl Operation {
             Self::ReadAt { buffer, .. }
             | Self::WriteAt { buffer, .. }
             | Self::Send { buffer, .. }
+            | Self::SendRange { buffer, .. }
             | Self::Recv { buffer, .. } => Some(buffer),
             _ => None,
         }
@@ -159,6 +167,7 @@ impl Operation {
             Self::ReadAt { buffer, .. }
             | Self::WriteAt { buffer, .. }
             | Self::Send { buffer, .. }
+            | Self::SendRange { buffer, .. }
             | Self::Recv { buffer, .. } => Some(buffer),
             _ => None,
         }
