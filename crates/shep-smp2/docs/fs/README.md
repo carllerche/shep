@@ -1,12 +1,18 @@
-# Native asynchronous filesystems
+# Local asynchronous filesystems
 
-Filesystem operations are methods on `shep_smp2::io::Io`. Files, I/O handles,
-and their futures stay on the owning core. No Tokio runtime is required.
+File constructors and namespace functions use the runtime entered on the current
+thread. They resolve that context on first poll and panic if no runtime is
+entered, like other context-dependent runtime APIs. Creating and dropping an
+unpolled future performs no filesystem work. Once opened, a file retains its
+owning I/O handle; its operations do not look up a new runtime.
 
-```rust,ignore
-let fs = runtime.io();
-runtime.block_on(async move {
-    let file = fs.open("segment", shep_smp2::fs::OpenOptions {
+```rust,no_run
+use shep_smp2::{Runtime, fs::{self, File, OpenOptions}};
+
+let mut runtime = Runtime::new(Default::default())?;
+runtime.block_on(async {
+    fs::create_dir_all("data").await?;
+    let file = File::open("data/segment", OpenOptions {
         create_new: true,
         direct: true,
         ..Default::default()
@@ -16,66 +22,63 @@ runtime.block_on(async move {
     // Use file.alignment() for buffer addresses, lengths and offsets.
     // Await writes before syncing their durability.
     file.sync_data().await?;
-    file.close().await?;
+    fs::sync_dir("data").await?;
+    file.shutdown().await;
     Ok::<(), std::io::Error>(())
 })??;
+# Ok::<(), std::io::Error>(())
 ```
 
 ## File contract
 
-`FileIo` defines alignment, owned-buffer positional reads/writes, data/full sync,
-allocation without length extension, truncation, and length queries. Raw `File`
-implements it; schedulers can implement the same contract. It uses io2's Buffer,
-which is a different type from the older shep-smp-io Buffer. Existing appender,
-scheduler and storage consumers have not yet been migrated to this trait.
+`File` provides positional reads/writes, data/full sync, allocation without length
+extension, truncation, and length queries. Clones share the descriptor and one
+admission gate. Independent requests may run concurrently and have no implicit
+ordering; callers exclude conflicting mutations.
 
-Transfers expose short results and return the input buffer even on validation,
-admission, or kernel errors. Unpolled asynchronous operations do nothing. Eager
-`submit_read_at` / `submit_write_at` publish immediately; consume their handles
-or explicitly release them using the allocating Io. Abandoning a handle or
-future does not undo accepted filesystem work.
+Transfers own their `Buffer` and return `(Result<usize>, Buffer)`, including on
+validation, admission, and kernel errors. Short transfers are exposed. Dropping
+an admitted future abandons its result without undoing accepted work or disabling
+the file. Operations retain their buffers and descriptors through completion.
 
-Direct opens use O_DIRECT and query STATX_DIOALIGN on the metadata helper. Both
+`OpenOptions::default()` enables both reads and writes, without creating or
+truncating the file. Direct I/O is explicit and never silently downgraded.
+Direct opens use O_DIRECT and query STATX_DIOALIGN on the bounded worker. Both
 reported constraints must be nonzero powers of two. When alignment reporting is
-unavailable, the conservative 4096-byte fallback matches the older file layer;
-actual I/O errors remain visible. There is no buffered fallback. `Io::import_file`
-queries an imported descriptor's flags and alignment. The older synchronous
-`File::from_std` is for buffered descriptors only. Do not retain aliases that
-change descriptor flags or perform conflicting operations.
+unavailable, a conservative 4096-byte fallback is used; actual I/O errors remain
+visible. Buffered files report alignment one.
 
-Read/write, open, allocation, truncation, and file sync use io2 operations.
+`File::from_std(file).await` imports a descriptor, querying its flags and any
+direct-I/O alignment constraints. Do not retain aliases that change descriptor
+flags or perform conflicting I/O. Opening may create or truncate a file before a
+later alignment-query error or cancellation; those effects are not rolled back.
+
+Read/write, open, allocation, truncation, and file sync use the I/O driver.
 Length/alignment queries, directory creation/listing, rename, unlink and directory
-sync use one lazily started worker per driver. Its bounded queue has
-64 slots in addition to the executing job. Helper queue
-saturation and io2 saturation return WouldBlock; no hidden admission backlog or
-weighted scheduling is provided here. Opening may already have created or
-truncated a file before a later alignment-query error or cancellation.
+sync use one lazily started worker per driver. Its queue has 64 slots in addition
+to the executing job. Worker or driver saturation returns `WouldBlock`; there is
+no hidden admission backlog or weighted scheduling.
 
 ## Ordering and lifetime
 
-Callers manage dependencies and exclude conflicting metadata mutations. In
-particular, publishing metadata requires writing a temporary file, awaiting its
-writes, syncing it, renaming it, then syncing the containing directory. Submission
-order alone is not a durability dependency. Renaming between directories may
-require syncing both directories.
+Publishing metadata requires writing a temporary file, awaiting its writes,
+syncing it, renaming it, then syncing the containing directory. Submission order
+alone is not a durability dependency. Renaming between directories may require
+syncing both directories.
 
-`File::close` closes the shared admission gate, waits for accepted operations,
-and consumes that clone. Canceling an admitted close leaves the gate closed.
-Other clones and unconsumed completion results may retain the descriptor until
-dropped. Close does not imply fsync.
+`File::shutdown(&self)` stops admission through all clones and waits for accepted
+operations, including those whose futures were dropped. It returns `()`, does not
+sync, and does not await descriptor closure. Canceling a polled shutdown leaves
+the shared gate closed; another shutdown can finish waiting. Clones and retained
+completion results keep the descriptor alive until dropped. The runtime must
+continue driving completions while shutdown waits.
 
-`Io::close` stops admission for kernel and metadata work. `Driver::drain`
-finishes accepted kernel work and joins the metadata worker, including jobs whose
-waiters were dropped. Runtime shutdown uses this same teardown. Driver destruction
-also joins the worker as a fallback; joining can block until accepted jobs finish.
-The driver is shared with networking, so storage must finish its own transactions
-and close its files before runtime shutdown. There is no separate filesystem
-shutdown scope.
+`Io::close` stops admission for kernel and worker jobs. Driver drain finishes
+accepted kernel work and joins the worker, including abandoned jobs. Runtime
+shutdown uses the same teardown. Driver destruction also joins the worker as a
+fallback, which can block until accepted jobs finish. Storage should finish its
+transactions and shut down its files before runtime shutdown. There is no
+separate filesystem shutdown scope.
 
-The runtime must keep driving the reactor while awaiting file close. Manual
-drivers must deliver `Progress::wake`, which releases completion guards.
-Scheduling weights, admission waiters, appender buffering, and transaction-level
-drain remain responsibilities of the layers above the filesystem adapter.
-
-Run `cargo nextest run -p shep-smp2` for
-file, completion-lifetime, native runtime and socket regression coverage.
+Scheduling, appender buffering, and transaction-level drain remain the
+responsibility of layers above this adapter.

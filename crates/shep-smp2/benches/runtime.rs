@@ -59,7 +59,7 @@ fn main() {
     });
     let original = tempfile::tempfile().unwrap();
     original.set_len(16 << 20).unwrap();
-    let file = File::from_std(runtime.io(), original).unwrap();
+    let file = runtime.block_on(File::from_std(original)).unwrap().unwrap();
     let mut group = c.benchmark_group("io/write_read");
     for bytes in [64, 4096, 65536] {
         group.throughput(Throughput::Bytes((bytes * 2) as u64));

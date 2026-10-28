@@ -1,8 +1,5 @@
-use crate::fs::{
-    Buffer, FileIo,
-    activity::{Activity, Guard},
-    pending::finish,
-};
+use crate::fs::{Buffer, pending::finish};
+use crate::io::support::activity::{Activity, Guard};
 use crate::io::{Completion, Fd, Io, Operation, OperationHandle, Rejected, Value};
 use std::{io, rc::Rc, sync::Arc};
 
@@ -27,15 +24,6 @@ impl File {
                 alignment,
             }),
         }
-    }
-    pub fn io(&self) -> &Io {
-        &self.io
-    }
-    /// Import a buffered descriptor without starting a helper. For O_DIRECT use
-    /// Io::import_file instead. Validates io2 descriptor eligibility synchronously.
-    /// Aliases must not change descriptor flags.
-    pub fn from_std(io: Io, file: std::fs::File) -> io::Result<Self> {
-        Ok(Self::new(io, std::rc::Rc::new(Fd::new(file)?), 1))
     }
     pub fn alignment(&self) -> usize {
         self.inner.alignment
@@ -80,24 +68,12 @@ impl File {
         }
         self.io.push_with_guard(operation, guards)
     }
-    /// Eager admission. Consume or release the returned handle using self.io().
-    /// File activity survives handle release until the kernel completes.
-    pub fn submit_write_at(
-        &self,
-        buffer: Buffer,
-        offset: u64,
-    ) -> Result<OperationHandle, Rejected> {
-        self.submit_buffer(buffer, offset, true)
-    }
-    pub fn submit_read_at(&self, buffer: Buffer, offset: u64) -> Result<OperationHandle, Rejected> {
-        self.submit_buffer(buffer, offset, false)
-    }
     pub async fn write_at(&self, buffer: Buffer, offset: u64) -> (io::Result<usize>, Buffer) {
-        self.finish_buffer(self.submit_write_at(buffer, offset))
+        self.finish_buffer(self.submit_buffer(buffer, offset, true))
             .await
     }
     pub async fn read_at(&self, buffer: Buffer, offset: u64) -> (io::Result<usize>, Buffer) {
-        self.finish_buffer(self.submit_read_at(buffer, offset))
+        self.finish_buffer(self.submit_buffer(buffer, offset, false))
             .await
     }
     async fn finish_buffer(
@@ -159,8 +135,8 @@ impl File {
         let file = self.inner.descriptor.as_file().try_clone()?;
         self.io
             .shared
-            .metadata
-            .metadata(move || {
+            .worker
+            .run(move || {
                 let _guard = guard;
                 Ok(file.metadata()?.len())
             })?
@@ -169,39 +145,11 @@ impl File {
     pub async fn is_empty(&self) -> io::Result<bool> {
         Ok(self.len().await? == 0)
     }
-    /// Stop new operations through all clones and await accepted work, without
-    /// syncing. Clones retain the descriptor until dropped, including this
-    /// consuming clone until close returns. Completed unconsumed results may
-    /// also retain it. Canceling close leaves the shared gate closed.
-    pub async fn close(self) -> io::Result<()> {
+    /// Stop admission through all clones and await accepted work, including
+    /// operations whose futures were dropped. Does not sync or close the descriptor.
+    /// Canceling an admitted shutdown leaves the shared gate closed.
+    pub async fn shutdown(&self) {
         self.inner.activity.close();
         self.inner.activity.idle().await;
-        Ok(())
-    }
-}
-impl FileIo for File {
-    fn alignment(&self) -> usize {
-        File::alignment(self)
-    }
-    async fn read_at(&self, buffer: Buffer, offset: u64) -> (io::Result<usize>, Buffer) {
-        File::read_at(self, buffer, offset).await
-    }
-    async fn write_at(&self, buffer: Buffer, offset: u64) -> (io::Result<usize>, Buffer) {
-        File::write_at(self, buffer, offset).await
-    }
-    async fn sync_data(&self) -> io::Result<()> {
-        File::sync_data(self).await
-    }
-    async fn sync_all(&self) -> io::Result<()> {
-        File::sync_all(self).await
-    }
-    async fn allocate(&self, offset: u64, len: u64) -> io::Result<()> {
-        File::allocate(self, offset, len).await
-    }
-    async fn set_len(&self, len: u64) -> io::Result<()> {
-        File::set_len(self, len).await
-    }
-    async fn len(&self) -> io::Result<u64> {
-        File::len(self).await
     }
 }

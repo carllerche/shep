@@ -32,6 +32,7 @@ mod fd;
 mod lifecycle;
 mod operation;
 mod producer;
+pub(crate) mod support;
 pub use buffer::Buffer;
 pub use driver::{Driver, Progress, WaitOutcome};
 pub use fd::Fd;

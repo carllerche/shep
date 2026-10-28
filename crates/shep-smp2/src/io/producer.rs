@@ -18,7 +18,7 @@ impl std::fmt::Display for Rejected {
 }
 impl std::error::Error for Rejected {}
 
-/// Local I/O handle with publication and asynchronous filesystem operations.
+/// Local I/O admission and publication handle.
 /// Raw publication never submits, waits, or queues rejected work.
 #[derive(Clone)]
 pub struct Io {
@@ -65,7 +65,7 @@ impl Io {
     /// its reserve. Existing record states and kernel ownership are unchanged.
     pub fn close(&self) {
         self.shared.arena.borrow_mut().close();
-        self.shared.metadata.activity.close();
+        self.shared.worker.close();
     }
     pub fn is_failed(&self) -> bool {
         self.shared.arena.borrow().is_failed()

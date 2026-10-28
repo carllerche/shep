@@ -1,6 +1,7 @@
 use std::io;
 
-/// File opening policy. Direct I/O is explicit and never silently downgraded.
+/// File opening policy. Defaults to reading and writing an existing file.
+/// Direct I/O is explicit and never silently downgraded.
 #[derive(Clone, Copy, Debug)]
 pub struct OpenOptions {
     pub read: bool,

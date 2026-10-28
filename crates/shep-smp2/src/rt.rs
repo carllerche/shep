@@ -250,7 +250,11 @@ mod tests {
             }))
         })
         .unwrap();
-        let file = File::from_std(runtime.io(), tempfile::tempfile().unwrap()).unwrap();
+        let file = runtime
+            .block_on(File::from_std(tempfile::tempfile().unwrap()))
+            .unwrap()
+            .unwrap();
+        wakes.store(0, Ordering::Relaxed);
         runtime
             .block_on(async move {
                 let (send, recv) = tokio::sync::oneshot::channel();

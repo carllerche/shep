@@ -1,5 +1,5 @@
-//! One bounded metadata worker per driver. No runtime dependency.
-use crate::fs::activity::wake_safely;
+//! One bounded blocking worker per driver. No runtime dependency.
+use super::activity::wake_safely;
 use std::{
     future::Future,
     io,
@@ -21,7 +21,7 @@ impl Helper {
         }
         let (sender, receiver) = mpsc::sync_channel::<Job>(queue);
         let thread = thread::Builder::new()
-            .name("shep-fs-metadata".into())
+            .name("shep-io-worker".into())
             .spawn(move || {
                 while let Ok(job) = receiver.recv() {
                     job();
@@ -43,7 +43,7 @@ impl Helper {
         let output = shared.clone();
         let job = Box::new(move || {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work))
-                .unwrap_or_else(|_| Err(io::Error::other("metadata helper panicked")));
+                .unwrap_or_else(|_| Err(io::Error::other("blocking worker panicked")));
             let wake = {
                 let mut state = output.lock().unwrap();
                 state.result = Some(result);

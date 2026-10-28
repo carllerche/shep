@@ -13,7 +13,10 @@ use std::{
 fn nested_local_tasks_and_file_io_run_without_tokio_runtime() {
     assert!(tokio::runtime::Handle::try_current().is_err());
     let mut runtime = Runtime::new(Config { max_in_flight: 2 }).unwrap();
-    let file = File::from_std(runtime.io(), tempfile::tempfile().unwrap()).unwrap();
+    let file = runtime
+        .block_on(File::from_std(tempfile::tempfile().unwrap()))
+        .unwrap()
+        .unwrap();
     let local = Rc::new(42);
     let expected = local.clone();
     let result = runtime
@@ -114,7 +117,10 @@ fn shutdown_cancels_tasks_and_drains_detached_kernel_work() {
     let mut runtime = Runtime::new(Config::default()).unwrap();
     let io = runtime.io();
     let original = tempfile::NamedTempFile::new().unwrap();
-    let file = File::from_std(io.clone(), original.reopen().unwrap()).unwrap();
+    let file = runtime
+        .block_on(File::from_std(original.reopen().unwrap()))
+        .unwrap()
+        .unwrap();
     let dropped = Rc::new(Cell::new(false));
     let probe = Dropped(dropped.clone());
     let join = runtime.spawn(async move {
@@ -139,7 +145,10 @@ fn shutdown_cancels_tasks_and_drains_detached_kernel_work() {
 #[test]
 fn io_and_timers_progress_under_sustained_task_load() {
     let mut runtime = Runtime::new(Config { max_in_flight: 64 }).unwrap();
-    let file = File::from_std(runtime.io(), tempfile::tempfile().unwrap()).unwrap();
+    let file = runtime
+        .block_on(File::from_std(tempfile::tempfile().unwrap()))
+        .unwrap()
+        .unwrap();
     runtime
         .block_on(async move {
             let mut tasks = Vec::new();
@@ -179,7 +188,10 @@ fn task_panics_are_contained_and_runtime_can_be_reused() {
 #[test]
 fn invalid_operation_does_not_consume_admission() {
     let mut runtime = Runtime::new(Config { max_in_flight: 1 }).unwrap();
-    let file = File::from_std(runtime.io(), tempfile::tempfile().unwrap()).unwrap();
+    let file = runtime
+        .block_on(File::from_std(tempfile::tempfile().unwrap()))
+        .unwrap()
+        .unwrap();
     runtime
         .block_on(async move {
             let bad = file.clone();
@@ -209,21 +221,24 @@ fn invalid_operation_does_not_consume_admission() {
 #[test]
 fn saturated_runtime_returns_owned_operation_without_an_admission_waiter() {
     let mut runtime = Runtime::new(Config { max_in_flight: 1 }).unwrap();
-    let file = File::from_std(runtime.io(), tempfile::tempfile().unwrap()).unwrap();
+    let file = runtime
+        .block_on(File::from_std(tempfile::tempfile().unwrap()))
+        .unwrap()
+        .unwrap();
     runtime
         .block_on(async move {
-            let mut first = file
-                .submit_write_at(Buffer::from_slice(b"first", 1).unwrap(), 0)
-                .unwrap();
+            let mut first = Box::pin(file.write_at(Buffer::from_slice(b"first", 1).unwrap(), 0));
+            poll_fn(|cx| {
+                assert!(first.as_mut().poll(cx).is_pending());
+                Poll::Ready(())
+            })
+            .await;
             let (result, buffer) = file
                 .write_at(Buffer::from_slice(b"second", 1).unwrap(), 8)
                 .await;
             assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
             assert_eq!(&*buffer, b"second");
-            std::future::poll_fn(|cx| first.poll_complete(file.io(), cx))
-                .await
-                .result
-                .unwrap();
+            first.await.0.unwrap();
             assert_eq!(file.write_at(buffer, 8).await.0.unwrap(), 6);
         })
         .unwrap();
@@ -234,23 +249,21 @@ fn saturated_runtime_returns_owned_operation_without_an_admission_waiter() {
 fn filesystem_metadata_worker_wakes_native_runtime_and_shutdown_drains_files() {
     use shep_smp2::fs::OpenOptions;
     let mut runtime = Runtime::new(Default::default()).unwrap();
-    let fs = runtime.io();
     let dir = tempfile::tempdir().unwrap();
     runtime
         .block_on(async move {
             let work = async {
                 let path = dir.path().join("native-fs");
-                fs.create_dir_all(&path).await.unwrap();
-                let file = fs
-                    .open(
-                        path.join("data"),
-                        OpenOptions {
-                            create_new: true,
-                            ..Default::default()
-                        },
-                    )
-                    .await
-                    .unwrap();
+                shep_smp2::fs::create_dir_all(&path).await.unwrap();
+                let file = File::open(
+                    path.join("data"),
+                    OpenOptions {
+                        create_new: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
                 file.allocate(0, 4096).await.unwrap();
                 assert_eq!(file.len().await.unwrap(), 0);
                 let (result, _) = file
@@ -259,9 +272,9 @@ fn filesystem_metadata_worker_wakes_native_runtime_and_shutdown_drains_files() {
                 assert_eq!(result.unwrap(), 6);
                 assert_eq!(file.len().await.unwrap(), 6);
                 file.sync_data().await.unwrap();
-                fs.sync_dir(&path).await.unwrap();
-                assert_eq!(fs.read_dir(&path).await.unwrap().len(), 1);
-                file.close().await.unwrap();
+                shep_smp2::fs::sync_dir(&path).await.unwrap();
+                assert_eq!(shep_smp2::fs::read_dir(&path).await.unwrap().len(), 1);
+                file.shutdown().await;
             };
             shep_smp2::timeout(Duration::from_secs(5), work)
                 .await
