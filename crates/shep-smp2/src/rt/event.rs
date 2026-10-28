@@ -10,7 +10,7 @@ use std::{
 use super::state::ParkState;
 
 pub(super) struct Event {
-    file: Arc<std::fs::File>,
+    file: std::fs::File,
     state: ParkState,
     owner: ThreadId,
 }
@@ -18,7 +18,7 @@ impl Event {
     pub(super) fn new() -> io::Result<Arc<Self>> {
         let fd = shep_sys::eventfd(0, true)?;
         Ok(Arc::new(Self {
-            file: Arc::new(std::fs::File::from(fd)),
+            file: std::fs::File::from(fd),
             state: ParkState::new(),
             owner: thread::current().id(),
         }))
@@ -28,7 +28,7 @@ impl Event {
         // One eventfd read drains the whole counter (not semaphore mode). Do
         // not loop on successful reads: a wake storm must not starve the core.
         loop {
-            match (&*self.file).read(&mut bytes) {
+            match (&self.file).read(&mut bytes) {
                 Ok(8) => return Ok(()),
                 Ok(_) => return Err(io::Error::other("short eventfd read")),
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
@@ -51,8 +51,8 @@ impl Event {
     pub(super) fn finish(&self) {
         self.state.finish();
     }
-    pub(super) fn file(&self) -> Arc<std::fs::File> {
-        self.file.clone()
+    pub(super) fn file(&self) -> &std::fs::File {
+        &self.file
     }
 }
 
@@ -77,7 +77,7 @@ impl WakeHandle {
             return Ok(true);
         }
         loop {
-            match (&*event.file).write(&1u64.to_ne_bytes()) {
+            match (&event.file).write(&1u64.to_ne_bytes()) {
                 Ok(8) => return Ok(true),
                 Ok(_) => return Err(io::Error::other("short eventfd write")),
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
@@ -108,7 +108,7 @@ mod tests {
     use std::time::{Duration, Instant};
     fn counter(event: &Event) -> io::Result<u64> {
         let mut bytes = [0; 8];
-        (&*event.file).read_exact(&mut bytes)?;
+        (&event.file).read_exact(&mut bytes)?;
         Ok(u64::from_ne_bytes(bytes))
     }
     fn assert_no_write(event: &Event) {
