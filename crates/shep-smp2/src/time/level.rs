@@ -50,91 +50,12 @@ const LEVEL_MULT: usize = 64;
 
 impl Level {
     pub(crate) fn new(level: usize) -> Level {
-        // A value has to be Copy in order to use syntax like:
-        //     let stack = Stack::default();
-        //     ...
-        //     slots: [stack; 64],
-        //
-        // Alternatively, since Stack is Default one can
-        // use syntax like:
-        //     let slots: [Stack; 64] = Default::default();
-        //
-        // However, that is only supported for arrays of size
-        // 32 or fewer.  So in our case we have to explicitly
-        // invoke the constructor for each array element.
-        let ctor = EntryList::default;
-
         Level {
             level,
             slot_range: slot_range(level),
             level_range: level_range(level),
             occupied: 0,
-            slot: [
-                ctor(),
-                ctor(),
-                ctor(),
-                ctor(),
-                ctor(),
-                ctor(),
-                ctor(),
-                ctor(),
-                ctor(),
-                ctor(),
-                ctor(),
-                ctor(),
-                ctor(),
-                ctor(),
-                ctor(),
-                ctor(),
-                ctor(),
-                ctor(),
-                ctor(),
-                ctor(),
-                ctor(),
-                ctor(),
-                ctor(),
-                ctor(),
-                ctor(),
-                ctor(),
-                ctor(),
-                ctor(),
-                ctor(),
-                ctor(),
-                ctor(),
-                ctor(),
-                ctor(),
-                ctor(),
-                ctor(),
-                ctor(),
-                ctor(),
-                ctor(),
-                ctor(),
-                ctor(),
-                ctor(),
-                ctor(),
-                ctor(),
-                ctor(),
-                ctor(),
-                ctor(),
-                ctor(),
-                ctor(),
-                ctor(),
-                ctor(),
-                ctor(),
-                ctor(),
-                ctor(),
-                ctor(),
-                ctor(),
-                ctor(),
-                ctor(),
-                ctor(),
-                ctor(),
-                ctor(),
-                ctor(),
-                ctor(),
-                ctor(),
-                ctor(),
-            ],
+            slot: std::array::from_fn(|_| EntryList::default()),
         }
     }
 
