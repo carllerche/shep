@@ -301,30 +301,11 @@ fn relative_intervals_start_immediately_and_reject_zero_periods() {
 
 #[test]
 fn standard_clock_instants_support_reactor_deadline_arithmetic() {
-    let standard = std::time::Instant::now() - Duration::from_secs(5);
-    let epoch = Instant::from_std(standard);
-    assert_eq!(epoch.into_std(), standard);
-    assert_eq!(Instant::from(standard), epoch);
-    assert_eq!(std::time::Instant::from(epoch), standard);
-    let duration = Duration::from_millis(125);
-    let mut deadline = epoch;
-    deadline += duration;
-    assert_eq!(deadline.duration_since(epoch), duration);
-    assert_eq!(deadline.checked_duration_since(epoch), Some(duration));
-    assert_eq!(epoch.checked_duration_since(deadline), None);
-    assert_eq!(epoch.saturating_duration_since(deadline), Duration::ZERO);
-    assert_eq!(deadline.saturating_duration_since(epoch), duration);
-    assert_eq!(epoch.checked_add(duration), Some(deadline));
-    assert_eq!(deadline.checked_sub(duration), Some(epoch));
-    assert_eq!(epoch.checked_add(Duration::MAX), None);
-    assert_eq!(epoch.checked_sub(Duration::MAX), None);
-    deadline -= duration;
-    assert_eq!(deadline, epoch);
-    assert!(epoch.elapsed() >= Duration::from_secs(5));
-
+    let epoch = std::time::Instant::now() - Duration::from_secs(5);
+    let duration = std::time::Duration::from_millis(125);
     let timer = ManualTimer::new(epoch);
     let mut delay = pin!(timer.with(|| sleep_until(epoch + duration)));
     assert!(poll(delay.as_mut()).is_pending());
-    timer.advance(Instant::from_std(standard + duration));
+    timer.advance(epoch + duration);
     assert!(poll(delay.as_mut()).is_ready());
 }

@@ -51,7 +51,6 @@
 
 mod entry;
 pub mod error;
-mod instant;
 mod interval;
 mod level;
 mod sleep;
@@ -59,7 +58,6 @@ mod timeout;
 mod timer;
 mod wheel;
 
-pub use instant::Instant;
 pub use interval::{Interval, MissedTickBehavior, interval, interval_at};
 pub use sleep::{Sleep, sleep, sleep_until};
 pub use timeout::{Timeout, timeout, timeout_at};
@@ -67,4 +65,4 @@ pub(crate) use timer::Handle;
 #[doc(hidden)]
 pub use timer::Timer;
 
-pub use std::time::Duration;
+pub use std::time::{Duration, Instant};

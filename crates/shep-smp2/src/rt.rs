@@ -175,7 +175,7 @@ impl Runtime {
                 continue;
             }
             self.driver.timer.advance(Instant::now());
-            let deadline = self.driver.timer.next_wake().map(Instant::into_std);
+            let deadline = self.driver.timer.next_wake();
             let park = self.driver.prepare_park()?;
             // This check MUST follow publishing PARKING in prepare_park.
             // The notification RMW either synchronizes prior inbox publication,

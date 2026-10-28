@@ -12,6 +12,11 @@ use pin_project_lite::pin_project;
 
 use crate::time::{Duration, Instant, entry::TimerEntry, error::Error, timer::Handle};
 
+// Preserve the existing overflow fallback: roughly 30 years from now.
+fn far_future() -> Instant {
+    Instant::now() + Duration::from_secs(86400 * 365 * 30)
+}
+
 /// Waits until `deadline` is reached.
 ///
 /// No work is performed while awaiting on the sleep future to complete. `Sleep`
@@ -90,7 +95,7 @@ pub fn sleep_until(deadline: Instant) -> Sleep {
 pub fn sleep(duration: Duration) -> Sleep {
     match Instant::now().checked_add(duration) {
         Some(deadline) => sleep_until(deadline),
-        None => sleep_until(Instant::far_future()),
+        None => sleep_until(far_future()),
     }
 }
 
@@ -197,7 +202,7 @@ impl Sleep {
     }
 
     pub(crate) fn far_future() -> Sleep {
-        Self::new_timeout(Instant::far_future())
+        Self::new_timeout(far_future())
     }
 
     /// Returns the instant at which the future will complete.
