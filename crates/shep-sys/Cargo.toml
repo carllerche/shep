@@ -1,0 +1,11 @@
+[package]
+name = "shep-sys"
+description = "Small safe wrappers for the Linux primitives used by Shep"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+[lints]
+workspace = true
+[dependencies]
+libc.workspace = true

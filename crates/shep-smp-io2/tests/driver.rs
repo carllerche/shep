@@ -128,7 +128,7 @@ fn write_at_overrides_append_enabled_after_push() {
 }
 
 fn check_write_at_append(enable_after_push: bool) {
-    use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
+    use shep_sys::{file_flags, set_file_flags};
 
     let mut driver = Driver::new(1).unwrap();
     let temp = tempfile::NamedTempFile::new().unwrap();
@@ -154,18 +154,18 @@ fn check_write_at_append(enable_after_push: bool) {
     if enable_after_push {
         // Deterministically exercise the check-then-submit race through a clone
         // sharing the open file description, before the kernel sees the SQE.
-        let flags = fcntl_getfl(&alias).unwrap();
-        assert!(!flags.contains(OFlags::APPEND));
-        fcntl_setfl(&alias, flags | OFlags::APPEND).unwrap();
+        let flags = file_flags(&alias).unwrap();
+        assert!(flags & libc::O_APPEND == 0);
+        set_file_flags(&alias, flags | libc::O_APPEND).unwrap();
     }
-    let flags = fcntl_getfl(&alias).unwrap();
-    assert!(flags.contains(OFlags::APPEND));
+    let flags = file_flags(&alias).unwrap();
+    assert!(flags & libc::O_APPEND != 0);
     let done = finish(&mut driver, &mut handle);
     assert_eq!(done.result.unwrap().into_count(), 1);
     assert_eq!(done.operation.buffer().unwrap().as_ptr(), ptr);
     assert_eq!(std::fs::read(temp.path()).unwrap(), b"Xbc");
     assert_eq!(alias.stream_position().unwrap(), 0);
-    assert_eq!(fcntl_getfl(&alias).unwrap(), flags);
+    assert_eq!(file_flags(&alias).unwrap(), flags);
     // The override is per request; ordinary writes through the clone still append.
     alias.write_all(b"Y").unwrap();
     assert_eq!(std::fs::read(temp.path()).unwrap(), b"XbcY");
@@ -510,7 +510,11 @@ fn ring_descriptor_import_does_not_leak() {
     use std::os::fd::AsRawFd;
 
     let ring = io_uring::IoUring::new(1).unwrap();
-    let file = File::from(rustix::io::dup(&ring).unwrap());
+    let file = File::from(
+        std::os::fd::AsFd::as_fd(&ring)
+            .try_clone_to_owned()
+            .unwrap(),
+    );
     let fd = file.as_raw_fd();
     let path = format!("/proc/self/fd/{fd}");
     assert!(std::fs::read_link(&path).is_ok());

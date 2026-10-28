@@ -13,7 +13,7 @@ libc.workspace = true
 slab.workspace = true
 [dev-dependencies]
 io-uring = { workspace = true, features = ["io_safety"] }
-rustix = { workspace = true, features = ["fs"] }
+shep-sys.workspace = true
 tempfile.workspace = true
 criterion.workspace = true
 

@@ -1371,8 +1371,8 @@ name = "shep-smp-fs2"
 version = "0.1.0"
 dependencies = [
  "libc",
- "rustix",
  "shep-smp-io2",
+ "shep-sys",
  "tempfile",
 ]
 
@@ -1403,7 +1403,7 @@ dependencies = [
  "criterion",
  "io-uring",
  "libc",
- "rustix",
+ "shep-sys",
  "slab",
  "tempfile",
 ]
@@ -1413,9 +1413,9 @@ name = "shep-smp-net"
 version = "0.1.0"
 dependencies = [
  "libc",
- "rustix",
  "shep-smp-io2",
  "shep-smp2",
+ "shep-sys",
 ]
 
 [[package]]
@@ -1443,11 +1443,12 @@ name = "shep-smp2"
 version = "0.1.0"
 dependencies = [
  "criterion",
- "rustix",
+ "libc",
  "shep-smp-exec",
  "shep-smp-fs2",
  "shep-smp-io2",
  "shep-smp-time",
+ "shep-sys",
  "tempfile",
  "tokio",
 ]
@@ -1466,6 +1467,13 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "shep-sys"
+version = "0.1.0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

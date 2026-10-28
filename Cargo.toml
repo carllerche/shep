@@ -45,7 +45,7 @@ futures-core = "0.3"
 hegeltest = "0.50"
 io-uring = "0.7"
 libc = "0.2"
-rustix = { version = "1", features = ["event"] }
+shep-sys = { path = "crates/shep-sys" }
 pin-project-lite = "0.2"
 proc-macro2 = "1"
 quote = "1"

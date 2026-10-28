@@ -12,7 +12,8 @@ shep-smp-exec.workspace = true
 shep-smp-time.workspace = true
 shep-smp-io2.workspace = true
 shep-smp-fs2.workspace = true
-rustix.workspace = true
+shep-sys.workspace = true
+libc.workspace = true
 [[bench]]
 name = "runtime"
 harness = false

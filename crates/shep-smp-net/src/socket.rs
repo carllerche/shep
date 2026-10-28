@@ -30,7 +30,7 @@ impl Socket {
         self.closed.set(true);
         // Also terminates queued receives/sends and accepts submitted *after*
         // this call. Cancellation alone is insufficient when its reserve is full.
-        let _ = rustix::net::shutdown(&*self.file, rustix::net::Shutdown::Both);
+        let _ = shep_sys::shutdown(&*self.file, std::net::Shutdown::Both);
     }
     pub(super) async fn run(
         &self,

@@ -11,23 +11,12 @@ impl TcpStream {
     /// io_uring readiness wait, so dropping even an unsubmitted wait can abort
     /// the connection without depending on cancellation admission.
     pub async fn connect(io: &Io, address: SocketAddr, config: Config) -> io::Result<Self> {
-        use rustix::net::{AddressFamily, SocketFlags, SocketType};
         let config = config.validate()?;
-        let domain = if address.is_ipv4() {
-            AddressFamily::INET
-        } else {
-            AddressFamily::INET6
-        };
-        let fd = rustix::net::socket_with(
-            domain,
-            SocketType::STREAM,
-            SocketFlags::CLOEXEC | SocketFlags::NONBLOCK,
-            None,
-        )?;
+        let fd = shep_sys::tcp_socket(&address)?;
         let socket = Socket::new(io, Fd::new(fd)?, config);
-        match rustix::net::connect(&*socket.file, &address) {
+        match shep_sys::connect(&*socket.file, &address) {
             Ok(()) => {}
-            Err(rustix::io::Errno::INPROGRESS) => {
+            Err(error) if error.raw_os_error() == Some(libc::EINPROGRESS) => {
                 socket
                     .run(Operation::PollAdd {
                         file: socket.file.clone(),
@@ -36,11 +25,11 @@ impl TcpStream {
                     .await
                     .map_err(|r| r.error)?
                     .result?;
-                rustix::net::sockopt::socket_error(&*socket.file)??;
+                shep_sys::socket_error(&*socket.file)?;
             }
-            Err(error) => return Err(error.into()),
+            Err(error) => return Err(error),
         }
-        rustix::fs::fcntl_setfl(&*socket.file, rustix::fs::OFlags::empty())?;
+        shep_sys::set_file_flags(&*socket.file, 0)?;
         Ok(Self { socket })
     }
     /// Takes ownership; callers must not retain aliases that perform socket I/O

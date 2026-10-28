@@ -9,7 +9,7 @@ publish.workspace = true
 workspace = true
 [dependencies]
 shep-smp-io2.workspace = true
-rustix = { workspace = true, features = ["net", "fs"] }
+shep-sys.workspace = true
 libc.workspace = true
 [dev-dependencies]
 shep-smp2.workspace = true

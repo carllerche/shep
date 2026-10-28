@@ -55,7 +55,7 @@ impl Parking {
             self.driver
                 .push(Operation::PollAdd {
                     file: self.event_fd.as_ref().unwrap().clone(),
-                    events: rustix::event::PollFlags::IN.bits() as u32,
+                    events: libc::POLLIN as u32,
                 })
                 .map_err(|rejected| rejected.error)?,
         );
@@ -175,13 +175,7 @@ impl Drop for Park<'_> {
 mod tests;
 
 fn transient(error: &io::Error) -> bool {
-    error.raw_os_error().is_some_and(|code| {
-        [
-            rustix::io::Errno::INTR,
-            rustix::io::Errno::AGAIN,
-            rustix::io::Errno::BUSY,
-        ]
-        .iter()
-        .any(|errno| errno.raw_os_error() == code)
-    })
+    error
+        .raw_os_error()
+        .is_some_and(|code| [libc::EINTR, libc::EAGAIN, libc::EBUSY].contains(&code))
 }

@@ -16,10 +16,7 @@ pub(super) struct Event {
 }
 impl Event {
     pub(super) fn new() -> io::Result<Arc<Self>> {
-        let fd = rustix::event::eventfd(
-            0,
-            rustix::event::EventfdFlags::CLOEXEC | rustix::event::EventfdFlags::NONBLOCK,
-        )?;
+        let fd = shep_sys::eventfd(0, true)?;
         Ok(Arc::new(Self {
             file: Arc::new(std::fs::File::from(fd)),
             state: ParkState::new(),

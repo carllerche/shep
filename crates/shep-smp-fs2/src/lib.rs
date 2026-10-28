@@ -185,8 +185,8 @@ impl Fs {
         let (file, alignment) = self
             .domain
             .metadata(move || {
-                let flags = rustix::fs::fcntl_getfl(&file)?;
-                let alignment = if flags.contains(rustix::fs::OFlags::DIRECT) {
+                let flags = shep_sys::file_flags(&file)?;
+                let alignment = if flags & libc::O_DIRECT != 0 {
                     direct_alignment(&file)?
                 } else {
                     1
@@ -235,14 +235,12 @@ impl Fs {
         let path = path.into();
         self.domain
             .metadata(move || {
-                let fd = rustix::fs::open(
-                    path,
-                    rustix::fs::OFlags::RDONLY
-                        | rustix::fs::OFlags::DIRECTORY
-                        | rustix::fs::OFlags::CLOEXEC,
-                    rustix::fs::Mode::empty(),
-                )?;
-                rustix::fs::fsync(fd).map_err(Into::into)
+                use std::os::unix::fs::OpenOptionsExt;
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_DIRECTORY)
+                    .open(path)?
+                    .sync_all()
             })?
             .await
     }
@@ -506,11 +504,10 @@ impl Drop for Pending<'_> {
 }
 
 fn direct_alignment(file: &std::fs::File) -> io::Result<usize> {
-    use rustix::fs::{AtFlags, StatxFlags, statx};
-    match statx(file, "", AtFlags::EMPTY_PATH, StatxFlags::DIOALIGN) {
-        Ok(stat) if stat.stx_mask & StatxFlags::DIOALIGN.bits() != 0 => {
-            let memory = stat.stx_dio_mem_align as usize;
-            let offset = stat.stx_dio_offset_align as usize;
+    match shep_sys::direct_io_alignment(file) {
+        Ok(Some((memory, offset))) => {
+            let memory = memory as usize;
+            let offset = offset as usize;
             if !memory.is_power_of_two() || !offset.is_power_of_two() {
                 return Err(io::Error::new(
                     io::ErrorKind::Unsupported,
@@ -521,11 +518,16 @@ fn direct_alignment(file: &std::fs::File) -> io::Result<usize> {
         }
         // Match the existing file layer's conservative fallback when the
         // filesystem/kernel cannot report DIOALIGN. Kernel errors remain visible.
-        Ok(_)
-        | Err(rustix::io::Errno::NOSYS | rustix::io::Errno::INVAL | rustix::io::Errno::OPNOTSUPP) => {
+        Ok(None) => Ok(4096),
+        Err(error)
+            if matches!(
+                error.raw_os_error(),
+                Some(libc::ENOSYS | libc::EINVAL | libc::EOPNOTSUPP)
+            ) =>
+        {
             Ok(4096)
         }
-        Err(error) => Err(error.into()),
+        Err(error) => Err(error),
     }
 }
 

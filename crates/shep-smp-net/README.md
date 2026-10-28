@@ -54,7 +54,7 @@ Dropping a stream also shuts down its socket; callers importing standard sockets
 must not retain aliases that perform I/O or change socket flags.
 
 Connect takes a numeric `SocketAddr`, starts a nonblocking connection through
-safe rustix calls, waits using io_uring `PollAdd`, and checks `SO_ERROR`. It then
+safe `shep-sys` calls, waits using io_uring `PollAdd`, and checks `SO_ERROR`. It then
 clears nonblocking mode for owned io_uring sends/receives. This avoids a queued
 CONNECT starting after cancellation already shut down the socket. Bind/listen
 setup is synchronous. DNS, provided buffers, multishot receive, zero-copy sends,

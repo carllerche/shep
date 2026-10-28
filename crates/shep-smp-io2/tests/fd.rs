@@ -97,7 +97,11 @@ fn assert_closed(fd: i32) {
 fn a_standard_socket_wrapper_does_not_bypass_ring_validation() {
     let ring = io_uring::IoUring::new(1).unwrap();
     // This conversion is safe in std, but does not check the descriptor's type.
-    let socket = std::net::TcpStream::from(rustix::io::dup(&ring).unwrap());
+    let socket = std::net::TcpStream::from(
+        std::os::fd::AsFd::as_fd(&ring)
+            .try_clone_to_owned()
+            .unwrap(),
+    );
     let raw = socket.as_raw_fd();
     let error = Fd::try_from(socket).unwrap_err();
     assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
@@ -108,9 +112,9 @@ fn a_standard_socket_wrapper_does_not_bypass_ring_validation() {
 fn anonymous_non_ring_descriptors_can_be_imported_and_closed() {
     for epoll in [false, true] {
         let owned = if epoll {
-            rustix::event::epoll::create(rustix::event::epoll::CreateFlags::CLOEXEC).unwrap()
+            shep_sys::epoll().unwrap()
         } else {
-            rustix::event::eventfd(0, rustix::event::EventfdFlags::CLOEXEC).unwrap()
+            shep_sys::eventfd(0, false).unwrap()
         };
         let fd = Fd::try_from(owned).unwrap();
         let raw = fd.as_raw_fd();

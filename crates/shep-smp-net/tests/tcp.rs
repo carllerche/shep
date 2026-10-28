@@ -210,7 +210,7 @@ fn peer_eof_and_reset_are_reported() {
         })
         .unwrap();
     let (client, peer) = pair();
-    rustix::net::sockopt::set_socket_linger(&peer, Some(Duration::ZERO)).unwrap();
+    shep_sys::set_socket_linger(&peer, Some(Duration::ZERO)).unwrap();
     drop(peer);
     let mut client = TcpStream::from_std(&runtime.io(), client, Config::default()).unwrap();
     runtime
@@ -256,7 +256,7 @@ fn connect_refusal_and_unpolled_futures() {
 #[test]
 fn short_writes_and_write_all_preserve_byte_order_under_backpressure() {
     let (client, mut peer) = pair();
-    rustix::net::sockopt::set_socket_send_buffer_size(&client, 4096).unwrap();
+    shep_sys::set_socket_send_buffer_size(&client, 4096).unwrap();
     let length = 1024 * 1024;
     let bytes: Vec<u8> = (0..length).map(|i| (i % 251) as u8).collect();
     let expected = bytes.clone();
@@ -300,7 +300,7 @@ fn dropping_blocked_sends_retires_without_cancellation_capacity() {
     let mut peers = Vec::new();
     for _ in 0..2 {
         let (mut client, peer) = pair();
-        rustix::net::sockopt::set_socket_send_buffer_size(&client, 4096).unwrap();
+        shep_sys::set_socket_send_buffer_size(&client, 4096).unwrap();
         client.set_nonblocking(true).unwrap();
         loop {
             match client.write(&[1; 65536]) {

@@ -3,7 +3,7 @@
 The crate root denies unsafe code. `src/driver.rs` and `src/fd.rs` allow it; `buffer`,
 `io`, `operation`, `arena`, and `lifecycle` each forbid it. The file adapter in
 shep-smp-fs2 and runtime/eventfd protocol in shep-smp2 also forbid unsafe code.
-Dependencies (including io-uring and rustix) retain their own unsafe internals.
+Dependencies (including io-uring and shep-sys) retain their own unsafe internals.
 
 Callers supply owned operations, never raw SQEs, pointers, borrowed buffers,
 raw descriptors, or unsafe buffer traits. The driver and Io are local, backed
@@ -195,7 +195,7 @@ Fatal enter failures are not currently fault-injected in native tests.
 
 The runtime's RUNNING/PARKING/NOTIFIED/CLOSED atomic handshake, owner-thread
 notification suppression, and scoped executor TLS live above this boundary.
-Safe rustix eventfd creation needs no unsafe block here. Weak wake handles retain a standard File during racing writes. The reactor
+Safe shep-sys eventfd creation needs no unsafe block here. Weak wake handles retain a standard File during racing writes. The reactor
 creates a distinct local Fd duplicate for its poll watch, which retains that
 descriptor through its CQE; cancellation pins that watch's slab identity.
 
