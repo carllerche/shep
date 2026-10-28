@@ -4,17 +4,11 @@ use crate::fs::{
     pending::finish,
 };
 use crate::io::{Completion, Fd, Io, Operation, OperationHandle, Rejected, Value};
-use std::{
-    io,
-    path::{Path, PathBuf},
-    rc::Rc,
-    sync::Arc,
-};
+use std::{io, rc::Rc, sync::Arc};
 
 struct FileInner {
     descriptor: Rc<Fd>,
     activity: Arc<Activity>,
-    path: PathBuf,
     alignment: usize,
 }
 /// File clones share descriptor ownership and one close gate.
@@ -24,13 +18,12 @@ pub struct File {
     inner: Rc<FileInner>,
 }
 impl File {
-    pub(super) fn new(io: Io, file: Rc<Fd>, path: PathBuf, alignment: usize) -> Self {
+    pub(super) fn new(io: Io, file: Rc<Fd>, alignment: usize) -> Self {
         Self {
             io,
             inner: Rc::new(FileInner {
                 descriptor: file,
                 activity: Arc::default(),
-                path,
                 alignment,
             }),
         }
@@ -42,16 +35,7 @@ impl File {
     /// Io::import_file instead. Validates io2 descriptor eligibility synchronously.
     /// Aliases must not change descriptor flags.
     pub fn from_std(io: Io, file: std::fs::File) -> io::Result<Self> {
-        Ok(Self::new(
-            io,
-            std::rc::Rc::new(Fd::new(file)?),
-            PathBuf::new(),
-            1,
-        ))
-    }
-    /// Original open path; empty for imported descriptors, unchanged by rename.
-    pub fn path(&self) -> &Path {
-        &self.inner.path
+        Ok(Self::new(io, std::rc::Rc::new(Fd::new(file)?), 1))
     }
     pub fn alignment(&self) -> usize {
         self.inner.alignment

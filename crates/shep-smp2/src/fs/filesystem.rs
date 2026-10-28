@@ -37,7 +37,7 @@ impl Io {
         } else {
             1
         };
-        Ok(File::new(self.clone(), file, path, alignment))
+        Ok(File::new(self.clone(), file, alignment))
     }
     /// Import a descriptor after querying its flags and, for O_DIRECT, alignment.
     /// Do not retain aliases that change flags or perform conflicting I/O.
@@ -55,12 +55,7 @@ impl Io {
                 Ok((file, alignment))
             })?
             .await?;
-        Ok(File::new(
-            self.clone(),
-            Rc::new(Fd::new(file)?),
-            PathBuf::new(),
-            alignment,
-        ))
+        Ok(File::new(self.clone(), Rc::new(Fd::new(file)?), alignment))
     }
     pub async fn create_dir_all(&self, path: impl Into<PathBuf>) -> io::Result<()> {
         let path = path.into();

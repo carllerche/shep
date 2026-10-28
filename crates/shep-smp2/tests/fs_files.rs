@@ -201,7 +201,6 @@ fn storage_file_contract_allocation_trimming_and_publication() {
             )
             .await
             .unwrap();
-        assert_eq!(file.path(), tmp);
         append_and_trim(file.clone()).await;
         fs.rename(&tmp, nested.join("manifest")).await.unwrap();
         fs.sync_dir(&nested).await.unwrap();
