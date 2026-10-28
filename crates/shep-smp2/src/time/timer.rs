@@ -97,6 +97,10 @@ pub(crate) struct InnerState {
 }
 
 impl Timer {
+    pub(crate) fn handle(&self) -> Handle {
+        self.handle.clone()
+    }
+
     /// Create an empty wheel with `now` as its epoch, reserving 1,024 entry
     /// slots. The reactor supplies the same monotonic clock for subsequent
     /// calls to [`advance`](Self::advance).
@@ -201,7 +205,7 @@ impl Handle {
     ///
     /// Panics outside a runtime context.
     pub(crate) fn current() -> Self {
-        crate::rt::context::with_current(|rt| rt.shared().timer.handle.clone())
+        crate::rt::context::with_current(|rt| rt.shared().driver.timer.clone())
             .expect("timers must be created from within a shep_smp2 runtime")
     }
 }

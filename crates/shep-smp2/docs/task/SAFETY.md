@@ -10,11 +10,22 @@ Stale IDs must be ignored by the executor.
 ## Allocation and type erasure
 
 `RawTask::new` leaks a boxed `Cell<F>` into a non-null header pointer. `Cell`
-is repr(C), with Header first. Its vtable is selected from exactly F. The two
+is repr(C), with Header first. Its vtable is selected from exactly F. The initial
 local owners are Task and JoinHandle; copying RawTask does not acquire another
-reference. The packed reference count starts at two. Every owner releases it
+reference. The packed reference count starts at two. A runtime `Notified` token
+acquires an additional reference while the owning Task is live. Every owner releases it
 once, and only the final release calls the matching F vtable's deallocator.
 Wakers own the separate notification allocation and never keep the cell alive.
+
+`LocalOwnedTasks` retains cancellation ownership independently of runnable
+references. Its ID index supports foreign wakes; polling does not remove a task
+from the collection. `Notified` stays on the owner thread, polls only an idle,
+notified task, and releases its reference without cancelling. The scheduler
+rejects recursive execution, never holds collection/context borrows across
+polling, and releases ownership after completion. Shutdown closes admission,
+cancels owned tasks, and then drains runnable references. Cancellation drops a
+pending future even if a queue reference keeps its allocation alive. The final
+reference (including a queue reference) may deallocate the cell.
 
 The raw-pointer dereference in Harness is shared by its header/core/trailer
 accessors. No mutable reference to the entire cell is created. The original

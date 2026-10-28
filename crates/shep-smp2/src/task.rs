@@ -1,8 +1,9 @@
 //! Local tasks for Shep's per-core runtime, adapted from Monoio's task module.
 //!
 //! [`new_task`] allocates a pinned future and its [`JoinHandle`]. The executor
-//! owns the returned [`Task`] until completion or shutdown, queues its [`TaskId`]
-//! for the initial poll, and calls [`Task::run`] for subsequent notifications.
+//! owns the returned [`Task`] until completion or shutdown. Standalone executors
+//! can queue its [`TaskId`] and call [`Task::run`]; the runtime retains local
+//! runnable references separately from task ownership.
 //! Dropping a task cancels it; dropping its join handle detaches it.
 //!
 //! Futures, outputs, tasks, and join handles stay on their creating thread.
@@ -43,11 +44,13 @@
 mod core;
 mod harness;
 mod join;
+mod owned;
 mod raw;
 mod state;
 mod waker;
 
 pub use join::JoinHandle;
+pub(crate) use owned::LocalOwnedTasks;
 
 use std::fmt;
 use std::future::Future;
@@ -138,6 +141,15 @@ impl Task {
         self.is_finished()
     }
 
+    /// Retain a local runnable reference without transferring cancellation ownership.
+    pub(crate) fn notified(&self) -> Notified {
+        self.raw.header().shared.state.ref_inc();
+        Notified {
+            raw: self.raw,
+            _local: PhantomData,
+        }
+    }
+
     pub fn is_finished(&self) -> bool {
         self.raw.header().shared.state.load().is_complete()
     }
@@ -146,6 +158,35 @@ impl Task {
 impl Drop for Task {
     fn drop(&mut self) {
         self.raw.cancel();
+        if self.raw.header().shared.state.ref_dec() {
+            self.raw.dealloc();
+        }
+    }
+}
+
+/// A local queue reference. Dropping it releases storage, but does not cancel.
+/// Only the scheduler polls these references; foreign wakers still carry IDs.
+pub(crate) struct Notified {
+    raw: RawTask,
+    _local: PhantomData<Rc<()>>,
+}
+
+impl Notified {
+    pub(crate) fn id(&self) -> TaskId {
+        self.raw.header().shared.id
+    }
+
+    pub(crate) fn run(self) -> bool {
+        let state = self.raw.header().shared.state.load();
+        if state.is_idle() && state.is_notified() {
+            self.raw.poll();
+        }
+        self.raw.header().shared.state.load().is_complete()
+    }
+}
+
+impl Drop for Notified {
+    fn drop(&mut self) {
         if self.raw.header().shared.state.ref_dec() {
             self.raw.dealloc();
         }

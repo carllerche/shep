@@ -1,11 +1,18 @@
 //! The single-core runtime: one construct owning tasks, timers and the I/O
 //! driver, entered through one scoped thread-local context.
+//!
+//! Runtime owns the scheduler core (local run queue and remote receiver) and
+//! resource driver. Handle retains task cancellation ownership, submission
+//! state, and resource registration handles. Entering a runtime exposes those
+//! capabilities; executing a scheduler turn additionally lends its core to the
+//! thread-local context. No context or task-collection borrow spans user code.
 #![forbid(unsafe_code)]
 
 pub(crate) mod context;
 mod driver;
 mod event;
 mod handle;
+mod remote;
 mod scheduler;
 mod shared;
 mod state;
@@ -39,6 +46,7 @@ impl Default for Config {
 /// Run one instance on each owning OS thread when building an SMP layer.
 pub struct Runtime {
     handle: Handle,
+    scheduler: scheduler::Scheduler,
     driver: Driver,
     closed: bool,
 }
@@ -56,11 +64,19 @@ impl Runtime {
         timer: Option<Timer>,
         wake: impl FnOnce(Waker) -> Waker,
     ) -> io::Result<Self> {
-        let (driver, io) = Driver::new(config.max_in_flight)?;
-        let timer = timer.unwrap_or_else(|| Timer::new(Instant::now()));
-        let shared = Shared::new(wake(driver.wake_handle().waker()), timer, io);
+        let (mut driver, _) = Driver::new(config.max_in_flight)?;
+        if let Some(timer) = timer {
+            driver.timer = timer;
+        }
+        let (send, receive) = std::sync::mpsc::channel();
+        let remote = std::sync::Arc::new(remote::Remote::new(
+            send,
+            wake(driver.wake_handle().waker()),
+        ));
+        let shared = Shared::new(remote, driver.handle());
         Ok(Self {
             handle: Handle::new(shared),
+            scheduler: scheduler::Scheduler::new(receive),
             driver,
             closed: false,
         })
@@ -76,19 +92,21 @@ impl Runtime {
 
     #[doc(hidden)]
     pub fn timer(&self) -> &Timer {
-        &self.handle.shared().timer
+        &self.driver.timer
     }
 
     /// Run one task turn without driving I/O or timers.
+    ///
+    /// Panics if called from a task or while another runtime is entered.
     #[doc(hidden)]
     pub fn run_ready(&self) -> usize {
         let _enter = context::try_enter(&self.handle);
-        self.handle.shared().run_ready()
+        self.scheduler.run_ready(&self.handle)
     }
 
     #[doc(hidden)]
     pub fn has_ready(&self) -> bool {
-        self.handle.shared().has_ready()
+        self.scheduler.has_ready(self.handle.shared())
     }
 
     /// Whether every task has finished or been cancelled.
@@ -143,29 +161,29 @@ impl Runtime {
         let mut root = shared.spawn(future);
         loop {
             self.driver.poll()?;
-            shared.timer.advance(Instant::now());
-            shared.run_ready();
+            self.driver.timer.advance(Instant::now());
+            self.scheduler.run_ready(&self.handle);
             self.driver.poll()?;
-            shared.timer.advance(Instant::now());
+            self.driver.timer.advance(Instant::now());
             if root.is_finished() {
                 return match Pin::new(&mut root).poll(&mut Context::from_waker(Waker::noop())) {
                     Poll::Ready(result) => result.map_err(io::Error::other),
                     Poll::Pending => unreachable!("finished root has an output"),
                 };
             }
-            if shared.has_ready() || shared.io.has_pending() {
+            if self.scheduler.has_ready(shared) || shared.driver.io.has_pending() {
                 continue;
             }
+            self.driver.timer.advance(Instant::now());
+            let deadline = self.driver.timer.next_wake().map(Instant::into_std);
             let park = self.driver.prepare_park()?;
             // This check MUST follow publishing PARKING in prepare_park.
             // The notification RMW either synchronizes prior inbox publication,
             // or claims an eventfd write if it observes this parking attempt.
-            shared.timer.advance(Instant::now());
-            if shared.has_ready() || shared.io.has_pending() {
+            if self.scheduler.has_ready(shared) || shared.driver.io.has_pending() {
                 drop(park);
                 continue;
             }
-            let deadline = shared.timer.next_wake().map(Instant::into_std);
             park.wait(deadline)?;
         }
     }
@@ -181,15 +199,18 @@ impl Runtime {
             let _enter = context::try_enter(&self.handle);
             self.handle.shared().shutdown();
         }
+        self.scheduler.shutdown();
         self.driver.shutdown()
     }
 }
 impl Drop for Runtime {
     fn drop(&mut self) {
         // Unwinding out of another runtime's task cannot enter this one, and a
-        // second panic would abort. Retire the driver; tasks drop with the handle.
+        // second panic would abort. Cancel without installing another context.
         if std::thread::panicking() && context::entered_elsewhere(&self.handle) {
             self.closed = true;
+            self.handle.shared().shutdown();
+            self.scheduler.shutdown();
             let _ = self.driver.shutdown();
             return;
         }

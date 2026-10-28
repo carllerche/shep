@@ -44,7 +44,8 @@ impl<T: Future> Harness<T> {
         &self.cell().core
     }
 
-    /// Called only by the owner's unique Task handle. Shared wakers update
+    /// Called by Task or a local runnable reference, with exclusive execution
+    /// access. Shared wakers update
     /// notification bits but never touch the local stage or trailer.
     pub(super) fn poll(self) {
         self.header().shared.state.transition_to_running();
@@ -78,7 +79,7 @@ impl<T: Future> Harness<T> {
     }
 
     pub(super) fn dealloc(self) {
-        // SAFETY: The last of the two local owners releases the original Box.
+        // SAFETY: The last local reference releases the original Box.
         // Wakers own only Notification; no local cell access follows this call.
         unsafe { drop(Box::from_raw(self.cell.as_ptr())) }
     }
@@ -121,7 +122,7 @@ impl<T: Future> Harness<T> {
     }
 
     /// Complete a running task and release its joiner's waker. The owner's
-    /// Task handle keeps the cell alive even if a wake drops the join handle.
+    /// Task or Notified reference keeps the cell alive even if a wake drops the join handle.
     fn complete(&self) {
         let snapshot = self.header().shared.state.transition_to_complete();
         let waker = self.trailer().take_waker();

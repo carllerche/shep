@@ -434,3 +434,36 @@ fn an_idle_runtime_parks_until_a_remote_wake() {
 fn spawn_outside_a_runtime_is_rejected() {
     assert!(catch_unwind(AssertUnwindSafe(|| spawn(async {}))).is_err());
 }
+
+#[test]
+fn retained_handle_cannot_keep_execution_alive_after_runtime_drop() {
+    let rt = runtime();
+    let handle = rt.handle().clone();
+    let drops = Rc::new(Cell::new(0));
+    let probe = Probe::new(&drops);
+    let join = handle.spawn(async move {
+        let _probe = probe;
+        pending::<()>().await;
+    });
+    drop(rt);
+    assert_eq!(drops.get(), 1);
+    assert_eq!(block_on(join), Err(JoinError::Cancelled));
+    assert_eq!(
+        block_on(handle.spawn(async { 42 })),
+        Err(JoinError::Cancelled)
+    );
+}
+
+#[test]
+fn recursive_scheduler_execution_is_rejected_without_losing_the_core() {
+    let rt = Rc::new(runtime());
+    let nested = rt.clone();
+    let join = rt.spawn(async move { nested.run_ready() });
+    let sibling = rt.spawn(async { 42 });
+    assert_eq!(rt.run_ready(), 2);
+    assert_eq!(block_on(join), Err(JoinError::Panicked));
+    assert_eq!(block_on(sibling), Ok(42));
+    let next = rt.spawn(async { 7 });
+    assert_eq!(rt.run_ready(), 1);
+    assert_eq!(block_on(next), Ok(7));
+}

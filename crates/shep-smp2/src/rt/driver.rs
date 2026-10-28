@@ -7,6 +7,7 @@ use std::{io, sync::Arc, time::Instant};
 
 pub struct Driver {
     driver: IoDriver,
+    pub(super) timer: crate::time::Timer,
     progress: Progress,
     pub(super) event: Option<Arc<event::Event>>,
     watch: Option<OperationHandle>,
@@ -29,6 +30,7 @@ impl Driver {
         let event_fd = std::rc::Rc::new(crate::io::Fd::new(event.file().try_clone()?)?);
         let mut reactor = Self {
             driver,
+            timer: crate::time::Timer::new(crate::time::Instant::now()),
             progress: Progress::default(),
             event: Some(event),
             event_fd: Some(event_fd),
@@ -174,4 +176,19 @@ fn transient(error: &io::Error) -> bool {
     error
         .raw_os_error()
         .is_some_and(|code| [libc::EINTR, libc::EAGAIN, libc::EBUSY].contains(&code))
+}
+
+/// Registration capabilities exposed through a runtime handle.
+pub(crate) struct Handle {
+    pub(crate) io: Io,
+    pub(crate) timer: crate::time::Handle,
+}
+
+impl Driver {
+    pub(super) fn handle(&self) -> Handle {
+        Handle {
+            io: self.driver.io().clone(),
+            timer: self.timer.handle(),
+        }
+    }
 }

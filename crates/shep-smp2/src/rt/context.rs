@@ -9,12 +9,13 @@ use std::cell::{Cell, RefCell};
 use std::marker::PhantomData;
 use std::rc::Rc;
 
-use super::Handle;
+use super::{Handle, scheduler::Core};
 use crate::task::TaskId;
 
 struct Context {
     /// The runtime entered on this thread.
     current: RefCell<Option<Handle>>,
+    scheduler: RefCell<Option<Core>>,
     /// The task whose future is being polled or dropped.
     current_task_id: Cell<Option<TaskId>>,
 }
@@ -23,6 +24,7 @@ thread_local! {
     static CONTEXT: Context = const {
         Context {
             current: RefCell::new(None),
+            scheduler: RefCell::new(None),
             current_task_id: Cell::new(None),
         }
     };
@@ -102,4 +104,13 @@ pub(crate) fn current_task_id() -> Option<TaskId> {
     CONTEXT
         .try_with(|cx| cx.current_task_id.get())
         .unwrap_or_default()
+}
+
+/// Access is brief and must never span polling, destruction, or user callbacks.
+pub(super) fn with_scheduler<R>(f: impl FnOnce(&mut Core) -> R) -> Option<R> {
+    CONTEXT.with(|cx| cx.scheduler.borrow_mut().as_mut().map(f))
+}
+
+pub(super) fn set_scheduler(core: Option<Core>) -> Option<Core> {
+    CONTEXT.with(|cx| cx.scheduler.replace(core))
 }

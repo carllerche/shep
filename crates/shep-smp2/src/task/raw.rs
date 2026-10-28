@@ -15,7 +15,7 @@ use crate::task::{
 };
 use std::sync::Arc;
 
-/// Non-owning token used by exactly two local owners: Task and JoinHandle.
+/// Non-owning token used by local Task, JoinHandle, and Notified references.
 /// Copying this token does not acquire a reference. See docs/task/SAFETY.md for the
 /// allocation, matching-vtable and final-release invariants.
 pub(crate) struct RawTask {
@@ -78,13 +78,14 @@ impl RawTask {
     /// Safety: mutual exclusion is required to call this function.
     pub(crate) fn poll(self) {
         let vtable = self.header().vtable;
-        // SAFETY: Task::run has unique owner access and checked notification.
+        // SAFETY: Task::run or Notified::run checked notification and has exclusive
+        // execution access on the owner thread. No polling call can overlap.
         unsafe { (vtable.poll)(self.ptr) }
     }
 
     pub(crate) fn dealloc(self) {
         let vtable = self.header().vtable;
-        // SAFETY: Both release paths call this only at reference count zero.
+        // SAFETY: All local release paths call this only at reference count zero.
         unsafe {
             (vtable.dealloc)(self.ptr);
         }

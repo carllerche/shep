@@ -62,7 +62,8 @@ const REF_ONE: usize = 1 << REF_COUNT_SHIFT;
 ///  * A reference for the JoinHandle.
 ///
 /// Wakers own only the separate notification allocation and do not add task
-/// references. Dropping the executor's Task always releases a pending future.
+/// references. Local runnable references increment this count separately.
+/// Dropping the executor's Task always releases a pending future.
 ///
 /// As the task starts with a `JoinHandle`, `JOIN_INTEREST` is set.
 /// The executor queues the initial poll, so `NOTIFIED` is set.
@@ -228,6 +229,17 @@ impl State {
 
             Some(next)
         })
+    }
+
+    /// Acquire a local queue reference while an existing owner keeps the cell live.
+    pub(crate) fn ref_inc(&self) {
+        self.fetch_update_action(|curr| {
+            let next = curr
+                .0
+                .checked_add(REF_ONE)
+                .expect("task reference count overflow");
+            ((), Some(Snapshot(next)))
+        });
     }
 
     /// Returns `true` if the task should be released.
