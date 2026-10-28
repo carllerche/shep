@@ -7,15 +7,15 @@ Unsupported initialization and opcode errors are returned without a fallback.
 
 | Component | Responsibility |
 |---|---|
-| shep-smp-io2 | Safe owned operations, ring push/submit/reap, completion lifecycle and cancellation |
-| shep-smp-fs2 | Positional owned-buffer file adapter and operation-completion futures |
-| shep-smp-net | TCP listener/stream adapter, bounded transfers, serialized directions and socket shutdown |
-| shep-smp2 | Local executor/timer integration, batching policy and eventfd parking |
+| shep_smp2::io | Safe owned operations, ring push/submit/reap, completion lifecycle and cancellation |
+| shep_smp2::fs | Positional owned-buffer file adapter and operation-completion futures |
+| shep_smp2::net | TCP listener/stream adapter, bounded transfers, serialized directions and socket shutdown |
+| shep_smp2 runtime | Local executor/timer integration, batching policy and eventfd parking |
 
-The io2 crate root denies unsafe code; only its private driver module opts in.
+The io module denies unsafe code; only its private driver and fd modules opt in.
 Io, arena, lifecycle, operations and buffers each forbid unsafe code. Both higher layers
 forbid unsafe code too. The three unsafe blocks publish operation/cancellation SQEs and adopt owned
-file descriptors. See [the safety boundary](../crates/shep-smp-io2/SAFETY.md).
+file descriptors. See [the safety boundary](../crates/shep-smp2/docs/io/SAFETY.md).
 Production dependencies have no Tokio runtime. Existing task internals retain
 their separate unsafe implementation and upstream attribution.
 
@@ -105,7 +105,7 @@ protocol must first account for its outstanding operations.
 The driver owns no write backlog, resource-readiness waiter collection,
 durability frontier or background error policy. File writers can retain eager
 handles to track concurrent completion, contiguous progress and durability above
-it. The [shep-smp-net adapter](../crates/shep-smp-net/README.md) provides TCP
+it. The [net adapter](../crates/shep-smp2/docs/net/README.md) provides TCP
 serialization through exclusive read/write halves, bounded transfers, flush,
 half-close, and cleanup on dropped futures. It has no background write queue:
 every write awaits completion. Dropping an admitted socket future shuts down
@@ -170,16 +170,16 @@ sleep before rechecking pending work. It does not copy their unsafe driver
 cell or systemwide memory-barrier mechanisms.
 
 ```sh
-cargo nextest run -p shep-smp-io2 -p shep-smp-fs2 -p shep-smp-net -p shep-smp2
-cargo clippy -p shep-smp-io2 -p shep-smp-fs2 -p shep-smp-net -p shep-smp2 --all-targets -- -D warnings
-MIRIFLAGS='-Zmiri-disable-isolation -Zmiri-tree-borrows' cargo +nightly-2026-10-22 miri test -p shep-smp-io2 --lib
+cargo nextest run -p shep-smp2
+cargo clippy -p shep-smp2 --all-targets -- -D warnings
+MIRIFLAGS='-Zmiri-disable-isolation -Zmiri-tree-borrows' cargo +nightly-2026-10-22 miri test -p shep-smp2 --lib io::
 ```
 
 Pure lifecycle and buffer tests run under Miri; actual io_uring/eventfd tests
 require a native kernel. Compile-fail docs enforce local-only driver/runtime
 ownership. The [13-case runtime benchmarks](../crates/shep-smp2/benches/README.md)
 cover scheduling, timers, foreign handoff, file batches and parking.
-[Eight driver-only cases](../crates/shep-smp-io2/benches/README.md) isolate
+[Eight driver-only cases](../crates/shep-smp2/benches/io/README.md) isolate
 batching, owned-buffer reuse, ignored completions and identity pins. Historical
 archives retain their original source paths and hashes, including the former
 io2-core crate and former core module. They are measurement records.

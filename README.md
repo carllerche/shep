@@ -19,16 +19,10 @@ replicates.
 | `crates/shep-rpc-server` | Serving it: concurrent handlers, routing on the header and metadata before the body is read |
 | `crates/shep-rpc-client` | Calling it: pipelined calls over one connection, reconnect with backoff, a connection cache |
 | `crates/shep-smp` | Thread-per-core: a `LocalRuntime` per core, each with its own state, reached with `submit_to` |
-| `crates/shep-smp-task` | Local task ownership and execution, adapted from Monoio; the first component of the future SMP runtime |
-| `crates/shep-smp-exec` | Local FIFO executor with scoped `spawn`, bounded task turns, and driver wakeups |
-| `crates/shep-smp-time` | Reactor-owned hierarchical timing wheel, sleeps, timeouts, and intervals, adapted from Monoio |
 | `crates/shep-util-slab` | Safe reusable indexed storage, with the small API needed by runtime components |
 | `crates/shep-smp-io` | Core-local io_uring files, owned aligned buffers, and explicit I/O lifetime management |
 | `crates/shep-smp-io-scheduler` | Weighted admission with shared physical-device capacity and per-class metrics |
-| `crates/shep-smp-io2` | Safe owned-operation io_uring driver with explicit batching, completion lifecycle and cancellation; unsafe isolated in its private driver module |
-| `crates/shep-smp-fs2` | Positional owned-buffer file adapter over the native io_uring driver |
-| `crates/shep-smp-net` | Local TCP over the native driver: owned buffers, exclusive read/write halves, bounded transfers, and terminal cancellation |
-| `crates/shep-smp2` | Parallel single-core native runtime combining tasks, timers, and io_uring; see [design](docs/io2.md) |
+| `crates/shep-smp2` | Parallel single-core native runtime: `task` (Monoio-derived tasks and FIFO executor), `time` (hierarchical timing wheel), `io` (safe owned-operation io_uring driver), `fs` (positional owned-buffer files) and `net` (owned-buffer TCP); see [design](docs/io2.md) |
 | `crates/shep-append` | Format-independent buffered append files with explicit written and durable positions |
 | `crates/shep-storage` | Per-core storage, after Redpanda's: segmented logs with coalesced fsync and crash recovery, and a key-value store |
 | `crates/shep-raft-engine` | openraft 0.10.0-alpha.37, forked (see its `FORK.md`), with its test suite |

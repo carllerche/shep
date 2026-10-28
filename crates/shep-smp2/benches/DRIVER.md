@@ -49,7 +49,7 @@ with no statistically detected change (p=0.11). The small parking difference
 remains a measured cost of this generic-operation implementation. These results
 are retained rather than hidden behind a blanket speedup claim.
 
-Eight [driver-only cases](../../shep-smp-io2/benches/README.md) establish an initial
+Eight [driver-only cases](io/README.md) establish an initial
 baseline for explicit batching, buffer reuse, ignored completions and cancel
 identity references. They exclude task scheduling and per-iteration buffer
 allocation; they are not comparable with the old private driver API.

@@ -252,7 +252,7 @@ fn saturated_runtime_returns_owned_operation_without_an_admission_waiter() {
 
 #[test]
 fn filesystem_metadata_worker_wakes_native_runtime_and_shutdown_drains_files() {
-    use shep_smp_fs2::{Fs, OpenOptions};
+    use shep_smp2::fs::{Fs, OpenOptions};
     let mut runtime = Runtime::new(Default::default()).unwrap();
     let fs = Fs::new(runtime.io(), Default::default()).unwrap();
     let dir = tempfile::tempdir().unwrap();

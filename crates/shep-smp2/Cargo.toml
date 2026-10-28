@@ -1,6 +1,6 @@
 [package]
 name = "shep-smp2"
-description = "Native io_uring single-core runtime foundation for Shep SMP"
+description = "Native io_uring single-core runtime for Shep SMP: tasks, timers, I/O, files and TCP"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,17 +8,35 @@ publish.workspace = true
 [lints]
 workspace = true
 [dependencies]
-shep-smp-exec.workspace = true
-shep-smp-time.workspace = true
-shep-smp-io2.workspace = true
-shep-smp-fs2.workspace = true
-shep-sys.workspace = true
+io-uring.workspace = true
 libc.workspace = true
+pin-project-lite.workspace = true
+shep-sys.workspace = true
+shep-util-slab.workspace = true
+slab.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+io-uring = { workspace = true, features = ["io_safety"] }
+shep-futures.workspace = true
+tempfile.workspace = true
+tokio = { version = "1", default-features = false, features = ["sync", "rt"] }
+
 [[bench]]
 name = "runtime"
 harness = false
 
-[dev-dependencies]
-criterion.workspace = true
-tempfile.workspace = true
-tokio = { version = "1", default-features = false, features = ["sync", "rt"] }
+[[bench]]
+name = "driver"
+path = "benches/io/driver.rs"
+harness = false
+
+[[bench]]
+name = "tasks"
+path = "benches/task/tasks.rs"
+harness = false
+
+[[bench]]
+name = "timers"
+path = "benches/time/timers.rs"
+harness = false

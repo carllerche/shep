@@ -1358,25 +1358,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "shep-smp-exec"
-version = "0.1.0"
-dependencies = [
- "shep-futures",
- "shep-smp-task",
- "tokio",
-]
-
-[[package]]
-name = "shep-smp-fs2"
-version = "0.1.0"
-dependencies = [
- "libc",
- "shep-smp-io2",
- "shep-sys",
- "tempfile",
-]
-
-[[package]]
 name = "shep-smp-io"
 version = "0.1.0"
 dependencies = [
@@ -1397,58 +1378,17 @@ dependencies = [
 ]
 
 [[package]]
-name = "shep-smp-io2"
+name = "shep-smp2"
 version = "0.1.0"
 dependencies = [
  "criterion",
  "io-uring",
  "libc",
- "shep-sys",
- "slab",
- "tempfile",
-]
-
-[[package]]
-name = "shep-smp-net"
-version = "0.1.0"
-dependencies = [
- "libc",
- "shep-smp-io2",
- "shep-smp2",
- "shep-sys",
-]
-
-[[package]]
-name = "shep-smp-task"
-version = "0.1.0"
-dependencies = [
- "criterion",
- "shep-futures",
- "tokio",
-]
-
-[[package]]
-name = "shep-smp-time"
-version = "0.1.0"
-dependencies = [
- "criterion",
  "pin-project-lite",
  "shep-futures",
- "shep-smp-exec",
- "shep-util-slab",
-]
-
-[[package]]
-name = "shep-smp2"
-version = "0.1.0"
-dependencies = [
- "criterion",
- "libc",
- "shep-smp-exec",
- "shep-smp-fs2",
- "shep-smp-io2",
- "shep-smp-time",
  "shep-sys",
+ "shep-util-slab",
+ "slab",
  "tempfile",
  "tokio",
 ]
