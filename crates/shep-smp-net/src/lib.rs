@@ -11,7 +11,7 @@
 
 pub use shep_smp_io2::Buffer;
 use shep_smp_io2::{Completion, Fd, Io, Operation, OperationHandle, Value};
-use std::{cell::Cell, future::poll_fn, io, net::SocketAddr, os::fd::OwnedFd, sync::Arc};
+use std::{cell::Cell, future::poll_fn, io, net::SocketAddr, os::fd::OwnedFd, rc::Rc};
 
 /// Bound on each owned read/write and each temporary write_all chunk.
 #[derive(Clone, Copy, Debug)]
@@ -39,7 +39,7 @@ impl Config {
 
 struct Socket {
     io: Io,
-    file: Arc<Fd>,
+    file: Rc<Fd>,
     closed: Cell<bool>,
     write_closed: Cell<bool>,
     config: Config,
@@ -48,7 +48,7 @@ impl Socket {
     fn new(io: Io, file: Fd, config: Config) -> Self {
         Self {
             io,
-            file: Arc::new(file),
+            file: Rc::new(file),
             closed: Cell::new(false),
             write_closed: Cell::new(false),
             config,

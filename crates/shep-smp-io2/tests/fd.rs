@@ -3,6 +3,86 @@
 use shep_smp_io2::{Driver, Fd, Operation, Progress, Value};
 use std::{fs::File, os::fd::AsRawFd};
 
+fn poll<F: std::future::Future>(future: std::pin::Pin<&mut F>) -> std::task::Poll<F::Output> {
+    future.poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
+}
+
+#[test]
+fn explicit_async_close_waits_for_the_ring() {
+    let mut driver = Driver::new(1).unwrap();
+    let io = driver.io().clone();
+    let fd = Fd::new(File::open("/dev/null").unwrap()).unwrap();
+    let raw = fd.as_raw_fd();
+    let mut close = Box::pin(fd.close(&io));
+    assert!(poll(close.as_mut()).is_pending());
+    assert!(std::fs::read_link(format!("/proc/self/fd/{raw}")).is_ok());
+    assert_eq!(driver.in_flight(), 1);
+    loop {
+        driver.submit_and_wait(None).unwrap();
+        driver.reap_into(&mut Progress::default());
+        if let std::task::Poll::Ready(result) = poll(close.as_mut()) {
+            result.unwrap();
+            break;
+        }
+    }
+    assert_eq!(driver.in_flight(), 0);
+    assert_closed(raw);
+}
+
+#[test]
+fn dropping_an_unpolled_close_uses_synchronous_fallback() {
+    let driver = Driver::new(1).unwrap();
+    let fd = Fd::new(File::open("/dev/null").unwrap()).unwrap();
+    let raw = fd.as_raw_fd();
+    drop(fd.close(driver.io()));
+    assert_eq!(driver.in_flight(), 0);
+    assert_closed(raw);
+}
+
+#[test]
+fn dropping_a_published_close_leaves_cleanup_to_the_ring() {
+    let driver = Driver::new(1).unwrap();
+    let io = driver.io().clone();
+    let fd = Fd::new(File::open("/dev/null").unwrap()).unwrap();
+    let raw = fd.as_raw_fd();
+    let mut close = Box::pin(fd.close(&io));
+    assert!(poll(close.as_mut()).is_pending());
+    drop(close);
+    assert_eq!(io.in_flight(), 1);
+    assert!(std::fs::read_link(format!("/proc/self/fd/{raw}")).is_ok());
+    drop(driver);
+    assert_eq!(io.in_flight(), 0);
+    assert_closed(raw);
+}
+
+#[test]
+fn rejected_async_close_uses_synchronous_fallback() {
+    let mut driver = Driver::new(1).unwrap();
+    let io = driver.io().clone();
+    let mut nop = driver.push(Operation::Nop).unwrap();
+    let fd = Fd::new(File::open("/dev/null").unwrap()).unwrap();
+    let raw = fd.as_raw_fd();
+    let mut close = Box::pin(fd.close(&io));
+    let std::task::Poll::Ready(result) = poll(close.as_mut()) else {
+        panic!("full admission must reject immediately")
+    };
+    assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+    assert_closed(raw);
+    nop.release(&io);
+    driver.drain().unwrap();
+}
+
+#[test]
+fn last_rc_owner_closes_synchronously_without_a_driver() {
+    let fd = std::rc::Rc::new(Fd::new(File::open("/dev/null").unwrap()).unwrap());
+    let raw = fd.as_raw_fd();
+    let other = fd.clone();
+    drop(fd);
+    assert!(std::fs::read_link(format!("/proc/self/fd/{raw}")).is_ok());
+    drop(other);
+    assert_closed(raw);
+}
+
 fn assert_closed(fd: i32) {
     assert_eq!(
         std::fs::read_link(format!("/proc/self/fd/{fd}"))

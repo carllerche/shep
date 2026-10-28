@@ -20,7 +20,7 @@ submitter/completion states. These implementation modules are crate-private.
 
 `Io::push` stores an owned operation in the slab before publishing its SQE.
 Buffer backing allocations, CString paths and boxed socket addresses remain
-stable across operation moves and slab growth. Arc<Fd> retains input
+stable across operation moves and slab growth. Rc<Fd> retains input
 file descriptors. Buffer storage is initialized, so short reads and errors
 never expose uninitialized memory. Lengths fit the kernel's signed result size;
 positional offsets reject the current-position sentinel and signed overflow.
@@ -142,7 +142,16 @@ invariant. No mutable File/OwnedFd reference is exposed that could replace the
 descriptor. Duplicating an Fd preserves its classification without revalidation.
 Successful open/socket/accept CQEs return fresh non-ring descriptors, so the
 unsafe adoption boundary constructs Fd directly without a validation syscall.
-All descriptor-bearing operations take Fd (shared through Arc where needed).
+All descriptor-bearing operations take Fd (shared through Rc where needed).
+
+Fd is !Send and !Sync through a PhantomData<Rc<()>> marker. It has no driver
+reference or deferred cleanup queue. Its File field closes synchronously on drop,
+including abandoned outputs and final input references retired by the driver.
+This is a fallback; callers can explicitly await Fd::close(&io) to use io_uring.
+That future publishes an ordinary Close operation and releases its handle if
+canceled. Before publication, dropping the future or rejecting admission drops
+the still-owned Fd synchronously. After publication, only the kernel closes it;
+canceling the future abandons its result but does not cancel the CLOSE.
 
 Close accepts a unique Fd and transfers it with into_raw_fd after successful
 SQ publication, suppressing its destructor. The driver retains no raw fd to
@@ -186,9 +195,9 @@ Fatal enter failures are not currently fault-injected in native tests.
 
 The runtime's RUNNING/PARKING/NOTIFIED/CLOSED atomic handshake, owner-thread
 notification suppression, and scoped executor TLS live above this boundary.
-Safe rustix eventfd creation needs no unsafe block here. Weak wake handles retain
-the event descriptor during racing writes. The watch's Arc<File> independently
-retains it through its CQE; cancellation pins that watch's slab identity.
+Safe rustix eventfd creation needs no unsafe block here. Weak wake handles retain a standard File during racing writes. The reactor
+creates a distinct local Fd duplicate for its poll watch, which retains that
+descriptor through its CQE; cancellation pins that watch's slab identity.
 
 ## Verification limits
 

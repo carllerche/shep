@@ -12,6 +12,7 @@ pub struct Parking {
     progress: Progress,
     event: Option<Arc<event::Event>>,
     watch: Option<OperationHandle>,
+    event_fd: Option<std::rc::Rc<shep_smp_io2::Fd>>,
     closed: bool,
 }
 impl Parking {
@@ -26,10 +27,13 @@ impl Parking {
         // Rearm before callbacks/tasks so that slot cannot be taken by data I/O.
         let driver = Driver::new(capacity + 1)?;
         let io = driver.io().clone();
+        let event = event::Event::new()?;
+        let event_fd = std::rc::Rc::new(shep_smp_io2::Fd::new(event.file().try_clone()?)?);
         let mut reactor = Self {
             driver,
             progress: Progress::default(),
-            event: Some(event::Event::new()?),
+            event: Some(event),
+            event_fd: Some(event_fd),
             watch: None,
             closed: false,
         };
@@ -50,7 +54,7 @@ impl Parking {
         self.watch = Some(
             self.driver
                 .push(Operation::PollAdd {
-                    file: event.file(),
+                    file: self.event_fd.as_ref().unwrap().clone(),
                     events: rustix::event::PollFlags::IN.bits() as u32,
                 })
                 .map_err(|rejected| rejected.error)?,
@@ -138,6 +142,7 @@ impl Parking {
         }
         self.watch = None;
         self.event = None;
+        self.event_fd = None;
         Ok(())
     }
 }

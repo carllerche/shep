@@ -319,10 +319,10 @@ impl Arena {
 mod tests {
     use super::*;
     use crate::Buffer;
-    use std::{fs::File, sync::Arc};
+    use std::{fs::File, rc::Rc};
     fn operation() -> Operation {
         Operation::ReadAt {
-            file: Arc::new(crate::Fd::new(File::open("/dev/null").unwrap()).unwrap()),
+            file: Rc::new(crate::Fd::new(File::open("/dev/null").unwrap()).unwrap()),
             buffer: Buffer::new(8, 8).unwrap(),
             offset: 0,
         }
@@ -349,7 +349,7 @@ mod tests {
         let Operation::ReadAt { file, .. } = &operation else {
             unreachable!()
         };
-        let weak = Arc::downgrade(file);
+        let weak = Rc::downgrade(file);
         let token = arena.insert(operation).unwrap();
         assert!(arena.abandon(token).1.is_none());
         assert_eq!(arena.len(), 1);

@@ -117,12 +117,14 @@ fn wake_storm_can_race_with_reactor_destruction() {
 #[test]
 fn shutdown_retires_an_existing_cancel_before_canceling_its_watch() {
     use shep_smp_io2::{Buffer, Operation};
-    use std::{fs::File, os::fd::OwnedFd, sync::Arc};
+    use std::{fs::File, os::fd::OwnedFd};
     let (mut parking, io) = Parking::new(1).unwrap();
     let (socket, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
     let mut receive = io
         .push(Operation::Recv {
-            socket: Arc::new(shep_smp_io2::Fd::new(File::from(OwnedFd::from(socket))).unwrap()),
+            socket: std::rc::Rc::new(
+                shep_smp_io2::Fd::new(File::from(OwnedFd::from(socket))).unwrap(),
+            ),
             buffer: Buffer::new(8, 1).unwrap(),
         })
         .unwrap();

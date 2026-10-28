@@ -106,7 +106,7 @@ fn full_admission_rejects_immediately_with_original_buffer() {
     let address = buffer.as_ptr();
     let rejected = driver
         .push(Operation::WriteAt {
-            file: Arc::new(Fd::new(tempfile::tempfile().unwrap()).unwrap()),
+            file: std::rc::Rc::new(Fd::new(tempfile::tempfile().unwrap()).unwrap()),
             buffer,
             offset: 0,
         })
@@ -141,7 +141,7 @@ fn check_write_at_append(enable_after_push: bool) {
             .unwrap(),
     );
     let mut alias = file.try_clone().unwrap();
-    let file = Arc::new(Fd::new(Arc::try_unwrap(file).unwrap()).unwrap());
+    let file = std::rc::Rc::new(Fd::new(Arc::try_unwrap(file).unwrap()).unwrap());
     let buffer = Buffer::from_slice(b"X", 1).unwrap();
     let ptr = buffer.as_ptr();
     let mut handle = driver
@@ -176,7 +176,7 @@ fn check_write_at_append(enable_after_push: bool) {
 fn positional_owned_buffers_and_errors_preserve_allocation() {
     let mut driver = Driver::new(2).unwrap();
     let mut original = tempfile::tempfile().unwrap();
-    let file = Arc::new(Fd::new(original.try_clone().unwrap()).unwrap());
+    let file = std::rc::Rc::new(Fd::new(original.try_clone().unwrap()).unwrap());
     let buffer = Buffer::from_slice(b"positional", 4096).unwrap();
     let ptr = buffer.as_ptr();
     let mut write = driver
@@ -205,7 +205,7 @@ fn positional_owned_buffers_and_errors_preserve_allocation() {
     assert_eq!(bytes, b"positional");
     let mut bad = driver
         .push(Operation::WriteAt {
-            file: Arc::new(Fd::new(File::open("/dev/null").unwrap()).unwrap()),
+            file: std::rc::Rc::new(Fd::new(File::open("/dev/null").unwrap()).unwrap()),
             buffer: done.operation.into_buffer().unwrap(),
             offset: 0,
         })
@@ -220,7 +220,7 @@ fn positional_owned_buffers_and_errors_preserve_allocation() {
 fn cancellation_reserve_works_at_capacity_and_retains_target_identity() {
     let mut driver = Driver::new(1).unwrap();
     let (socket, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
-    let socket = Arc::new(Fd::new(File::from(OwnedFd::from(socket))).unwrap());
+    let socket = std::rc::Rc::new(Fd::new(File::from(OwnedFd::from(socket))).unwrap());
     let mut target = driver
         .push(Operation::Recv {
             socket: socket.clone(),
@@ -276,8 +276,8 @@ fn unsubmitted_cancellation_token_releases_pin_and_other_ring_rejects_it() {
 #[test]
 fn ignored_operations_keep_descriptors_until_cqe_and_results_survive_driver() {
     let mut driver = Driver::new(1).unwrap();
-    let file = Arc::new(Fd::new(tempfile::tempfile().unwrap()).unwrap());
-    let weak = Arc::downgrade(&file);
+    let file = std::rc::Rc::new(Fd::new(tempfile::tempfile().unwrap()).unwrap());
+    let weak = std::rc::Rc::downgrade(&file);
     driver
         .push(Operation::WriteAt {
             file,
@@ -303,7 +303,9 @@ fn open_allocate_truncate_sync_and_close() {
     let mut driver = Driver::new(1).unwrap();
     let mut open = driver
         .push(Operation::OpenAt {
-            directory: Some(Arc::new(Fd::new(File::open(dir.path()).unwrap()).unwrap())),
+            directory: Some(std::rc::Rc::new(
+                Fd::new(File::open(dir.path()).unwrap()).unwrap(),
+            )),
             path: CString::new("created").unwrap(),
             flags: libc::O_CREAT | libc::O_RDWR,
             mode: 0o600,
@@ -312,7 +314,7 @@ fn open_allocate_truncate_sync_and_close() {
     let Value::File(file) = finish(&mut driver, &mut open).result.unwrap() else {
         panic!("fd result")
     };
-    let file = Arc::new(file);
+    let file = std::rc::Rc::new(file);
     for operation in [
         Operation::Fallocate {
             file: file.clone(),
@@ -334,7 +336,7 @@ fn open_allocate_truncate_sync_and_close() {
     }
     assert_eq!(file.as_file().metadata().unwrap().len(), 17);
     let mut close = driver
-        .push(Operation::close(Arc::try_unwrap(file).unwrap()))
+        .push(Operation::close(std::rc::Rc::try_unwrap(file).unwrap()))
         .unwrap();
     let done = finish(&mut driver, &mut close);
     assert_close_result(done.result);
@@ -358,8 +360,8 @@ fn socket_connect_accept_send_recv_shutdown() {
     let Value::File(client) = finish(&mut driver, &mut create).result.unwrap() else {
         panic!("socket result")
     };
-    let client = Arc::new(client);
-    let listener = Arc::new(Fd::new(File::from(OwnedFd::from(listener))).unwrap());
+    let client = std::rc::Rc::new(client);
+    let listener = std::rc::Rc::new(Fd::new(File::from(OwnedFd::from(listener))).unwrap());
     let mut accept = driver.push(Operation::Accept { socket: listener }).unwrap();
     let mut connect = driver
         .push(Operation::Connect {
@@ -371,7 +373,7 @@ fn socket_connect_accept_send_recv_shutdown() {
     let Value::File(server) = finish(&mut driver, &mut accept).result.unwrap() else {
         panic!("accept result")
     };
-    let server = Arc::new(server);
+    let server = std::rc::Rc::new(server);
     let mut recv = driver
         .push(Operation::Recv {
             socket: server,
@@ -577,7 +579,7 @@ fn close_flush_error_never_closes_a_reused_descriptor() {
 #[test]
 fn retained_results_grow_slab_without_moving_kernel_buffers() {
     let mut driver = Driver::new(1).unwrap();
-    let file = Arc::new(Fd::new(tempfile::tempfile().unwrap()).unwrap());
+    let file = std::rc::Rc::new(Fd::new(tempfile::tempfile().unwrap()).unwrap());
     let mut handles = Vec::new();
     let mut progress = Progress::default();
     for offset in 0..64 {
@@ -611,7 +613,7 @@ fn zero_length_and_eof_preserve_initialized_buffers_and_file_position() {
     let mut original = tempfile::tempfile().unwrap();
     original.set_len(16).unwrap();
     original.seek(SeekFrom::Start(7)).unwrap();
-    let file = Arc::new(Fd::new(original.try_clone().unwrap()).unwrap());
+    let file = std::rc::Rc::new(Fd::new(original.try_clone().unwrap()).unwrap());
     for operation in [
         Operation::ReadAt {
             file: file.clone(),
@@ -643,7 +645,7 @@ fn invalid_capacity_and_position_are_rejected() {
     assert!(Driver::new(0).is_err());
     assert!(Driver::new(32768).is_err());
     let driver = Driver::new(1).unwrap();
-    let file = Arc::new(Fd::new(tempfile::tempfile().unwrap()).unwrap());
+    let file = std::rc::Rc::new(Fd::new(tempfile::tempfile().unwrap()).unwrap());
     let buffer = Buffer::from_slice(b"untouched", 8).unwrap();
     let pointer = buffer.as_ptr();
     let rejected = driver
@@ -757,8 +759,8 @@ fn handle_is_one_word_and_wrong_io_never_accesses_a_matching_slab_slot() {
 #[test]
 fn release_is_idempotent_and_keeps_kernel_resources_until_reaping() {
     let mut driver = Driver::new(1).unwrap();
-    let file = Arc::new(Fd::new(tempfile::tempfile().unwrap()).unwrap());
-    let weak = Arc::downgrade(&file);
+    let file = std::rc::Rc::new(Fd::new(tempfile::tempfile().unwrap()).unwrap());
+    let weak = std::rc::Rc::downgrade(&file);
     let mut handle = driver
         .push(Operation::WriteAt {
             file,
@@ -777,8 +779,8 @@ fn release_is_idempotent_and_keeps_kernel_resources_until_reaping() {
 fn handles_do_not_keep_the_driver_alive_and_new_drivers_reject_old_ids() {
     use std::panic::{AssertUnwindSafe, catch_unwind};
     let mut driver = Driver::new(1).unwrap();
-    let file = Arc::new(Fd::new(tempfile::tempfile().unwrap()).unwrap());
-    let weak = Arc::downgrade(&file);
+    let file = std::rc::Rc::new(Fd::new(tempfile::tempfile().unwrap()).unwrap());
+    let weak = std::rc::Rc::downgrade(&file);
     let mut handle = driver
         .push(Operation::ReadAt {
             file,
@@ -816,8 +818,8 @@ fn drop_cancels_queued_and_submitted_work_at_full_capacity() {
     let worker = std::thread::spawn(move || {
         for submitted in [false, true] {
             let (socket, peer) = UnixStream::pair().unwrap();
-            let socket = Arc::new(Fd::new(File::from(OwnedFd::from(socket))).unwrap());
-            let weak = Arc::downgrade(&socket);
+            let socket = std::rc::Rc::new(Fd::new(File::from(OwnedFd::from(socket))).unwrap());
+            let weak = std::rc::Rc::downgrade(&socket);
             let mut driver = Driver::new(3).unwrap();
             let io = driver.io().clone();
             let mut receive = driver
@@ -895,8 +897,8 @@ fn drop_cancels_queued_and_submitted_work_at_full_capacity() {
 fn drop_submits_queued_file_io_and_reaps_close_without_retaining_resources() {
     let driver = Driver::new(2).unwrap();
     let io = driver.io().clone();
-    let file = Arc::new(Fd::new(tempfile::tempfile().unwrap()).unwrap());
-    let weak = Arc::downgrade(&file);
+    let file = std::rc::Rc::new(Fd::new(tempfile::tempfile().unwrap()).unwrap());
+    let weak = std::rc::Rc::downgrade(&file);
     let mut write = driver
         .push(Operation::WriteAt {
             file,

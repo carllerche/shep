@@ -162,11 +162,11 @@ impl Fs {
         let Value::File(file) = completion.result? else {
             unreachable!("open result")
         };
-        let file = Arc::new(file);
+        let file = Rc::new(file);
         let alignment = if options.direct {
-            let query = file.clone();
+            let query = file.as_file().try_clone()?;
             self.domain
-                .metadata(move || direct_alignment(query.as_file()))?
+                .metadata(move || direct_alignment(&query))?
                 .await?
         } else {
             1
@@ -185,20 +185,19 @@ impl Fs {
         let (file, alignment) = self
             .domain
             .metadata(move || {
-                let file = Fd::new(file)?;
                 let flags = rustix::fs::fcntl_getfl(&file)?;
                 let alignment = if flags.contains(rustix::fs::OFlags::DIRECT) {
-                    direct_alignment(file.as_file())?
+                    direct_alignment(&file)?
                 } else {
                     1
                 };
-                Ok((Arc::new(file), alignment))
+                Ok((file, alignment))
             })?
             .await?;
         Ok(File::new(
             self.io.clone(),
             self.domain.clone(),
-            file,
+            Rc::new(Fd::new(file)?),
             PathBuf::new(),
             alignment,
         ))
@@ -281,7 +280,7 @@ pub trait FileIo: Clone + 'static {
 }
 
 struct FileInner {
-    descriptor: Arc<Fd>,
+    descriptor: Rc<Fd>,
     activity: Arc<Activity>,
     path: PathBuf,
     alignment: usize,
@@ -294,7 +293,7 @@ pub struct File {
     inner: Rc<FileInner>,
 }
 impl File {
-    fn new(io: Io, domain: Rc<Domain>, file: Arc<Fd>, path: PathBuf, alignment: usize) -> Self {
+    fn new(io: Io, domain: Rc<Domain>, file: Rc<Fd>, path: PathBuf, alignment: usize) -> Self {
         Self {
             io,
             domain,
@@ -316,7 +315,7 @@ impl File {
         Ok(Self::new(
             io,
             Domain::new(Config::default()),
-            Arc::new(Fd::new(file)?),
+            std::rc::Rc::new(Fd::new(file)?),
             PathBuf::new(),
             1,
         ))
@@ -406,7 +405,7 @@ impl File {
             ),
         }
     }
-    async fn execute(&self, make: impl FnOnce(Arc<Fd>) -> Operation) -> io::Result<()> {
+    async fn execute(&self, make: impl FnOnce(Rc<Fd>) -> Operation) -> io::Result<()> {
         let guard = self.begin()?;
         let handle = self
             .io
@@ -444,11 +443,11 @@ impl File {
     }
     pub async fn len(&self) -> io::Result<u64> {
         let guard = self.begin()?;
-        let file = self.inner.descriptor.clone();
+        let file = self.inner.descriptor.as_file().try_clone()?;
         self.domain
             .metadata(move || {
                 let _guard = guard;
-                Ok(file.as_file().metadata()?.len())
+                Ok(file.metadata()?.len())
             })?
             .await
     }

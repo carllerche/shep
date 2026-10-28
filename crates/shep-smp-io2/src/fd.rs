@@ -4,10 +4,26 @@
 use std::{
     fs::File,
     io,
+    marker::PhantomData,
     os::fd::{AsFd, AsRawFd, BorrowedFd, IntoRawFd, OwnedFd, RawFd},
+    rc::Rc,
 };
 
-/// An owned descriptor that can be consumed by io_uring CLOSE.
+/// A thread-local owned descriptor that can be consumed by io_uring CLOSE.
+///
+/// This type is neither Send nor Sync. Shared local ownership uses Rc<Fd>.
+/// ```compile_fail
+/// fn assert_send<T: Send>() {}
+/// assert_send::<shep_smp_io2::Fd>();
+/// ```
+/// ```compile_fail
+/// fn assert_sync<T: Sync>() {}
+/// assert_sync::<shep_smp_io2::Fd>();
+/// ```
+///
+/// Use [`Self::close`] to explicitly await an io_uring CLOSE. Otherwise dropping
+/// the last owner closes synchronously through std::fs::File, as a fallback.
+/// Drop does not require a live driver and ignores close errors.
 ///
 /// The descriptor must be live, uniquely owned, and must not refer to an
 /// io_uring instance. Duplicates with distinct descriptor numbers are allowed.
@@ -26,9 +42,38 @@ use std::{
 #[derive(Debug)]
 pub struct Fd {
     file: File,
+    _local: PhantomData<Rc<()>>,
 }
 
 impl Fd {
+    /// Consume the descriptor and await an io_uring CLOSE.
+    ///
+    /// The caller must keep driving the supplied Io's driver. This future is
+    /// lazy: dropping it before its first poll closes synchronously. Admission
+    /// failure likewise drops the still-owned descriptor and returns the error.
+    /// After publication, cancellation only abandons the result; the driver
+    /// completes the CLOSE, including during shutdown. Flush errors are returned
+    /// without retrying a descriptor number that may already have been reused.
+    pub async fn close(self, io: &crate::Io) -> io::Result<()> {
+        struct Pending<'a> {
+            io: &'a crate::Io,
+            handle: crate::OperationHandle,
+        }
+        impl Drop for Pending<'_> {
+            fn drop(&mut self) {
+                self.handle.release(self.io);
+            }
+        }
+        let handle = io
+            .push(crate::Operation::close(self))
+            .map_err(|rejected| rejected.error)?;
+        let mut pending = Pending { io, handle };
+        std::future::poll_fn(|cx| pending.handle.poll_complete(io, cx))
+            .await
+            .result
+            .map(|_| ())
+    }
+
     /// Import and validate an owned descriptor. On error the input is closed.
     ///
     /// Calls fstat once. For anonymous inodes only, also reads `/proc/self/fd`
@@ -64,7 +109,10 @@ impl Fd {
     /// also uphold OwnedFd's live, exclusive descriptor ownership requirements.
     /// Ordinary filesystem descriptors, sockets, eventfd and epoll are valid.
     pub unsafe fn from_owned_fd_unchecked(fd: OwnedFd) -> Self {
-        Self { file: fd.into() }
+        Self {
+            file: fd.into(),
+            _local: PhantomData,
+        }
     }
 
     /// Duplicate the descriptor, preserving the invariant without revalidation.
@@ -72,6 +120,7 @@ impl Fd {
     pub fn try_clone(&self) -> io::Result<Self> {
         Ok(Self {
             file: self.file.try_clone()?,
+            _local: PhantomData,
         })
     }
 

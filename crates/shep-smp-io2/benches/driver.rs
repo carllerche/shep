@@ -2,7 +2,7 @@
 #![forbid(unsafe_code)]
 use criterion::{BenchmarkId, Criterion, Throughput};
 use shep_smp_io2::{Buffer, Driver, Fd, Operation, Progress};
-use std::{hint::black_box, sync::Arc, time::Duration};
+use std::{hint::black_box, time::Duration};
 
 fn retire(driver: &mut Driver) {
     let mut progress = Progress::default();
@@ -46,7 +46,7 @@ fn main() {
     let mut group = criterion.benchmark_group("driver/write_4k_batch");
     for count in [1, 32, 256] {
         let mut driver = Driver::new(count).unwrap();
-        let file = Arc::new(Fd::new(tempfile::tempfile().unwrap()).unwrap());
+        let file = std::rc::Rc::new(Fd::new(tempfile::tempfile().unwrap()).unwrap());
         file.as_file().set_len((count * 4096) as u64).unwrap();
         let mut buffers: Vec<_> = (0..count)
             .map(|_| Buffer::new(4096, 4096).unwrap())

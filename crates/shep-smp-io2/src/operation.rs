@@ -6,7 +6,7 @@ use std::{
     ffi::CString,
     io,
     net::{Shutdown, SocketAddr},
-    sync::Arc,
+    rc::Rc,
     task::{Context, Poll},
 };
 
@@ -21,7 +21,7 @@ pub enum Operation {
     /// Read once at an explicit file offset; short reads and EOF are returned.
     ReadAt {
         /// Descriptor retained until the read CQE.
-        file: Arc<Fd>,
+        file: Rc<Fd>,
         /// Initialized destination; its visible length is the requested byte count.
         buffer: Buffer,
         /// Absolute byte offset; current-file-position sentinel and signed overflow are rejected.
@@ -35,7 +35,7 @@ pub enum Operation {
     /// an error through the completion; the driver never retries without the flag.
     WriteAt {
         /// Descriptor retained until the write CQE.
-        file: Arc<Fd>,
+        file: Rc<Fd>,
         /// Owned source bytes; retained even if the submitter releases its claim.
         buffer: Buffer,
         /// Absolute byte offset; never advances the descriptor's shared file cursor.
@@ -44,14 +44,14 @@ pub enum Operation {
     /// Request a durability barrier; callers must order prerequisite writes themselves.
     Fsync {
         /// Descriptor whose file data/metadata is synchronized.
-        file: Arc<Fd>,
+        file: Rc<Fd>,
         /// Use DATASYNC when true; otherwise request full file synchronization.
         data_only: bool,
     },
     /// Allocate or modify a file range using Linux fallocate semantics.
     Fallocate {
         /// Descriptor retained through completion.
-        file: Arc<Fd>,
+        file: Rc<Fd>,
         /// Start of the byte range, fitting a signed file offset.
         offset: u64,
         /// Range length; both length and offset + length must fit a signed offset.
@@ -62,14 +62,14 @@ pub enum Operation {
     /// Set file length without using or advancing a shared file cursor.
     Ftruncate {
         /// Descriptor whose length is changed.
-        file: Arc<Fd>,
+        file: Rc<Fd>,
         /// New byte length; values beyond a signed file offset are rejected.
         len: u64,
     },
     /// Open one path and return an owned descriptor; always requests CLOEXEC.
     OpenAt {
         /// Base for relative paths; None uses the process working directory.
-        directory: Option<Arc<Fd>>,
+        directory: Option<Rc<Fd>>,
         /// Owned NUL-terminated path, stable until the CQE.
         path: CString,
         /// Linux open flags; CLOEXEC is added by the driver.
@@ -93,40 +93,40 @@ pub enum Operation {
     /// Accept one connection and return an owned descriptor; no peer address is returned.
     Accept {
         /// Listening descriptor retained through completion.
-        socket: Arc<Fd>,
+        socket: Rc<Fd>,
     },
     /// Connect once using stable owned IPv4/IPv6 address storage.
     Connect {
         /// Descriptor being connected, retained through completion.
-        socket: Arc<Fd>,
+        socket: Rc<Fd>,
         /// Destination sockaddr allocation retained until the CQE.
         address: SocketAddress,
     },
     /// Send owned bytes once; short sends are returned and MSG_NOSIGNAL is added.
     Send {
         /// Connected descriptor retained through completion.
-        socket: Arc<Fd>,
+        socket: Rc<Fd>,
         /// Owned source bytes for an ordinary copying send, without zero-copy notifications.
         buffer: Buffer,
     },
     /// Receive once into an owned buffer; returns the actual byte count or EOF.
     Recv {
         /// Descriptor retained until the receive CQE, including while waiting for data.
-        socket: Arc<Fd>,
+        socket: Rc<Fd>,
         /// Initialized destination; this operation does not use a provided-buffer pool.
         buffer: Buffer,
     },
     /// Shut down selected socket directions without closing its descriptor.
     Shutdown {
         /// Descriptor retained through shutdown completion.
-        socket: Arc<Fd>,
+        socket: Rc<Fd>,
         /// Receive, send, or both directions to shut down.
         how: Shutdown,
     },
     /// Wait once for descriptor readiness; the CQE terminates this watch.
     PollAdd {
         /// Watched descriptor, retained until its watch CQE is reaped.
-        file: Arc<Fd>,
+        file: Rc<Fd>,
         /// Linux poll event bits to watch; multishot flags are not exposed.
         events: u32,
     },
