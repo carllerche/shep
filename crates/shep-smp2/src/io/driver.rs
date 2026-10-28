@@ -108,6 +108,7 @@ impl Progress {
 }
 /// Local ring and lifecycle storage retained by Io clones and active cancel pins.
 pub(crate) struct Shared {
+    pub(crate) metadata: Rc<crate::fs::metadata::Metadata>,
     /// Process-unique owner prefix used to reject handles from another Io.
     pub(crate) id: DriverId,
     /// Shared operation state; no borrow may span application waker callbacks.
@@ -216,6 +217,7 @@ impl Driver {
             shutdown_cancel_pending: false,
             io: Io {
                 shared: Rc::new(Shared {
+                    metadata: crate::fs::metadata::Metadata::new(),
                     id,
                     arena: RefCell::new(Arena::new(max_in_flight, id)),
                     ring: RefCell::new(Some(ring)),
@@ -371,13 +373,14 @@ impl Driver {
             Err(e) => Err(e),
         }
     }
-    /// Stop admission and drive accepted work to terminal CQEs. Pending watches
+    /// Stop admission, join accepted metadata work, and drive kernel work to terminal CQEs. Pending watches
     /// and receives must be explicitly canceled by their higher-level owner.
     /// Repeated reap turns pending records into Completed or removes Ignored
     /// records after their refs retire. Completed submitter claims remain for
     /// later consumption. Return enter errors; this can wait indefinitely for I/O.
     pub fn drain(&mut self) -> io::Result<()> {
         self.io.close();
+        self.io.shared.metadata.shutdown();
         let mut progress = Progress::default();
         while self.in_flight() != 0 {
             match self.submit() {
@@ -464,6 +467,8 @@ impl Drop for Driver {
     /// kernel inputs. Notifications run after retirement and ring destruction.
     fn drop(&mut self) {
         let mut guard = RetirementGuard { retired: false };
+        self.io.close();
+        self.io.shared.metadata.shutdown();
         let mut progress = Progress::default();
         if let Err(error) = self.cancel_and_drain(&mut progress) {
             eprintln!("io_uring teardown failed before request retirement: {error}");

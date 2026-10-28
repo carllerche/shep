@@ -232,9 +232,9 @@ fn saturated_runtime_returns_owned_operation_without_an_admission_waiter() {
 
 #[test]
 fn filesystem_metadata_worker_wakes_native_runtime_and_shutdown_drains_files() {
-    use shep_smp2::fs::{Fs, OpenOptions};
+    use shep_smp2::fs::OpenOptions;
     let mut runtime = Runtime::new(Default::default()).unwrap();
-    let fs = Fs::new(runtime.io(), Default::default()).unwrap();
+    let fs = runtime.io();
     let dir = tempfile::tempdir().unwrap();
     runtime
         .block_on(async move {
@@ -262,7 +262,6 @@ fn filesystem_metadata_worker_wakes_native_runtime_and_shutdown_drains_files() {
                 fs.sync_dir(&path).await.unwrap();
                 assert_eq!(fs.read_dir(&path).await.unwrap().len(), 1);
                 file.close().await.unwrap();
-                fs.shutdown().await;
             };
             shep_smp2::timeout(Duration::from_secs(5), work)
                 .await

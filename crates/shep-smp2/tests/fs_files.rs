@@ -161,7 +161,7 @@ fn run<F: Future>(driver: &mut Driver, future: F) -> F::Output {
 
 #[test]
 fn storage_file_contract_allocation_trimming_and_publication() {
-    use shep_smp2::fs::{FileIo, Fs, OpenOptions};
+    use shep_smp2::fs::{FileIo, OpenOptions};
     async fn append_and_trim<F: FileIo>(file: F) {
         assert!(file.is_empty().await.unwrap());
         file.allocate(0, 16384).await.unwrap();
@@ -186,7 +186,7 @@ fn storage_file_contract_allocation_trimming_and_publication() {
     }
     let dir = tempfile::tempdir().unwrap();
     let mut driver = Driver::new(8).unwrap();
-    let fs = Fs::new(driver.io().clone(), Default::default()).unwrap();
+    let fs = driver.io().clone();
     run(&mut driver, async {
         let nested = dir.path().join("data");
         fs.create_dir_all(&nested).await.unwrap();
@@ -213,20 +213,15 @@ fn storage_file_contract_allocation_trimming_and_publication() {
         assert_eq!(std::fs::read(nested.join("manifest")).unwrap(), b"record");
         fs.remove_file(nested.join("manifest")).await.unwrap();
         fs.sync_dir(&nested).await.unwrap();
-        fs.shutdown().await;
-        assert_eq!(
-            fs.read_dir(&nested).await.unwrap_err().kind(),
-            std::io::ErrorKind::BrokenPipe
-        );
     });
 }
 
 #[test]
-fn close_and_domain_drain_track_released_eager_handles_and_retained_results() {
-    use shep_smp2::fs::{Fs, OpenOptions};
+fn close_track_released_eager_handles_and_retained_results() {
+    use shep_smp2::fs::OpenOptions;
     let dir = tempfile::tempdir().unwrap();
     let mut driver = Driver::new(8).unwrap();
-    let fs = Fs::new(driver.io().clone(), Default::default()).unwrap();
+    let fs = driver.io().clone();
     let file = run(
         &mut driver,
         fs.open(
@@ -244,16 +239,13 @@ fn close_and_domain_drain_track_released_eager_handles_and_retained_results() {
     abandoned.release(file.io());
     let mut retained = file.submit_read_at(Buffer::new(0, 1).unwrap(), 0).unwrap();
     let mut close = Box::pin(file.clone().close());
-    let mut drain = Box::pin(fs.drain());
     assert!(poll(close.as_mut()).is_pending());
-    assert!(poll(drain.as_mut()).is_pending());
     let rejected = file
         .submit_write_at(Buffer::from_slice(b"rejected", 1).unwrap(), 4)
         .unwrap_err();
     assert_eq!(rejected.error.kind(), std::io::ErrorKind::BrokenPipe);
     assert_eq!(&*rejected.operation.into_buffer().unwrap(), b"rejected");
     run(&mut driver, close).unwrap();
-    assert!(poll(drain.as_mut()).is_ready());
     // Completion consumption is not required for close/drain.
     assert!(retained.try_complete(file.io()).unwrap().result.is_ok());
     assert_eq!(std::fs::read(dir.path().join("data")).unwrap(), b"data");
@@ -261,8 +253,7 @@ fn close_and_domain_drain_track_released_eager_handles_and_retained_results() {
         run(&mut driver, file.len()).unwrap_err().kind(),
         std::io::ErrorKind::BrokenPipe
     );
-    // A filesystem shutdown must not close a shared networking/other-domain driver.
-    run(&mut driver, fs.shutdown());
+    // Closing a file leaves the shared driver usable.
     let mut nop = driver.io().push(shep_smp2::io::Operation::Nop).unwrap();
     nop.release(driver.io());
 }
@@ -286,12 +277,12 @@ fn dropping_async_write_and_canceling_close_does_not_reopen_gate() {
 
 #[test]
 fn direct_io_discovers_alignment_validates_inputs_and_imports() {
-    use shep_smp2::fs::{Fs, OpenOptions};
+    use shep_smp2::fs::OpenOptions;
     use std::os::unix::fs::OpenOptionsExt;
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("direct");
     let mut driver = Driver::new(8).unwrap();
-    let fs = Fs::new(driver.io().clone(), Default::default()).unwrap();
+    let fs = driver.io().clone();
     run(&mut driver, async {
         let file = fs
             .open(
@@ -328,20 +319,22 @@ fn direct_io_discovers_alignment_validates_inputs_and_imports() {
             .custom_flags(libc::O_DIRECT)
             .open(&path)
             .unwrap();
-        assert_eq!(fs.from_std(imported).await.unwrap().alignment(), alignment);
+        assert_eq!(
+            fs.import_file(imported).await.unwrap().alignment(),
+            alignment
+        );
         file.close().await.unwrap();
-        fs.shutdown().await;
     });
 }
 
 #[test]
 fn invalid_open_exclusive_creation_and_saturation_have_no_unaccepted_effects() {
-    use shep_smp2::fs::{Fs, OpenOptions};
+    use shep_smp2::fs::OpenOptions;
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("data");
     std::fs::write(&path, b"keep").unwrap();
     let mut driver = Driver::new(1).unwrap();
-    let fs = Fs::new(driver.io().clone(), Default::default()).unwrap();
+    let fs = driver.io().clone();
     run(&mut driver, async {
         assert_eq!(
             fs.open(
@@ -390,5 +383,5 @@ fn invalid_open_exclusive_creation_and_saturation_have_no_unaccepted_effects() {
     assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
     assert!(!other.exists());
     handle.release(driver.io());
-    run(&mut driver, fs.shutdown());
+    driver.drain().unwrap();
 }

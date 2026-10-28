@@ -1,7 +1,6 @@
 use crate::fs::{
-    Buffer, Config, FileIo,
+    Buffer, FileIo,
     activity::{Activity, Guard},
-    domain::Domain,
     pending::finish,
 };
 use crate::io::{Completion, Fd, Io, Operation, OperationHandle, Rejected, Value};
@@ -22,20 +21,12 @@ struct FileInner {
 #[derive(Clone)]
 pub struct File {
     io: Io,
-    domain: Rc<Domain>,
     inner: Rc<FileInner>,
 }
 impl File {
-    pub(super) fn new(
-        io: Io,
-        domain: Rc<Domain>,
-        file: Rc<Fd>,
-        path: PathBuf,
-        alignment: usize,
-    ) -> Self {
+    pub(super) fn new(io: Io, file: Rc<Fd>, path: PathBuf, alignment: usize) -> Self {
         Self {
             io,
-            domain,
             inner: Rc::new(FileInner {
                 descriptor: file,
                 activity: Arc::default(),
@@ -48,12 +39,11 @@ impl File {
         &self.io
     }
     /// Import a buffered descriptor without starting a helper. For O_DIRECT use
-    /// Fs::from_std instead. Validates io2 descriptor eligibility synchronously.
+    /// Io::import_file instead. Validates io2 descriptor eligibility synchronously.
     /// Aliases must not change descriptor flags.
     pub fn from_std(io: Io, file: std::fs::File) -> io::Result<Self> {
         Ok(Self::new(
             io,
-            Domain::new(Config::default()),
             std::rc::Rc::new(Fd::new(file)?),
             PathBuf::new(),
             1,
@@ -66,8 +56,8 @@ impl File {
     pub fn alignment(&self) -> usize {
         self.inner.alignment
     }
-    fn begin(&self) -> io::Result<(Guard, Guard)> {
-        Ok((self.domain.activity.begin()?, self.inner.activity.begin()?))
+    fn begin(&self) -> io::Result<Guard> {
+        self.inner.activity.begin()
     }
     fn submit_buffer(
         &self,
@@ -107,7 +97,7 @@ impl File {
         self.io.push_with_guard(operation, guards)
     }
     /// Eager admission. Consume or release the returned handle using self.io().
-    /// File/domain activity survives handle release until the kernel completes.
+    /// File activity survives handle release until the kernel completes.
     pub fn submit_write_at(
         &self,
         buffer: Buffer,
@@ -183,7 +173,9 @@ impl File {
     pub async fn len(&self) -> io::Result<u64> {
         let guard = self.begin()?;
         let file = self.inner.descriptor.as_file().try_clone()?;
-        self.domain
+        self.io
+            .shared
+            .metadata
             .metadata(move || {
                 let _guard = guard;
                 Ok(file.metadata()?.len())

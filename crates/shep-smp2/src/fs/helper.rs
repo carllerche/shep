@@ -1,4 +1,4 @@
-//! One bounded metadata worker per filesystem domain. No runtime dependency.
+//! One bounded metadata worker per driver. No runtime dependency.
 use crate::fs::activity::wake_safely;
 use std::{
     future::Future,
@@ -97,5 +97,42 @@ impl<T> Drop for ResultFuture<T> {
     fn drop(&mut self) {
         let wake = self.0.lock().unwrap().wake.take();
         drop(wake);
+    }
+}
+
+#[cfg(all(test, not(miri)))]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+    fn poll<F: Future>(future: Pin<&mut F>) -> Poll<F::Output> {
+        future.poll(&mut Context::from_waker(Waker::noop()))
+    }
+    #[test]
+    fn worker_survives_job_panic() {
+        let helper = Helper::new(1).unwrap();
+        let mut failed = Box::pin(
+            helper
+                .run(|| -> io::Result<()> { panic!("helper work failed") })
+                .unwrap(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Poll::Ready(result) = poll(failed.as_mut()) {
+                assert!(result.is_err());
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // The worker remains usable after a job panic.
+        let mut next = Box::pin(helper.run(|| Ok(42)).unwrap());
+        loop {
+            if let Poll::Ready(result) = poll(next.as_mut()) {
+                assert_eq!(result.unwrap(), 42);
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
 }

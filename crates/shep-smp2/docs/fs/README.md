@@ -1,10 +1,10 @@
 # Native asynchronous filesystems
 
-`Fs` binds filesystem work to a `shep_smp2::io::Io`. Files, the filesystem handle,
+Filesystem operations are methods on `shep_smp2::io::Io`. Files, I/O handles,
 and their futures stay on the owning core. No Tokio runtime is required.
 
 ```rust,ignore
-let fs = shep_smp2::fs::Fs::new(runtime.io(), Default::default())?;
+let fs = runtime.io();
 runtime.block_on(async move {
     let file = fs.open("segment", shep_smp2::fs::OpenOptions {
         create_new: true,
@@ -17,7 +17,6 @@ runtime.block_on(async move {
     // Await writes before syncing their durability.
     file.sync_data().await?;
     file.close().await?;
-    fs.shutdown().await;
     Ok::<(), std::io::Error>(())
 })??;
 ```
@@ -39,15 +38,15 @@ future does not undo accepted filesystem work.
 Direct opens use O_DIRECT and query STATX_DIOALIGN on the metadata helper. Both
 reported constraints must be nonzero powers of two. When alignment reporting is
 unavailable, the conservative 4096-byte fallback matches the older file layer;
-actual I/O errors remain visible. There is no buffered fallback. `Fs::from_std`
+actual I/O errors remain visible. There is no buffered fallback. `Io::import_file`
 queries an imported descriptor's flags and alignment. The older synchronous
 `File::from_std` is for buffered descriptors only. Do not retain aliases that
 change descriptor flags or perform conflicting operations.
 
 Read/write, open, allocation, truncation, and file sync use io2 operations.
 Length/alignment queries, directory creation/listing, rename, unlink and directory
-sync use one lazily started worker per filesystem domain. Its bounded queue has
-`Config::metadata_queue` slots in addition to the executing job. Helper queue
+sync use one lazily started worker per driver. Its bounded queue has
+64 slots in addition to the executing job. Helper queue
 saturation and io2 saturation return WouldBlock; no hidden admission backlog or
 weighted scheduling is provided here. Opening may already have created or
 truncated a file before a later alignment-query error or cancellation.
@@ -65,18 +64,18 @@ and consumes that clone. Canceling an admitted close leaves the gate closed.
 Other clones and unconsumed completion results may retain the descriptor until
 dropped. Close does not imply fsync.
 
-`Fs::drain` waits for accepted kernel and helper work in that domain. Producers
-must be quiesced for a stable drain; appender buffers and future steps of storage
-transactions are not accounted for by fs2. `Fs::shutdown` closes domain admission,
-including its files, drains work and stops the helper. It does not close the
-shared io2 driver, which may also serve sockets or another filesystem domain.
-The runtime must keep driving the reactor while awaiting close/drain/shutdown.
-Manual drivers must deliver `Progress::wake`, which releases completion guards.
+`Io::close` stops admission for kernel and metadata work. `Driver::drain`
+finishes accepted kernel work and joins the metadata worker, including jobs whose
+waiters were dropped. Runtime shutdown uses this same teardown. Driver destruction
+also joins the worker as a fallback; joining can block until accepted jobs finish.
+The driver is shared with networking, so storage must finish its own transactions
+and close its files before runtime shutdown. There is no separate filesystem
+shutdown scope.
 
-Dropping the last domain owner joins its metadata worker as a fallback and can
-block. Prefer explicit shutdown. Dropping the driver retains its existing kernel
-retirement behavior. Scheduling weights, admission waiters, appender buffering,
-and transaction-level drain remain responsibilities of the layers above fs2.
+The runtime must keep driving the reactor while awaiting file close. Manual
+drivers must deliver `Progress::wake`, which releases completion guards.
+Scheduling weights, admission waiters, appender buffering, and transaction-level
+drain remain responsibilities of the layers above the filesystem adapter.
 
 Run `cargo nextest run -p shep-smp2` for
 file, completion-lifetime, native runtime and socket regression coverage.
