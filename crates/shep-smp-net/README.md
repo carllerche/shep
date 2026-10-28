@@ -9,7 +9,7 @@ use shep_smp2::Runtime;
 
 let mut runtime = Runtime::new(Default::default())?;
 let mut listener = TcpListener::bind(
-    runtime.io(), "127.0.0.1:7001".parse().unwrap(), Config::default(),
+    &runtime.io(), "127.0.0.1:7001".parse().unwrap(), Config::default(),
 )?;
 runtime.block_on(async move {
     let mut stream = listener.accept().await?;

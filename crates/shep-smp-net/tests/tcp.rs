@@ -44,8 +44,7 @@ fn drain(driver: &mut Driver) {
 fn native_connect_accept_and_full_duplex_half_close() {
     let mut runtime = runtime();
     let io = runtime.io();
-    let mut listener =
-        TcpListener::bind(io.clone(), address(), Config { max_buffer_size: 7 }).unwrap();
+    let mut listener = TcpListener::bind(&io, address(), Config { max_buffer_size: 7 }).unwrap();
     let address = listener.local_addr();
     runtime
         .block_on(async move {
@@ -66,7 +65,7 @@ fn native_connect_accept_and_full_duplex_half_close() {
                 }
                 assert_eq!(received, b"a message larger than the buffer limit");
             });
-            let mut client = TcpStream::connect(io, address, Config::default())
+            let mut client = TcpStream::connect(&io, address, Config::default())
                 .await
                 .unwrap();
             client
@@ -99,8 +98,7 @@ fn bounds_and_saturation_return_original_buffer_without_closing_socket() {
     let mut driver = Driver::new(1).unwrap();
     let io = driver.io().clone();
     let (client, _peer) = pair();
-    let mut stream =
-        TcpStream::from_std(io.clone(), client, Config { max_buffer_size: 4 }).unwrap();
+    let mut stream = TcpStream::from_std(&io, client, Config { max_buffer_size: 4 }).unwrap();
     let mut noop = io.push(Operation::Nop).unwrap();
     for (len, kind) in [
         (5, std::io::ErrorKind::InvalidInput),
@@ -134,8 +132,8 @@ fn dropping_multiple_queued_receives_retires_even_with_cancel_reserve_full() {
     let io = driver.io().clone();
     let (a, mut peer_a) = pair();
     let (b, mut peer_b) = pair();
-    let mut a = TcpStream::from_std(io.clone(), a, Config::default()).unwrap();
-    let mut b = TcpStream::from_std(io.clone(), b, Config::default()).unwrap();
+    let mut a = TcpStream::from_std(&io, a, Config::default()).unwrap();
+    let mut b = TcpStream::from_std(&io, b, Config::default()).unwrap();
     let mut first = Box::pin(a.read(Buffer::new(8, 1).unwrap()));
     let mut second = Box::pin(b.read(Buffer::new(8, 1).unwrap()));
     let mut cx = Context::from_waker(Waker::noop());
@@ -158,8 +156,8 @@ fn dropping_multiple_queued_receives_retires_even_with_cancel_reserve_full() {
 fn abandoned_accepts_retire_before_and_after_submission() {
     for submitted in [false, true] {
         let mut driver = Driver::new(2).unwrap();
-        let mut a = TcpListener::bind(driver.io().clone(), address(), Config::default()).unwrap();
-        let mut b = TcpListener::bind(driver.io().clone(), address(), Config::default()).unwrap();
+        let mut a = TcpListener::bind(driver.io(), address(), Config::default()).unwrap();
+        let mut b = TcpListener::bind(driver.io(), address(), Config::default()).unwrap();
         let mut first = Box::pin(a.accept());
         let mut second = Box::pin(b.accept());
         let mut cx = Context::from_waker(Waker::noop());
@@ -185,9 +183,9 @@ fn abandoned_accepts_retire_before_and_after_submission() {
 fn runtime_shutdown_aborts_live_accept_and_receive_tasks() {
     let mut runtime = runtime();
     let io = runtime.io();
-    let mut listener = TcpListener::bind(io.clone(), address(), Config::default()).unwrap();
+    let mut listener = TcpListener::bind(&io, address(), Config::default()).unwrap();
     let (stream, mut peer) = pair();
-    let mut stream = TcpStream::from_std(io.clone(), stream, Config::default()).unwrap();
+    let mut stream = TcpStream::from_std(&io, stream, Config::default()).unwrap();
     runtime.spawn(async move { listener.accept().await });
     runtime.spawn(async move { stream.read(Buffer::new(8, 1).unwrap()).await });
     runtime
@@ -203,7 +201,7 @@ fn peer_eof_and_reset_are_reported() {
     let mut runtime = runtime();
     let (client, peer) = pair();
     peer.shutdown(Shutdown::Write).unwrap();
-    let mut client = TcpStream::from_std(runtime.io(), client, Config::default()).unwrap();
+    let mut client = TcpStream::from_std(&runtime.io(), client, Config::default()).unwrap();
     runtime
         .block_on(async move {
             let (result, _) = client.read(Buffer::new(8, 1).unwrap()).await;
@@ -214,7 +212,7 @@ fn peer_eof_and_reset_are_reported() {
     let (client, peer) = pair();
     rustix::net::sockopt::set_socket_linger(&peer, Some(Duration::ZERO)).unwrap();
     drop(peer);
-    let mut client = TcpStream::from_std(runtime.io(), client, Config::default()).unwrap();
+    let mut client = TcpStream::from_std(&runtime.io(), client, Config::default()).unwrap();
     runtime
         .block_on(async move {
             let (result, _) = client.read(Buffer::new(8, 1).unwrap()).await;
@@ -235,7 +233,7 @@ fn connect_refusal_and_unpolled_futures() {
     let io = runtime.io();
     runtime
         .block_on(async move {
-            let error = TcpStream::connect(io, address, Config::default())
+            let error = TcpStream::connect(&io, address, Config::default())
                 .await
                 .err()
                 .unwrap();
@@ -243,7 +241,7 @@ fn connect_refusal_and_unpolled_futures() {
         })
         .unwrap();
     let (client, mut peer) = pair();
-    let mut client = TcpStream::from_std(runtime.io(), client, Config::default()).unwrap();
+    let mut client = TcpStream::from_std(&runtime.io(), client, Config::default()).unwrap();
     drop(client.read(Buffer::new(8, 1).unwrap()));
     drop(client.write(Buffer::from_slice(b"unsent", 1).unwrap()));
     peer.write_all(b"ok").unwrap();
@@ -271,7 +269,7 @@ fn short_writes_and_write_all_preserve_byte_order_under_backpressure() {
     });
     let mut runtime = runtime();
     let mut stream = TcpStream::from_std(
-        runtime.io(),
+        &runtime.io(),
         client,
         Config {
             max_buffer_size: length,
@@ -311,7 +309,7 @@ fn dropping_blocked_sends_retires_without_cancellation_capacity() {
                 Err(e) => panic!("{e}"),
             }
         }
-        streams.push(TcpStream::from_std(driver.io().clone(), client, Config::default()).unwrap());
+        streams.push(TcpStream::from_std(driver.io(), client, Config::default()).unwrap());
         peers.push(peer);
     }
     let (first, second) = streams.split_at_mut(1);
@@ -332,16 +330,8 @@ fn dropping_connect_waits_at_full_capacity_retires_all_work() {
     let listener = std::net::TcpListener::bind(address()).unwrap();
     let address = listener.local_addr().unwrap();
     let mut driver = Driver::new(2).unwrap();
-    let mut a = Box::pin(TcpStream::connect(
-        driver.io().clone(),
-        address,
-        Config::default(),
-    ));
-    let mut b = Box::pin(TcpStream::connect(
-        driver.io().clone(),
-        address,
-        Config::default(),
-    ));
+    let mut a = Box::pin(TcpStream::connect(driver.io(), address, Config::default()));
+    let mut b = Box::pin(TcpStream::connect(driver.io(), address, Config::default()));
     let mut cx = Context::from_waker(Waker::noop());
     assert!(a.as_mut().poll(&mut cx).is_pending());
     assert!(b.as_mut().poll(&mut cx).is_pending());
