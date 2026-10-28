@@ -1,4 +1,4 @@
-// Adapted from Monoio's task notification state; see docs/task/FORK.md.
+// Adapted from Monoio's task notification state, commit 8675e9406ea7943c441d969e38c3f5fc198ef6d1.
 // Copyright (c) 2021 ihciah, dyxushuai and other Monoio Contributors.
 // Portions Copyright (c) 2021 Tokio Contributors. Licensed under MIT.
 

@@ -90,7 +90,7 @@ includes growth if needed. They are not physical cold-page or p99 measurements.
 
 ## Retained memory
 
-Valgrind DHAT 3.22 snapshots use the safe `arena_memory` example against the
+Valgrind DHAT 3.22 snapshots used the safe `arena_memory` example (since removed) against the
 current code and the isolated b5b9a22 copy. The old copy substitutes its existing
 `Timer::new` and reports zero arena capacity; the profiling workloads otherwise
 match. The example intentionally forgets owners for the chosen phase so DHAT's

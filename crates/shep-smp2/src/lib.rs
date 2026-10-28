@@ -2,7 +2,8 @@
 //! This parallel implementation leaves shep-smp and its consumers unchanged.
 //! Thread-per-core orchestration is subsequent.
 //!
-//! - [`task`]: local tasks and the FIFO executor.
+//! - [`rt`]: the runtime owning tasks, timers and the I/O driver.
+//! - [`task`]: local tasks, [`spawn`] and task IDs.
 //! - [`time`]: the reactor-owned timing wheel, sleeps, timeouts and intervals.
 //! - [`io`]: the owned-operation io_uring driver.
 //! - [`fs`]: positional owned-buffer file operations over [`io`].
@@ -21,12 +22,12 @@
 pub mod fs;
 pub mod io;
 pub mod net;
-mod rt;
+pub mod rt;
 pub mod task;
 pub mod time;
 
 pub use fs::File;
 pub use io::{Buffer, Io};
-pub use rt::{Config, Park, Parking, Runtime, WakeHandle};
+pub use rt::{Config, Handle, Runtime};
 pub use task::{JoinError, JoinHandle, spawn};
 pub use time::{sleep, sleep_until, timeout};

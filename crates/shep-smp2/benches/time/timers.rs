@@ -11,8 +11,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Wake, Waker};
 
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput};
-use shep_smp2::task::Executor;
-use shep_smp2::time::{Duration, Instant, Sleep, Timer, sleep_until};
+use shep_smp2::time::{Duration, Instant, Sleep, sleep_until};
+
+#[path = "../../tests/support/timer.rs"]
+mod support;
+use support::ManualTimer;
 
 const COUNTS: [usize; 3] = [1, 1024, 32_768];
 
@@ -51,7 +54,7 @@ impl Wake for WakeCount {
 }
 
 struct Timers {
-    timer: Timer,
+    timer: ManualTimer,
     sleeps: Vec<Option<Pin<Box<Sleep>>>>,
     targets: Vec<Instant>,
     cancel_order: Vec<usize>,
@@ -62,7 +65,7 @@ struct Timers {
 impl Timers {
     fn new(count: usize, deadlines: Deadlines, waker: Waker) -> Self {
         let epoch = Instant::now();
-        let timer = Timer::new(epoch);
+        let timer = ManualTimer::new(epoch);
         let sleeps = timer.with(|| {
             (0..count)
                 .map(|index| {
@@ -140,9 +143,9 @@ fn lifecycle(c: &mut Criterion) {
     let mut group = c.benchmark_group("lifecycle");
     group.throughput(Throughput::Elements(1));
     group.bench_function("timer_create_drop", |b| {
-        b.iter(|| drop(black_box(Timer::new(black_box(epoch)))));
+        b.iter(|| drop(black_box(ManualTimer::new(black_box(epoch)))));
     });
-    let timer = Timer::new(epoch);
+    let timer = ManualTimer::new(epoch);
     timer.with(|| {
         group.bench_function("lazy_inline", |b| {
             b.iter(|| drop(black_box(sleep_until(black_box(deadline)))));
@@ -170,7 +173,7 @@ fn churn(c: &mut Criterion) {
     for count in COUNTS {
         group.throughput(Throughput::Elements(count as u64));
         let epoch = Instant::now();
-        let timer = Timer::new(epoch);
+        let timer = ManualTimer::new(epoch);
         let deadlines: Vec<_> = (0..count)
             .map(|index| epoch + Duration::from_millis(Deadlines::Spread.tick(index)))
             .collect();
@@ -322,7 +325,7 @@ fn capacity_cases(c: &mut Criterion) {
                 b.iter_batched_ref(
                     || {
                         let epoch = Instant::now();
-                        let timer = Timer::with_capacity(epoch, capacity);
+                        let timer = ManualTimer::with_capacity(epoch, capacity);
                         let sleeps: Vec<_> = timer.with(|| {
                             (0..count)
                                 .map(|_| Box::pin(sleep_until(epoch + Duration::from_millis(1))))
@@ -345,32 +348,25 @@ fn capacity_cases(c: &mut Criterion) {
 }
 
 struct Tasks {
-    timer: Timer,
-    executor: Executor,
+    timer: ManualTimer,
     deadline: Instant,
 }
 
 impl Tasks {
     fn new(count: usize) -> Self {
         let epoch = Instant::now();
-        let timer = Timer::new(epoch);
+        let timer = ManualTimer::new(epoch);
         let deadline = epoch + Duration::from_millis(4096);
-        let mut executor = Executor::new(Waker::noop().clone());
         for _ in 0..count {
-            drop(executor.spawn(async move { sleep_until(deadline).await }));
+            drop(timer.0.spawn(async move { sleep_until(deadline).await }));
         }
-        timer.with(|| executor.run_ready(count));
-        Self {
-            timer,
-            executor,
-            deadline,
-        }
+        timer.0.run_ready();
+        Self { timer, deadline }
     }
 
     fn expire(&mut self) {
         self.timer.advance(black_box(self.deadline));
-        self.timer
-            .with(|| black_box(self.executor.run_ready(usize::MAX)));
+        black_box(self.timer.0.run_ready());
     }
 }
 
@@ -414,9 +410,9 @@ fn validate() {
     timers.cancel();
     assert_eq!(timers.timer.next_wake(), None);
     let mut tasks = Tasks::new(count);
-    assert!(!tasks.executor.is_empty());
+    assert!(!tasks.timer.0.is_empty());
     tasks.expire();
-    assert!(tasks.executor.is_empty());
+    assert!(tasks.timer.0.is_empty());
     assert_eq!(tasks.timer.next_wake(), None);
 }
 
@@ -424,7 +420,7 @@ fn main() {
     println!(
         "layout: Sleep={} bytes, Timer={} bytes",
         size_of::<Sleep>(),
-        size_of::<Timer>()
+        size_of::<shep_smp2::time::Timer>()
     );
     validate();
     let mut c = Criterion::default()

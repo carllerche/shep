@@ -130,13 +130,9 @@ runtime-owned watch. Runtime shutdown cancels task consumers and drains accepted
 kernel work; users of raw indefinite operations must cancel those operations
 before shutdown. No resource-level forced close policy is inferred.
 
-```sh
-cargo run -p shep-smp2 --example files
-```
-
 ## Idle/wakeup protocol
 
-Parking::prepare_park drains stale eventfd tokens and publishes PARKING before
+The runtime driver's prepare_park drains stale eventfd tokens and publishes PARKING before
 the runtime's final ready-work/deadline check. The Park guard restores RUNNING
 on wait, error, timeout, unwind or an abandoned attempt. NOTIFIED retains a
 permit that skips waiting; CLOSED is terminal. SeqCst atomic RMWs linearize

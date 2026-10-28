@@ -12,11 +12,7 @@ use std::{
 #[test]
 fn nested_local_tasks_and_file_io_run_without_tokio_runtime() {
     assert!(tokio::runtime::Handle::try_current().is_err());
-    let mut runtime = Runtime::new(Config {
-        max_in_flight: 2,
-        task_budget: 2,
-    })
-    .unwrap();
+    let mut runtime = Runtime::new(Config { max_in_flight: 2 }).unwrap();
     let file = File::from_std(runtime.io(), tempfile::tempfile().unwrap()).unwrap();
     let local = Rc::new(42);
     let expected = local.clone();
@@ -40,11 +36,7 @@ fn nested_local_tasks_and_file_io_run_without_tokio_runtime() {
 
 #[test]
 fn timers_make_progress_while_a_task_continually_self_wakes() {
-    let mut runtime = Runtime::new(Config {
-        task_budget: 1,
-        ..Config::default()
-    })
-    .unwrap();
+    let mut runtime = Runtime::new(Config::default()).unwrap();
     let stop = Rc::new(Cell::new(false));
     let stopped = stop.clone();
     let count = Rc::new(Cell::new(0usize));
@@ -146,11 +138,7 @@ fn shutdown_cancels_tasks_and_drains_detached_kernel_work() {
 
 #[test]
 fn io_and_timers_progress_under_sustained_task_load() {
-    let mut runtime = Runtime::new(Config {
-        task_budget: 2,
-        max_in_flight: 64,
-    })
-    .unwrap();
+    let mut runtime = Runtime::new(Config { max_in_flight: 64 }).unwrap();
     let file = File::from_std(runtime.io(), tempfile::tempfile().unwrap()).unwrap();
     runtime
         .block_on(async move {
@@ -190,11 +178,7 @@ fn task_panics_are_contained_and_runtime_can_be_reused() {
 
 #[test]
 fn invalid_operation_does_not_consume_admission() {
-    let mut runtime = Runtime::new(Config {
-        task_budget: 8,
-        max_in_flight: 1,
-    })
-    .unwrap();
+    let mut runtime = Runtime::new(Config { max_in_flight: 1 }).unwrap();
     let file = File::from_std(runtime.io(), tempfile::tempfile().unwrap()).unwrap();
     runtime
         .block_on(async move {
@@ -224,11 +208,7 @@ fn invalid_operation_does_not_consume_admission() {
 
 #[test]
 fn saturated_runtime_returns_owned_operation_without_an_admission_waiter() {
-    let mut runtime = Runtime::new(Config {
-        max_in_flight: 1,
-        task_budget: 8,
-    })
-    .unwrap();
+    let mut runtime = Runtime::new(Config { max_in_flight: 1 }).unwrap();
     let file = File::from_std(runtime.io(), tempfile::tempfile().unwrap()).unwrap();
     runtime
         .block_on(async move {

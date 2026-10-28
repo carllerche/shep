@@ -6,9 +6,13 @@ use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
 
 use shep_smp2::time::{
-    Duration, Instant, MissedTickBehavior, Timer, interval, interval_at, sleep, sleep_until,
-    timeout, timeout_at,
+    Duration, Instant, MissedTickBehavior, interval, interval_at, sleep, sleep_until, timeout,
+    timeout_at,
 };
+
+#[path = "support/timer.rs"]
+mod support;
+use support::ManualTimer;
 
 fn poll<F: Future>(future: Pin<&mut F>) -> Poll<F::Output> {
     future.poll(&mut Context::from_waker(Waker::noop()))
@@ -16,10 +20,10 @@ fn poll<F: Future>(future: Pin<&mut F>) -> Poll<F::Output> {
 
 #[test]
 fn relative_sleep_completes_after_200_milliseconds() {
-    // Port of Monoio's runtime::tests::timer at the revision in docs/time/FORK.md.
+    // Port of Monoio's runtime::tests::timer at commit 8675e9406ea7943c441d969e38c3f5fc198ef6d1.
     // Replace io_uring waiting and wall-clock tolerance with explicit advancement.
     let epoch = Instant::now();
-    let timer = Timer::new(epoch);
+    let timer = ManualTimer::new(epoch);
     let mut delay = Box::pin(timer.with(|| sleep(Duration::from_millis(200))));
     let deadline = delay.deadline();
     assert!(deadline >= epoch + Duration::from_millis(200));
@@ -45,7 +49,7 @@ fn timeout_cancels_and_drops_the_pending_local_operation() {
     // must release the losing operation. Use a local pending future in place
     // of an actual TCP connection to keep the test timer-only and deterministic.
     let epoch = Instant::now();
-    let timer = Timer::new(epoch);
+    let timer = ManualTimer::new(epoch);
     let dropped = Rc::new(Cell::new(false));
     let flag = DropFlag(dropped.clone());
     let operation = async move {
@@ -65,7 +69,7 @@ fn timeout_cancels_and_drops_the_pending_local_operation() {
 #[test]
 fn completing_the_operation_cancels_its_registered_timeout() {
     let epoch = Instant::now();
-    let timer = Timer::new(epoch);
+    let timer = ManualTimer::new(epoch);
     let ready = Rc::new(Cell::new(false));
     let operation = poll_fn(|_| {
         if ready.get() {
@@ -87,7 +91,7 @@ fn completing_the_operation_cancels_its_registered_timeout() {
 #[test]
 fn recovering_the_inner_future_cancels_an_unpolled_timeout() {
     let epoch = Instant::now();
-    let timer = Timer::new(epoch);
+    let timer = ManualTimer::new(epoch);
     let mut wrapped = timer.with(|| timeout(Duration::from_secs(1), std::future::ready(1)));
     assert_eq!(wrapped.get_ref().clone().into_inner(), 1);
     *wrapped.get_mut() = std::future::ready(42);
@@ -99,7 +103,7 @@ fn recovering_the_inner_future_cancels_an_unpolled_timeout() {
 #[test]
 fn dropping_a_pending_timeout_releases_its_operation_and_timer() {
     let epoch = Instant::now();
-    let timer = Timer::new(epoch);
+    let timer = ManualTimer::new(epoch);
     let dropped = Rc::new(Cell::new(false));
     let flag = DropFlag(dropped.clone());
     let mut wrapped = Box::pin(timer.with(|| {
@@ -118,7 +122,7 @@ fn dropping_a_pending_timeout_releases_its_operation_and_timer() {
 #[test]
 fn elapsed_timeout_converts_to_a_timed_out_io_error() {
     let epoch = Instant::now();
-    let timer = Timer::new(epoch);
+    let timer = ManualTimer::new(epoch);
     let mut wrapped = pin!(timer.with(|| timeout_at(epoch, pending::<()>())));
     let Poll::Ready(Err(elapsed)) = poll(wrapped.as_mut()) else {
         panic!("a deadline at the timer epoch must already be elapsed");
@@ -131,7 +135,7 @@ fn elapsed_timeout_converts_to_a_timed_out_io_error() {
 #[test]
 fn overflowing_relative_durations_use_far_future_timers() {
     let epoch = Instant::now();
-    let timer = Timer::new(epoch);
+    let timer = ManualTimer::new(epoch);
     let mut delay = Box::pin(timer.with(|| sleep(Duration::MAX)));
     let mut wrapped = Box::pin(timer.with(|| timeout(Duration::MAX, pending::<()>())));
     assert!(poll(delay.as_mut()).is_pending());
@@ -149,7 +153,7 @@ fn overflowing_relative_durations_use_far_future_timers() {
 #[test]
 fn sleeps_before_the_epoch_are_ready_on_first_poll() {
     let epoch = Instant::now();
-    let timer = Timer::new(epoch);
+    let timer = ManualTimer::new(epoch);
     for deadline in [epoch - Duration::from_secs(1), epoch] {
         let mut delay = pin!(timer.with(|| sleep_until(deadline)));
         assert!(poll(delay.as_mut()).is_ready());
@@ -161,7 +165,7 @@ fn sleeps_before_the_epoch_are_ready_on_first_poll() {
 #[test]
 fn registered_sleeps_can_be_safely_dropped_after_the_owner() {
     let epoch = Instant::now();
-    let timer = Timer::new(epoch);
+    let timer = ManualTimer::new(epoch);
     let mut delays: Vec<_> = [1, 64, 4096, 262_144, 16_777_216, 1_073_741_824]
         .map(|ms| Box::pin(timer.with(|| sleep_until(epoch + Duration::from_millis(ms)))))
         .into();
@@ -176,7 +180,7 @@ fn registered_sleeps_can_be_safely_dropped_after_the_owner() {
 #[test]
 fn burst_replays_each_missed_tick_before_waiting_again() {
     let epoch = Instant::now();
-    let timer = Timer::new(epoch);
+    let timer = ManualTimer::new(epoch);
     let period = Duration::from_secs(86400);
     let start = epoch - period * 2 - Duration::from_secs(6 * 3600);
     let mut interval = timer.with(|| interval_at(start, period));
@@ -199,7 +203,7 @@ fn burst_replays_each_missed_tick_before_waiting_again() {
 #[test]
 fn skip_keeps_the_original_schedule_without_replaying_missed_ticks() {
     let epoch = Instant::now();
-    let timer = Timer::new(epoch);
+    let timer = ManualTimer::new(epoch);
     let period = Duration::from_secs(86400);
     let start = epoch - period * 2 - Duration::from_secs(6 * 3600);
     let mut interval = timer.with(|| interval_at(start, period));
@@ -217,7 +221,7 @@ fn skip_keeps_the_original_schedule_without_replaying_missed_ticks() {
 #[test]
 fn delay_schedules_a_full_period_after_observing_a_missed_tick() {
     let epoch = Instant::now();
-    let timer = Timer::new(epoch);
+    let timer = ManualTimer::new(epoch);
     let period = Duration::from_secs(86400);
     let start = epoch - period * 2;
     let mut interval = timer.with(|| interval_at(start, period));
@@ -242,7 +246,7 @@ fn delay_schedules_a_full_period_after_observing_a_missed_tick() {
 #[test]
 fn dropping_a_pending_tick_future_does_not_consume_the_tick() {
     let epoch = Instant::now();
-    let timer = Timer::new(epoch);
+    let timer = ManualTimer::new(epoch);
     let first = epoch + Duration::from_secs(86400);
     let period = Duration::from_secs(1);
     let mut interval = timer.with(|| interval_at(first, period));
@@ -272,7 +276,7 @@ fn dropping_a_pending_tick_future_does_not_consume_the_tick() {
 #[test]
 fn relative_intervals_start_immediately_and_reject_zero_periods() {
     let epoch = Instant::now();
-    let timer = Timer::new(epoch);
+    let timer = ManualTimer::new(epoch);
     let before = Instant::now();
     let mut interval = timer.with(|| interval(Duration::from_secs(1)));
     let after = Instant::now();
@@ -318,7 +322,7 @@ fn standard_clock_instants_support_reactor_deadline_arithmetic() {
     assert_eq!(deadline, epoch);
     assert!(epoch.elapsed() >= Duration::from_secs(5));
 
-    let timer = Timer::new(epoch);
+    let timer = ManualTimer::new(epoch);
     let mut delay = pin!(timer.with(|| sleep_until(epoch + duration)));
     assert!(poll(delay.as_mut()).is_pending());
     timer.advance(Instant::from_std(standard + duration));

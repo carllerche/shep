@@ -1,4 +1,4 @@
-// Extracted from Monoio and adapted for Shep; see docs/time/FORK.md.
+// Extracted from Monoio and adapted for Shep, commit 8675e9406ea7943c441d969e38c3f5fc198ef6d1.
 // Copyright (c) 2021 ihciah, dyxushuai and other Monoio Contributors.
 // Portions Copyright (c) 2021 Tokio Contributors. Licensed under MIT.
 
@@ -14,8 +14,8 @@ use crate::time::{Duration, Instant, entry::Entry, wheel::Wheel};
 ///
 /// [`advance`](Self::advance) processes elapsed time and wakes expired timers.
 /// [`next_wake`](Self::next_wake) tells the reactor when the wheel next needs
-/// processing. This type performs no waiting or I/O. Use [`with`](Self::with)
-/// to select this timer while constructing and polling timer futures.
+/// processing. This type performs no waiting or I/O. Timer futures register
+/// with the timer of the runtime entered when they are created.
 ///
 /// Deadlines round up to one-millisecond ticks. Drop timer consumers before
 /// this owner: outstanding sleeps retain their state, but cannot advance once
@@ -126,12 +126,6 @@ impl Timer {
         self.handle.get().state.borrow().entries.capacity()
     }
 
-    /// Select this timer for a closure, restoring the previous selection on
-    /// return or unwind. The reactor uses this scope around task execution.
-    pub fn with<R>(&self, f: impl FnOnce() -> R) -> R {
-        self.handle.with(f)
-    }
-
     /// Process timers through `now` and wake the tasks whose deadlines elapsed.
     /// Call between task turns, including while tasks remain runnable. Time
     /// before the wheel's last processed tick is clamped to that tick.
@@ -178,10 +172,6 @@ impl fmt::Debug for Inner {
     }
 }
 
-thread_local! {
-    static CURRENT: RefCell<Option<Handle>> = const { RefCell::new(None) };
-}
-
 /// Local handle to a reactor-owned timer wheel.
 #[derive(Clone)]
 pub(crate) struct Handle {
@@ -205,26 +195,14 @@ impl Handle {
         &self.inner
     }
 
-    /// Standalone replacement for the enclosing Monoio runtime's time handle.
-    fn with<R>(&self, f: impl FnOnce() -> R) -> R {
-        struct Reset(Option<Handle>);
-        impl Drop for Reset {
-            fn drop(&mut self) {
-                CURRENT.with(|slot| slot.replace(self.0.take()));
-            }
-        }
-        let _reset = Reset(CURRENT.with(|slot| slot.replace(Some(self.clone()))));
-        f()
-    }
-    /// Tries to get a handle to the current timer.
+    /// The timer of the runtime entered on this thread.
     ///
     /// # Panics
     ///
-    /// This function panics if there is no current timer set.
-    ///
-    /// Timers must be constructed inside `Timer::with`.
+    /// Panics outside a runtime context.
     pub(crate) fn current() -> Self {
-        CURRENT.with(|slot| slot.borrow().clone().expect("timer requires Timer::with"))
+        crate::rt::context::with_current(|rt| rt.shared().timer.handle.clone())
+            .expect("timers must be created from within a shep_smp2 runtime")
     }
 }
 

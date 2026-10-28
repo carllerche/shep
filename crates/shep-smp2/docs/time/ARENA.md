@@ -72,7 +72,7 @@ callbacks, including when a far-future entry returns to the same top bucket.
 These rules permit plain reusable keys. Deferred batches that retain keys after
 consumer destruction would require revisiting generations or ownership.
 
-The inherited first-waker behavior remains as documented in FORK.md; replacing
+The inherited first-waker behavior from Monoio remains; replacing
 it with most-recent-waker semantics is a separate behavior change.
 
 ## Verification
@@ -87,6 +87,6 @@ unsafe code. Large capacity tests use small pools under Miri to avoid its
 quadratic mutable-slice retagging cost; full boundaries run in the normal suite.
 
 There are 56 timer benchmark cases, including completed-sleep rearming and
-registration at/above reservations. The safe `arena_memory` example provides
-staged retained-heap snapshots under DHAT. See `../../benches/time/README.md` and the
+registration at/above reservations. Staged retained-heap snapshots were taken
+under DHAT with an `arena_memory` example, since removed. See `../../benches/time/README.md` and the
 arena results in `benches/` for timings, memory, and their measurement limits.

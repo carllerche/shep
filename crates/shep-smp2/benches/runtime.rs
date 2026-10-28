@@ -110,7 +110,7 @@ fn main() {
         });
     }
     group.finish();
-    let (mut reactor, _io) = shep_smp2::Parking::new(1).unwrap();
+    let (mut reactor, _io) = shep_smp2::rt::Driver::new(1).unwrap();
     let wake = reactor.wake_handle();
     c.bench_function("park/owner_notification", |b| {
         b.iter(|| {

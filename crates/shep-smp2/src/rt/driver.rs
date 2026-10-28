@@ -1,20 +1,19 @@
-//! Runtime parking policy over ordinary io2 PollAdd/Cancel operations.
+//! The runtime's I/O driver and parking policy over ordinary PollAdd/Cancel operations.
 #![forbid(unsafe_code)]
 use super::event;
-pub use crate::io::WaitOutcome;
-use crate::io::{Driver, Io, Operation, OperationHandle, Progress};
+use crate::io::{Driver as IoDriver, Io, Operation, OperationHandle, Progress, WaitOutcome};
 pub use event::WakeHandle;
 use std::{io, sync::Arc, time::Instant};
 
-pub struct Parking {
-    driver: Driver,
+pub struct Driver {
+    driver: IoDriver,
     progress: Progress,
     pub(super) event: Option<Arc<event::Event>>,
     watch: Option<OperationHandle>,
     event_fd: Option<std::rc::Rc<crate::io::Fd>>,
     closed: bool,
 }
-impl Parking {
+impl Driver {
     pub fn new(capacity: usize) -> io::Result<(Self, Io)> {
         if !(1..=32766).contains(&capacity) {
             return Err(io::Error::new(
@@ -24,7 +23,7 @@ impl Parking {
         }
         // The retained eventfd watch always occupies one ordinary operation.
         // Rearm before callbacks/tasks so that slot cannot be taken by data I/O.
-        let driver = Driver::new(capacity + 1)?;
+        let driver = IoDriver::new(capacity + 1)?;
         let io = driver.io().clone();
         let event = event::Event::new()?;
         let event_fd = std::rc::Rc::new(crate::io::Fd::new(event.file().try_clone()?)?);
@@ -145,14 +144,14 @@ impl Parking {
         Ok(())
     }
 }
-impl Drop for Parking {
+impl Drop for Driver {
     fn drop(&mut self) {
         let _ = self.shutdown();
     }
 }
 #[must_use = "recheck ready work and deadlines before waiting"]
 pub struct Park<'a> {
-    reactor: &'a mut Parking,
+    reactor: &'a mut Driver,
     notified: bool,
 }
 impl Park<'_> {

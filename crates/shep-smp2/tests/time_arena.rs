@@ -6,7 +6,11 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Wake, Waker};
 
-use shep_smp2::time::{Duration, Instant, Sleep, Timer, sleep_until};
+use shep_smp2::time::{Duration, Instant, Sleep, sleep_until};
+
+#[path = "support/timer.rs"]
+mod support;
+use support::ManualTimer;
 
 fn poll(sleep: Pin<&mut Sleep>) -> Poll<()> {
     sleep.poll(&mut Context::from_waker(Waker::noop()))
@@ -15,8 +19,8 @@ fn poll(sleep: Pin<&mut Sleep>) -> Poll<()> {
 #[test]
 fn default_reserves_capacity_but_unpolled_sleeps_do_not_occupy_slots() {
     let epoch = Instant::now();
-    assert!(Timer::new(epoch).capacity() >= 1024);
-    let timer = Timer::with_capacity(epoch, 0);
+    assert!(ManualTimer::new(epoch).capacity() >= 1024);
+    let timer = ManualTimer::with_capacity(epoch, 0);
     let unpolled: Vec<_> = timer.with(|| {
         (0..32)
             .map(|_| sleep_until(epoch + Duration::from_millis(1)))
@@ -45,7 +49,7 @@ fn capacity_boundaries_preserve_entries_and_freed_slots_are_reused() {
         &[0, 1, 256, 1024, 4096]
     };
     for &requested in capacities {
-        let timer = Timer::with_capacity(epoch, requested);
+        let timer = ManualTimer::with_capacity(epoch, requested);
         let initial = timer.capacity();
         assert!(initial >= requested);
         let deadline = epoch + Duration::from_millis(10);
@@ -84,7 +88,7 @@ fn capacity_boundaries_preserve_entries_and_freed_slots_are_reused() {
 #[test]
 fn elapsed_sleeps_retain_their_slots_until_drop_and_rearm_in_place() {
     let epoch = Instant::now();
-    let timer = Timer::with_capacity(epoch, 1);
+    let timer = ManualTimer::with_capacity(epoch, 1);
     let capacity = timer.capacity();
     let mut elapsed = Box::pin(timer.with(|| sleep_until(epoch)));
     assert!(poll(elapsed.as_mut()).is_ready());
@@ -145,7 +149,7 @@ fn repeated_pending_polls_retain_the_first_waker_without_cloning_replacements() 
     }
 
     let epoch = Instant::now();
-    let timer = Timer::new(epoch);
+    let timer = ManualTimer::new(epoch);
     let deadline = epoch + Duration::from_millis(10);
     let mut sleep = Box::pin(timer.with(|| sleep_until(deadline)));
     let first = Arc::new(WakeCount::default());
@@ -182,7 +186,7 @@ fn repeated_pending_polls_retain_the_first_waker_without_cloning_replacements() 
 #[test]
 fn cloning_the_first_waker_can_expire_the_sleep_being_polled() {
     let epoch = Instant::now();
-    let timer = Rc::new(Timer::with_capacity(epoch, 1));
+    let timer = Rc::new(ManualTimer::with_capacity(epoch, 1));
     let deadline = epoch + Duration::from_millis(1);
     let mut sleep = Box::pin(timer.with(|| sleep_until(deadline)));
     let callback_timer = timer.clone();
@@ -201,7 +205,7 @@ fn cloning_the_first_waker_can_expire_the_sleep_being_polled() {
 #[test]
 fn cloning_a_waker_can_cancel_reuse_and_grow_other_slots() {
     let epoch = Instant::now();
-    let timer = Rc::new(Timer::with_capacity(epoch, 1));
+    let timer = Rc::new(ManualTimer::with_capacity(epoch, 1));
     let mut sibling = Box::pin(timer.with(|| sleep_until(epoch + Duration::from_millis(1))));
     assert!(poll(sibling.as_mut()).is_pending());
     let mut first = Box::pin(timer.with(|| sleep_until(epoch + Duration::from_millis(2))));
@@ -247,7 +251,7 @@ fn cloning_a_waker_can_cancel_reuse_and_grow_other_slots() {
 #[test]
 fn a_panicking_clone_leaves_the_registered_entry_retryable() {
     let epoch = Instant::now();
-    let timer = Timer::with_capacity(epoch, 1);
+    let timer = ManualTimer::with_capacity(epoch, 1);
     let deadline = epoch + Duration::from_millis(1);
     let mut sleep = Box::pin(timer.with(|| sleep_until(deadline)));
     ON_CLONE.with(|slot| *slot.borrow_mut() = Some(Box::new(|| panic!("clone callback"))));
@@ -283,7 +287,7 @@ fn dropping_a_ready_polls_waker_can_reuse_its_just_removed_slot() {
         }
     }
     let epoch = Instant::now();
-    let timer = Rc::new(Timer::with_capacity(epoch, 1));
+    let timer = Rc::new(ManualTimer::with_capacity(epoch, 1));
     let mut elapsed = Box::pin(timer.with(|| sleep_until(epoch)));
     let waker = Waker::from(Arc::new(DropWake));
     assert!(

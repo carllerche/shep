@@ -147,52 +147,6 @@ the extra lookup stream or borrow-flag stores on status queries.
 
 ## Reproduce
 
-The Rust example forbids unsafe code and uses only public timer APIs. The
-runner requires Linux perf, taskset, and Python's standard library.
-
-```sh
-cargo build -p shep-smp2 --release --example arena_profile
-python3 crates/shep-smp2/benches/time/profile_arena.py \
-  target/release/examples/arena_profile readiness 1024 32768 \
-  --output /tmp/readiness.json
-python3 crates/shep-smp2/benches/time/profile_arena.py \
-  target/release/examples/arena_profile register 32768 32 32768 \
-  --output /tmp/register-reserved.json
-python3 crates/shep-smp2/benches/time/profile_arena.py \
-  target/release/examples/arena_profile register_reused 32768 32 \
-  --output /tmp/register-reused.json
-```
-
-Modes are `readiness`, `pending`, `register`, and `register_reused`; positional
-arguments are mode, consumer count, rounds, and initial capacity. Readiness and
-pending reuse one fixture; registration creates one fixture per round before
-counters start. `--events` selects a comma-separated perf event list. Cache/TLB
-measurements used `cache-references:u,cache-misses:u,dTLB-loads:u,dTLB-load-misses:u`
-in separate runs. JSON contains normalized medians and raw CSV for every trial,
-including event running percentages and unsupported-event markers. Alternate
-before/after invocations when comparing versions.
-
-For instruction/memory simulation, setup still runs with collection disabled:
-
-```sh
-taskset -c 0 valgrind --tool=callgrind --collect-atstart=no \
-  '--toggle-collect=*profile_readiness*' --cache-sim=yes --branch-sim=yes \
-  --I1=32768,8,64 --D1=32768,8,64 --LL=33554432,16,64 \
-  --callgrind-out-file=/tmp/readiness.callgrind \
-  target/release/examples/arena_profile readiness 1024 128
-callgrind_annotate /tmp/readiness.callgrind
-```
-
-Use `*profile_pending*` or `*profile_register*` for the other modes. Registration
-simulation used 4 rounds at 1,024 and 2 rounds at 32,768 consumers. Steady-state
-simulation used 128 rounds at 1,024 and 16 rounds at 32,768. There are no actual
-clock sleeps or timer-advancement operations in these profiles.
-
-The before binary was built from an isolated b5b9a22 source snapshot. Copy the
-same example into that snapshot, replacing `Timer::with_capacity(epoch, capacity)`
-with `Timer::new(epoch)` and renaming that constructor argument `_capacity`.
-Build both with the same compiler, dependency versions, and profile. The
-standalone inline experiment uses the current source plus the two attributes
-described above. Disassemble release binaries with `objdump -d -C` to inspect
-the readiness and Future::poll paths rather than assuming guards/checks optimize
-away.
+These profiles used an `arena_profile` example and a `profile_arena.py` perf
+runner, both since removed. Recover them from git history to rerun the
+measurements.

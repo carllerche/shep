@@ -4,7 +4,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll, Wake, Waker};
 
-use shep_smp2::time::{Duration, Instant, Sleep, Timer, sleep_until};
+use shep_smp2::time::{Duration, Instant, Sleep, sleep_until};
+
+#[path = "support/timer.rs"]
+mod support;
+use support::ManualTimer;
 
 #[derive(Default)]
 struct WakeCount(AtomicUsize);
@@ -29,7 +33,7 @@ struct Entry {
 }
 
 impl Entry {
-    fn new(timer: &Timer, epoch: Instant, deadline: u64) -> Self {
+    fn new(timer: &ManualTimer, epoch: Instant, deadline: u64) -> Self {
         Self {
             sleep: Box::pin(timer.with(|| sleep_until(at(epoch, deadline)))),
             wakes: Arc::default(),
@@ -58,7 +62,7 @@ fn deadlines_on_both_sides_of_every_level_boundary() {
     let epoch = Instant::now();
     for boundary in (1..=6).map(|level| 64_u64.pow(level)) {
         for elapsed in [0, boundary - 2, boundary + 7] {
-            let timer = Timer::new(epoch);
+            let timer = ManualTimer::new(epoch);
             timer.advance(at(epoch, elapsed));
             let mut entries: Vec<_> = [boundary - 1, boundary, boundary + 1]
                 .map(|offset| Entry::new(&timer, epoch, elapsed + offset))
@@ -88,7 +92,7 @@ fn deadlines_on_both_sides_of_every_level_boundary() {
 #[test]
 fn deadlines_beyond_the_top_wheel_range_survive_repeated_wraps() {
     let epoch = Instant::now();
-    let timer = Timer::new(epoch);
+    let timer = ManualTimer::new(epoch);
     let cycle = 1_u64 << 36;
     // Both entries occupy the same top-level bucket over multiple rotations.
     let mut entries = [
@@ -119,7 +123,7 @@ fn deadlines_beyond_the_top_wheel_range_survive_repeated_wraps() {
 fn cancelling_head_middle_and_tail_leaves_shared_bucket_siblings_intact() {
     for deadline in [1, 100, 4097, 262_145, 16_777_217, 1_073_741_825] {
         let epoch = Instant::now();
-        let timer = Timer::new(epoch);
+        let timer = ManualTimer::new(epoch);
         let mut entries: Vec<_> = (0..7)
             .map(|_| Some(Entry::new(&timer, epoch, deadline)))
             .collect();
@@ -145,7 +149,7 @@ fn cancelling_head_middle_and_tail_leaves_shared_bucket_siblings_intact() {
 fn cancelling_lazy_extensions_before_and_after_cascading_unlinks_cached_buckets() {
     for cascade in [false, true] {
         let epoch = Instant::now();
-        let timer = Timer::new(epoch);
+        let timer = ManualTimer::new(epoch);
         let mut entry = Entry::new(&timer, epoch, 100);
         assert!(entry.poll().is_pending());
         entry.reset(epoch, 4097);
@@ -165,7 +169,7 @@ fn cancelling_lazy_extensions_before_and_after_cascading_unlinks_cached_buckets(
 #[test]
 fn resets_before_first_poll_and_into_the_past_obey_current_elapsed_time() {
     let epoch = Instant::now();
-    let timer = Timer::new(epoch);
+    let timer = ManualTimer::new(epoch);
     timer.advance(at(epoch, 100));
     let mut entry = Entry::new(&timer, epoch, 4096);
     entry.reset(epoch, 102);
@@ -215,7 +219,7 @@ fn mixed_operations_match_an_absolute_deadline_model() {
     ];
     for seed in [1_u64, 42, 0xdead_beef, 0xcafe_f00d] {
         let epoch = Instant::now();
-        let timer = Timer::new(epoch);
+        let timer = ManualTimer::new(epoch);
         let mut entries: Vec<Option<Entry>> = (0..16).map(|_| None).collect();
         let mut random = seed;
         let mut elapsed = 0_u64;

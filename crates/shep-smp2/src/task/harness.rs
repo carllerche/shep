@@ -1,4 +1,4 @@
-// Adapted from Monoio's task/harness.rs; see docs/task/FORK.md.
+// Adapted from Monoio's task/harness.rs, commit 8675e9406ea7943c441d969e38c3f5fc198ef6d1.
 // Copyright (c) 2021 ihciah, dyxushuai and other Monoio Contributors.
 // Portions Copyright (c) 2021 Tokio Contributors. Licensed under MIT.
 
@@ -9,8 +9,9 @@ use std::{
     task::{Context, Poll, Waker},
 };
 
+use crate::rt::context;
 use crate::task::{
-    JoinError,
+    JoinError, TaskId,
     core::{Cell, Core, CoreStage, Header, Trailer},
     state::{Snapshot, TransitionToIdle},
 };
@@ -49,7 +50,11 @@ impl<T: Future> Harness<T> {
         self.header().shared.state.transition_to_running();
         let waker = Waker::from(self.header().shared.clone());
         let cx = Context::from_waker(&waker);
-        if poll_future(&self.core().stage, cx).is_ready() {
+        let ready = {
+            let _id = TaskIdGuard::enter(self.header().shared.id);
+            poll_future(&self.core().stage, cx).is_ready()
+        };
+        if ready {
             self.complete();
         } else if let TransitionToIdle::OkNotified = self.header().shared.state.transition_to_idle()
         {
@@ -64,6 +69,7 @@ impl<T: Future> Harness<T> {
         if self.header().shared.state.transition_to_cancelled() {
             // Drop the future in place. Stage assignment installs the error
             // even if its destructor unwinds, so a joiner is still notified.
+            let _id = TaskIdGuard::enter(self.header().shared.id);
             let _ = panic::catch_unwind(AssertUnwindSafe(|| {
                 self.core().stage.store_output(Err(JoinError::Cancelled));
             }));
@@ -90,6 +96,7 @@ impl<T: Future> Harness<T> {
     pub(super) fn drop_join_handle_slow(self) {
         let mut maybe_panic = None;
         if self.header().shared.state.unset_join_interested().is_err() {
+            let _id = TaskIdGuard::enter(self.header().shared.id);
             let result = panic::catch_unwind(AssertUnwindSafe(|| {
                 self.core().stage.drop_future_or_output();
             }));
@@ -212,4 +219,24 @@ fn poll_future<T: Future>(core: &CoreStage<T>, cx: Context<'_>) -> Poll<()> {
     };
     core.store_output(output);
     Poll::Ready(())
+}
+
+/// Names the task while its future or output runs user code, restoring the
+/// enclosing task's ID, e.g. when a task drops a child's join handle.
+struct TaskIdGuard {
+    parent: Option<TaskId>,
+}
+
+impl TaskIdGuard {
+    fn enter(id: TaskId) -> Self {
+        Self {
+            parent: context::set_current_task_id(Some(id)),
+        }
+    }
+}
+
+impl Drop for TaskIdGuard {
+    fn drop(&mut self) {
+        context::set_current_task_id(self.parent);
+    }
 }

@@ -8,11 +8,10 @@
 //! Futures, outputs, tasks, and join handles stay on their creating thread.
 //! Standard Rust wakers can cross threads: they only update shared notification
 //! state and call [`Schedule::schedule`] with an opaque ID. They never access
-//! the future or output. Executors must ignore IDs for tasks already removed.
+//! the future or output. The runtime ignores IDs for tasks already removed.
 //!
-//! [`Executor`] is a FIFO executor over these tasks. It neither blocks nor owns
-//! a timer or I/O driver; the runtime supplies its wakeup mechanism. See
-//! `docs/task/FORK.md` and `docs/task/EXECUTOR-FORK.md` for provenance.
+//! The runtime owns the executor: [`spawn`] queues a task on the entered
+//! runtime, and [`id`] names the task currently running.
 //!
 //! Tasks and join handles remain local even when the output is `Send`:
 //!
@@ -41,17 +40,13 @@
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
-mod context;
 mod core;
-mod executor;
 mod harness;
 mod join;
 mod raw;
-mod scheduler;
 mod state;
 mod waker;
 
-pub use executor::{EnterGuard, Executor, spawn};
 pub use join::JoinHandle;
 
 use std::fmt;
@@ -75,6 +70,33 @@ impl TaskId {
                 .expect("task IDs exhausted"),
         )
     }
+}
+
+/// Queue a future on the runtime entered on this thread, without polling it.
+///
+/// # Panics
+///
+/// Panics outside a runtime context.
+pub fn spawn<F>(future: F) -> JoinHandle<F::Output>
+where
+    F: Future + 'static,
+    F::Output: 'static,
+{
+    crate::rt::Handle::current().spawn(future)
+}
+
+/// The ID of the task currently running on this thread.
+///
+/// # Panics
+///
+/// Panics outside a task's poll or destructor.
+pub fn id() -> TaskId {
+    try_id().expect("task::id must be called from within a task")
+}
+
+/// The ID of the task currently running on this thread, if any.
+pub fn try_id() -> Option<TaskId> {
+    crate::rt::context::current_task_id()
 }
 
 /// The executor's notification queue and wakeup mechanism.

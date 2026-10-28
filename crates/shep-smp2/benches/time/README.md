@@ -104,25 +104,10 @@ Preflight assertions and benchmark smoke runs check fixture behavior.
 
 ## Retained heap snapshots
 
-The source-safe example `arena_memory` prepares an empty, live, expired, or
-freed-consumer phase. It deliberately forgets the selected owners so DHAT's
-end-of-process live heap represents that phase instead of normal teardown.
-The leak is confined to this one-shot profiling fixture.
-
-```sh
-cargo build -p shep-smp2 --release --example arena_memory
-valgrind --tool=dhat --dhat-out-file=/tmp/timer-live.json \
-  target/release/examples/arena_memory live 32768 1024
-valgrind --tool=dhat --dhat-out-file=/tmp/timer-freed.json \
-  target/release/examples/arena_memory freed 32768 1024
-```
-
-Arguments are phase, consumer count, and initial capacity. The fixture uses
-boxed sleeps plus a Vec of owners; it is not an estimate of every executor's
-task layout. Sum DHAT point fields `eb` and `ebk` for retained requested bytes
-and allocation blocks. Figures include common process bookkeeping, not RSS,
-allocator rounding, or transient growth peaks. The before/after run used the
-same example against the old source, substituting its capacity-less constructor.
+These snapshots came from a one-shot `arena_memory` example that forgot the
+selected owners so DHAT's end-of-process live heap represented one phase (empty,
+live, expired, or freed consumers). The example has been removed; recover it
+from git history to rerun the measurement.
 
 `size_of::<Sleep>()` is now 48 bytes, while each reserved slot uses 56 bytes on
 this x86_64 build. The full arena can reduce total live bytes, but reservations
@@ -131,8 +116,8 @@ and the high-water capacity remain allocated after consumers disappear. See
 
 ## Correctness
 
-Run the integration tests, docs, and Miri in addition to timing. The library,
-benchmarks, and profiling example forbid unsafe code. The integration test for
+Run the integration tests, docs, and Miri in addition to timing. The library
+and benchmarks forbid unsafe code. The integration test for
 custom waker Clone reentrancy contains one documented raw-waker construction;
 the runtime does not. Production-sized reservation boundaries run natively,
 with smaller equivalent transitions under Miri to bound slice-retagging costs.

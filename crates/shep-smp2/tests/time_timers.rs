@@ -7,24 +7,28 @@ use std::sync::Arc;
 use std::task::{Context, Poll, Wake, Waker};
 
 use shep_futures::future::block_on;
-use shep_smp2::task::{Executor, JoinHandle};
+use shep_smp2::task::JoinHandle;
 use shep_smp2::time::{
-    Duration, Instant, MissedTickBehavior, Timer, interval_at, sleep, sleep_until, timeout_at,
+    Duration, Instant, MissedTickBehavior, interval_at, sleep, sleep_until, timeout_at,
 };
+
+#[path = "support/timer.rs"]
+mod support;
+use support::ManualTimer;
 
 fn poll<F: Future>(future: Pin<&mut F>) -> Poll<F::Output> {
     future.poll(&mut Context::from_waker(Waker::noop()))
 }
 
-// The reactor will own these steps. Tests advance directly to the next wheel
-// processing time, with no driver abstraction, clock trait, or wall-clock wait.
-fn drive<T>(timer: &Timer, exec: &mut Executor, join: JoinHandle<T>) -> T {
+// Run task turns by hand and advance directly to the next wheel processing
+// time, with no I/O, clock trait, or wall-clock wait.
+fn drive<T>(timer: &ManualTimer, join: JoinHandle<T>) -> T {
     for _ in 0..256 {
-        timer.with(|| exec.run_ready(64));
+        timer.0.run_ready();
         if join.is_finished() {
             return block_on(join).unwrap();
         }
-        if !exec.has_ready() {
+        if !timer.0.has_ready() {
             timer.advance(timer.next_wake().expect("pending task has no wake source"));
         }
     }
@@ -34,23 +38,22 @@ fn drive<T>(timer: &Timer, exec: &mut Executor, join: JoinHandle<T>) -> T {
 #[test]
 fn advancing_timers_wakes_local_executor_tasks_without_waiting() {
     let now = Instant::now();
-    let timer = Timer::new(now);
-    let mut exec = Executor::new(Waker::noop().clone());
+    let timer = ManualTimer::new(now);
     let local = Rc::new(42);
-    let join = exec.spawn(async move {
+    let join = timer.0.spawn(async move {
         sleep_until(now + Duration::from_secs(1)).await;
         local
     });
-    assert_eq!(*drive(&timer, &mut exec, join), 42);
-    assert!(exec.is_empty());
+    assert_eq!(*drive(&timer, join), 42);
+    assert!(timer.0.is_empty());
     assert_eq!(timer.next_wake(), None);
 }
 
 #[test]
 fn a_sleep_remains_bound_to_its_creation_timer() {
     let now = Instant::now();
-    let owner = Timer::new(now);
-    let other = Timer::new(now);
+    let owner = ManualTimer::new(now);
+    let other = ManualTimer::new(now);
     let deadline = now + Duration::from_millis(10);
     let mut sleep = Box::pin(owner.with(|| sleep_until(deadline)));
     other.with(|| assert!(poll(sleep.as_mut()).is_pending()));
@@ -66,7 +69,7 @@ fn a_sleep_remains_bound_to_its_creation_timer() {
 #[test]
 fn construction_is_lazy_and_dropping_a_registered_sleep_unlinks_it() {
     let now = Instant::now();
-    let timer = Timer::new(now);
+    let timer = ManualTimer::new(now);
     let mut sleep = Box::pin(timer.with(|| sleep_until(now + Duration::from_secs(30))));
     assert_eq!(timer.next_wake(), None);
     timer.with(|| assert!(poll(sleep.as_mut()).is_pending()));
@@ -78,7 +81,7 @@ fn construction_is_lazy_and_dropping_a_registered_sleep_unlinks_it() {
 #[test]
 fn resetting_later_preserves_the_extended_deadline() {
     let now = Instant::now();
-    let timer = Timer::new(now);
+    let timer = ManualTimer::new(now);
     let mut sleep = Box::pin(timer.with(|| sleep_until(now + Duration::from_millis(2))));
     assert!(poll(sleep.as_mut()).is_pending());
     let extended = now + Duration::from_millis(8);
@@ -94,7 +97,7 @@ fn resetting_later_preserves_the_extended_deadline() {
 #[test]
 fn reset_can_shorten_a_registered_timer_and_reuse_an_elapsed_one() {
     let now = Instant::now();
-    let timer = Timer::new(now);
+    let timer = ManualTimer::new(now);
     let mut sleep = Box::pin(timer.with(|| sleep_until(now + Duration::from_secs(30))));
     assert!(poll(sleep.as_mut()).is_pending());
     let earlier = now + Duration::from_millis(2);
@@ -114,7 +117,7 @@ fn reset_can_shorten_a_registered_timer_and_reuse_an_elapsed_one() {
 #[test]
 fn timeout_expires_and_a_ready_value_wins_even_with_a_past_deadline() {
     let now = Instant::now();
-    let timer = Timer::new(now);
+    let timer = ManualTimer::new(now);
     let deadline = now + Duration::from_millis(5);
     let mut timeout = Box::pin(timer.with(|| timeout_at(deadline, pending::<()>())));
     assert!(poll(timeout.as_mut()).is_pending());
@@ -127,7 +130,7 @@ fn timeout_expires_and_a_ready_value_wins_even_with_a_past_deadline() {
 #[test]
 fn interval_preserves_burst_catchup_and_missed_tick_configuration() {
     let now = Instant::now();
-    let timer = Timer::new(now);
+    let timer = ManualTimer::new(now);
     let start = now - Duration::from_secs(10);
     let mut interval = timer.with(|| interval_at(start, Duration::from_secs(1)));
     assert_eq!(interval.missed_tick_behavior(), MissedTickBehavior::Burst);
@@ -145,7 +148,7 @@ fn interval_preserves_burst_catchup_and_missed_tick_configuration() {
 #[test]
 fn next_wake_includes_coarse_bucket_processing_before_the_deadline() {
     let now = Instant::now();
-    let timer = Timer::new(now);
+    let timer = ManualTimer::new(now);
     let deadline = now + Duration::from_millis(100);
     let mut sleep = Box::pin(timer.with(|| sleep_until(deadline)));
     assert!(poll(sleep.as_mut()).is_pending());
@@ -163,7 +166,7 @@ fn next_wake_includes_coarse_bucket_processing_before_the_deadline() {
 #[test]
 fn fractional_millisecond_deadlines_round_up_without_firing_early() {
     let now = Instant::now();
-    let timer = Timer::new(now);
+    let timer = ManualTimer::new(now);
     let mut sleep = Box::pin(timer.with(|| sleep_until(now + Duration::from_micros(100))));
     assert!(poll(sleep.as_mut()).is_pending());
     let tick = now + Duration::from_millis(1);
@@ -177,7 +180,7 @@ fn fractional_millisecond_deadlines_round_up_without_firing_early() {
 #[test]
 fn advancing_backwards_is_clamped_and_cannot_fire_a_future_timer() {
     let now = Instant::now();
-    let timer = Timer::new(now);
+    let timer = ManualTimer::new(now);
     timer.advance(now + Duration::from_secs(1));
     let deadline = now + Duration::from_millis(1001);
     let mut sleep = Box::pin(timer.with(|| sleep_until(deadline)));
@@ -205,7 +208,7 @@ fn waking_a_timer_can_drop_another_timer_without_borrow_conflicts() {
         }
     }
     let now = Instant::now();
-    let timer = Timer::new(now);
+    let timer = ManualTimer::new(now);
     let deadline = now + Duration::from_millis(1);
     let mut first = Box::pin(timer.with(|| sleep_until(deadline)));
     let waker = Waker::from(Arc::new(WakeLocal));
@@ -246,7 +249,7 @@ fn cancelling_a_timer_can_drop_another_sleep_through_its_waker_destructor() {
     }
 
     let now = Instant::now();
-    let timer = Timer::new(now);
+    let timer = ManualTimer::new(now);
     let deadline = now + Duration::from_millis(1);
     let mut first = Box::pin(timer.with(|| sleep_until(deadline)));
     let waker = Waker::from(Arc::new(DropWake));
@@ -285,7 +288,7 @@ fn a_panicking_waker_destructor_leaves_other_timer_entries_valid() {
         }
     }
     let now = Instant::now();
-    let timer = Timer::new(now);
+    let timer = ManualTimer::new(now);
     let deadline = now + Duration::from_millis(1);
     let mut first = Box::pin(timer.with(|| sleep_until(deadline)));
     let waker = Waker::from(Arc::new(PanickingDropWake));
@@ -305,12 +308,12 @@ fn a_panicking_waker_destructor_leaves_other_timer_entries_valid() {
 }
 
 #[test]
-fn timer_context_is_restored_after_nested_scopes_and_unwind() {
+fn sleeps_register_with_the_entered_runtime_which_cannot_nest() {
     let now = Instant::now();
-    let outer = Timer::new(now);
-    let inner = Timer::new(now);
+    let outer = ManualTimer::new(now);
+    let inner = ManualTimer::new(now);
     outer.with(|| {
-        assert!(catch_unwind(AssertUnwindSafe(|| inner.with(|| panic!("unwind")))).is_err());
+        assert!(catch_unwind(AssertUnwindSafe(|| inner.with(|| ()))).is_err());
         let mut sleep = Box::pin(sleep(Duration::from_secs(30)));
         assert!(poll(sleep.as_mut()).is_pending());
         assert!(outer.next_wake().is_some());
@@ -336,7 +339,7 @@ fn a_wake_callback_can_reset_a_sibling_already_queued_for_firing() {
 
     for reset_to in [0, 5] {
         let now = Instant::now();
-        let timer = Rc::new(Timer::new(now));
+        let timer = Rc::new(ManualTimer::new(now));
         let deadline = now + Duration::from_millis(1);
         let mut first = Box::pin(timer.with(|| sleep_until(deadline)));
         let waker = Waker::from(Arc::new(WakeLocal));

@@ -103,7 +103,8 @@ impl Wake for WakeHandle {
 #[cfg(all(test, not(miri)))]
 mod tests {
     use super::*;
-    use crate::rt::park::{Parking, WaitOutcome};
+    use crate::io::WaitOutcome;
+    use crate::rt::driver::Driver;
     use std::time::{Duration, Instant};
     fn counter(event: &Event) -> io::Result<u64> {
         let mut bytes = [0; 8];
@@ -124,7 +125,7 @@ mod tests {
     }
     #[test]
     fn owner_notifications_never_write_even_after_prepare() {
-        let mut reactor = Parking::new(1).unwrap().0;
+        let mut reactor = Driver::new(1).unwrap().0;
         let event = reactor.event.as_ref().unwrap().clone();
         let wake = reactor.wake_handle();
         wake.unpark().unwrap();
@@ -141,7 +142,7 @@ mod tests {
     }
     #[test]
     fn remote_running_notifications_skip_writes_and_survive_until_prepare() {
-        let mut reactor = Parking::new(1).unwrap().0;
+        let mut reactor = Driver::new(1).unwrap().0;
         let event = reactor.event.as_ref().unwrap().clone();
         let wake = reactor.wake_handle();
         remote(&wake);
@@ -154,7 +155,7 @@ mod tests {
     }
     #[test]
     fn remote_parked_notifications_coalesce_to_one_eventfd_write() {
-        let mut reactor = Parking::new(1).unwrap().0;
+        let mut reactor = Driver::new(1).unwrap().0;
         let event = reactor.event.as_ref().unwrap().clone();
         let wake = reactor.wake_handle();
         let park = reactor.prepare_park().unwrap();
@@ -173,7 +174,7 @@ mod tests {
     }
     #[test]
     fn abandoned_ready_and_timed_out_waits_restore_running() {
-        let mut reactor = Parking::new(1).unwrap().0;
+        let mut reactor = Driver::new(1).unwrap().0;
         let event = reactor.event.as_ref().unwrap().clone();
         let wake = reactor.wake_handle();
         drop(reactor.prepare_park().unwrap());
@@ -202,7 +203,7 @@ mod tests {
     }
     #[test]
     fn a_delayed_foreign_notification_interrupts_a_kernel_wait() {
-        let mut reactor = Parking::new(1).unwrap().0;
+        let mut reactor = Driver::new(1).unwrap().0;
         let event = reactor.event.as_ref().unwrap().clone();
         let wake = reactor.wake_handle();
         let park = reactor.prepare_park().unwrap();
