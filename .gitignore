@@ -1,4 +1,5 @@
 target/
+__pycache__/
 formal/tla/.tlc.lock
 
 # Test logs, if anything writes them into the source tree.

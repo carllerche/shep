@@ -417,7 +417,7 @@ fn validate() {
 }
 
 fn main() {
-    println!(
+    eprintln!(
         "layout: Sleep={} bytes, Timer={} bytes",
         size_of::<Sleep>(),
         size_of::<shep_smp2::time::Timer>()

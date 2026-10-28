@@ -55,7 +55,7 @@ separate and set `CRITERION_HOME` to the same absolute results directory.
 Useful shorter checks:
 
 ```sh
-cargo test -p shep-smp2 --bench timers
+cargo nextest run -p shep-smp2 --bench timers
 taskset -c 0 cargo bench -p shep-smp2 --bench timers -- \
   '^(churn|reset_extend|expire_spread)/1024$' --quick --noplot
 ```

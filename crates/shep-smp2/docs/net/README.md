@@ -75,7 +75,7 @@ and recoverable cancellation that preserves a connection remain future work.
 Run the native loopback tests:
 
 ```sh
-cargo test -p shep-smp2 --test net_tcp
+cargo nextest run -p shep-smp2 --test net_tcp
 ```
 
 Tests cover short sends, bounded chunking, half-close, EOF/reset, connection

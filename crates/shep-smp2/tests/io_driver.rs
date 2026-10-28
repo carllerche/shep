@@ -475,6 +475,26 @@ fn reentrant_wake_consumes_another_result_and_pushes_into_reused_slot() {
     driver.drain().unwrap();
 }
 
+// Nextest isolates this test from other tests allocating the closed number.
+fn reuse_descriptor(fd: std::os::fd::RawFd) -> File {
+    use std::os::fd::AsRawFd;
+
+    let mut lower_descriptors = Vec::new();
+    loop {
+        let replacement = File::open("/dev/null").unwrap();
+        assert!(
+            replacement.as_raw_fd() <= fd,
+            "CLOSE did not release descriptor {fd}"
+        );
+        if replacement.as_raw_fd() == fd {
+            return replacement;
+        }
+        // open returns the lowest available number. Retain any lower slots so
+        // the next open advances toward fd, without an arbitrary retry limit.
+        lower_descriptors.push(replacement);
+    }
+}
+
 #[test]
 fn close_completion_never_closes_a_reused_descriptor() {
     use std::os::fd::AsRawFd;
@@ -483,25 +503,17 @@ fn close_completion_never_closes_a_reused_descriptor() {
     let fd = file.as_raw_fd();
     let mut close = driver.push(Operation::close(file)).unwrap();
     driver.submit_and_wait(None).unwrap();
-    // CLOSE ran, but its CQE has not been processed. Keep replacements open
-    // until the kernel allocates the old number to a new, independent owner.
-    let mut replacements = Vec::new();
-    for _ in 0..64 {
-        let replacement = File::open("/dev/null").unwrap();
-        let reused = replacement.as_raw_fd() == fd;
-        replacements.push(replacement);
-        if reused {
-            break;
-        }
-    }
+    // CLOSE ran, but its CQE has not been processed. Reuse its number before
+    // reaping, so a second close would affect a new, independent owner.
+    let replacement = reuse_descriptor(fd);
     finish(&mut driver, &mut close).result.unwrap();
     close.release(driver.io());
-    replacements
-        .iter()
-        .find(|f| f.as_raw_fd() == fd)
-        .unwrap_or_else(|| panic!("could not reuse fd"))
-        .metadata()
-        .unwrap();
+    let status = replacement.metadata();
+    if status.is_err() {
+        // Report a double close without an IO-safety abort during unwinding.
+        std::mem::forget(replacement);
+    }
+    status.unwrap();
     driver.drain().unwrap();
 }
 
@@ -545,20 +557,7 @@ fn close_flush_error_never_closes_a_reused_descriptor() {
     driver.submit_and_wait(None).unwrap();
 
     // Leave the CLOSE CQE unreaped while another owner acquires its fd number.
-    let mut replacements = Vec::new();
-    for _ in 0..64 {
-        let replacement = File::open("/dev/null").unwrap();
-        let reused = replacement.as_raw_fd() == fd;
-        replacements.push(replacement);
-        if reused {
-            break;
-        }
-    }
-    let index = replacements
-        .iter()
-        .position(|file| file.as_raw_fd() == fd)
-        .expect("could not reuse fd before reaping CLOSE");
-    let replacement = replacements.swap_remove(index);
+    let replacement = reuse_descriptor(fd);
     assert!(replacement.metadata().is_ok());
 
     let result = finish(&mut driver, &mut close).result;

@@ -78,5 +78,5 @@ block. Prefer explicit shutdown. Dropping the driver retains its existing kernel
 retirement behavior. Scheduling weights, admission waiters, appender buffering,
 and transaction-level drain remain responsibilities of the layers above fs2.
 
-Run `cargo test -p shep-smp2` for
+Run `cargo nextest run -p shep-smp2` for
 file, completion-lifetime, native runtime and socket regression coverage.

@@ -44,11 +44,20 @@ span many components go in `tests/test-<aspect>` crates.
 
 ```sh
 cargo nextest run --workspace
+cargo test --workspace --doc
 ```
 
+Use nextest for unit and integration tests, and `cargo test --doc` for doctests.
+Nextest runs each test in a separate process, so tests can inspect closed file
+descriptor numbers without racing unrelated tests. The Cargo runner enforces
+nextest for the entire `shep-smp2` native test suite. Plain `cargo test` delegates
+each compiled test binary to nextest, preserving the selected build and test
+filters (requires Python 3 and cargo-nextest). Use nextest directly to schedule
+tests across binaries together. Test discovery (`--list`), doctests, Miri, and
+`cargo bench` remain available separately.
+
 Use `cargo nextest run --workspace --profile ci` in CI. Nextest terminates hung
-tests after 2 minutes locally or 5 minutes in CI. Plain `cargo test` still works,
-but provides no hang protection.
+tests after 2 minutes locally or 5 minutes in CI.
 
 A single server is a complete deployment, without replication:
 

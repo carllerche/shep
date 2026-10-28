@@ -167,6 +167,7 @@ cell or systemwide memory-barrier mechanisms.
 
 ```sh
 cargo nextest run -p shep-smp2
+cargo test -p shep-smp2 --doc
 cargo clippy -p shep-smp2 --all-targets -- -D warnings
 MIRIFLAGS='-Zmiri-disable-isolation -Zmiri-tree-borrows' cargo +nightly-2026-10-22 miri test -p shep-smp2 --lib io::
 ```
