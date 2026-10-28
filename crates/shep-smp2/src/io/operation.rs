@@ -147,7 +147,11 @@ impl Operation {
     /// Fd establishes descriptor eligibility at construction; push does not
     /// perform descriptor validation syscalls.
     pub fn close(file: Fd) -> Self {
-        Self::Close(Close { file: Some(file) })
+        // Keep the validated descriptor in a plain File so an unpublished or
+        // rejected CLOSE falls back synchronously without reentering Fd::drop.
+        Self::Close(Close {
+            file: Some(file.into()),
+        })
     }
     /// Borrow this owned request's input/output buffer, if its opcode has one.
     pub fn buffer(&self) -> Option<&Buffer> {
@@ -182,7 +186,7 @@ impl Operation {
 #[derive(Debug)]
 pub struct Close {
     /// Some before SQ publication; None once descriptor ownership is transferred.
-    pub(crate) file: Option<Fd>,
+    pub(crate) file: Option<std::fs::File>,
 }
 
 /// Stable, owned socket-address storage for CONNECT.

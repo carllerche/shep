@@ -383,3 +383,88 @@ fn write_all_returns_owned_buffer_on_rejection_and_handles_empty_buffers() {
     occupied.release(driver.io());
     drain(&mut driver);
 }
+
+#[test]
+fn imported_lingering_socket_drops_and_submits_without_waiting_for_the_peer() {
+    use std::os::fd::AsRawFd;
+
+    let (mut client, peer) = pair();
+    shep_sys::set_socket_linger(&client, Some(Duration::from_secs(3))).unwrap();
+    client.set_nonblocking(true).unwrap();
+    let bytes = [0; 64 * 1024];
+    let mut sent = 0;
+    loop {
+        match client.write(&bytes) {
+            Ok(0) => panic!("socket stopped accepting data"),
+            Ok(n) => sent += n,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(e) => panic!("filling socket: {e}"),
+        }
+    }
+    assert!(sent > 0);
+    let raw = client.as_raw_fd();
+    let mut runtime = runtime();
+    let io = runtime.io();
+    let baseline = io.in_flight();
+    let stream = TcpStream::from_std(&io, client, Config::default()).unwrap();
+    let enter = runtime.enter();
+    let start = Instant::now();
+    drop(stream);
+    assert!(
+        start.elapsed() < Duration::from_secs(1),
+        "Drop waited for linger"
+    );
+    assert_eq!(
+        io.in_flight(),
+        baseline + 1,
+        "Drop must publish a detached CLOSE"
+    );
+    assert!(std::fs::read_link(format!("/proc/self/fd/{raw}")).is_ok());
+    let start = Instant::now();
+    runtime.block_on(async {}).unwrap();
+    assert!(
+        start.elapsed() < Duration::from_secs(1),
+        "submit waited for linger"
+    );
+    // Release the unread peer so the worker can finish promptly.
+    drop(peer);
+    runtime.shutdown().unwrap();
+    drop(enter);
+    assert!(std::fs::read_link(format!("/proc/self/fd/{raw}")).is_err());
+}
+
+#[test]
+fn socket_drop_falls_back_when_close_cannot_be_published() {
+    use std::os::fd::AsRawFd;
+
+    for unavailable in 0..4 {
+        let (client, _peer) = pair();
+        let raw = client.as_raw_fd();
+        let mut runtime = Some(Runtime::new(shep_smp2::Config { max_in_flight: 1 }).unwrap());
+        let io = runtime.as_ref().unwrap().io();
+        let stream = TcpStream::from_std(&io, client, Config::default()).unwrap();
+        let enter = (unavailable != 3).then(|| runtime.as_ref().unwrap().enter());
+        let mut occupied = match unavailable {
+            0 => Some(io.push(Operation::Nop).unwrap()),
+            1 => {
+                io.close();
+                None
+            }
+            2 => {
+                drop(runtime.take());
+                None
+            }
+            _ => None, // A live runtime exists, but is not entered.
+        };
+        drop(stream);
+        assert!(std::fs::read_link(format!("/proc/self/fd/{raw}")).is_err());
+        if let Some(handle) = &mut occupied {
+            handle.release(&io);
+        }
+        if let Some(runtime) = &mut runtime {
+            runtime.shutdown().unwrap();
+        }
+        drop(enter);
+        assert_eq!(io.in_flight(), 0);
+    }
+}

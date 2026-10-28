@@ -114,3 +114,54 @@ pub(super) fn with_scheduler<R>(f: impl FnOnce(&mut Core) -> R) -> Option<R> {
 pub(super) fn set_scheduler(core: Option<Core>) -> Option<Core> {
     CONTEXT.with(|cx| cx.scheduler.replace(core))
 }
+
+/// Clone the current I/O handle for destructor cleanup. TLS teardown or a busy
+/// context falls back to synchronous close. Release the borrow before cleanup.
+pub(crate) fn try_io() -> Option<crate::io::Io> {
+    CONTEXT
+        .try_with(|cx| cx.current.try_borrow().ok()?.as_ref().map(Handle::io))
+        .ok()
+        .flatten()
+}
+
+#[cfg(all(test, not(miri)))]
+mod tests {
+    use super::*;
+    use crate::{Runtime, io::Fd};
+    use std::os::fd::AsRawFd;
+
+    #[test]
+    fn fd_drop_falls_back_when_context_is_mutably_borrowed() {
+        let runtime = Runtime::new(Default::default()).unwrap();
+        let _enter = runtime.enter();
+        let io = runtime.io();
+        let baseline = io.in_flight();
+        let fd = Fd::new(tempfile::tempfile().unwrap()).unwrap();
+        let raw = fd.as_raw_fd();
+        CONTEXT.with(|cx| {
+            let _borrow = cx.current.borrow_mut();
+            drop(fd);
+        });
+        assert_eq!(io.in_flight(), baseline);
+        assert!(std::fs::read_link(format!("/proc/self/fd/{raw}")).is_err());
+    }
+
+    #[test]
+    fn fd_drop_falls_back_after_runtime_tls_destruction() {
+        thread_local! {
+            static LAST: RefCell<Option<Fd>> = const { RefCell::new(None) };
+        }
+        let raw = std::thread::spawn(|| {
+            let fd = Fd::new(tempfile::tempfile().unwrap()).unwrap();
+            let raw = fd.as_raw_fd();
+            // Initialize before CONTEXT so this descriptor is destroyed after it.
+            LAST.with(|last| *last.borrow_mut() = Some(fd));
+            let runtime = Runtime::new(Default::default()).unwrap();
+            let _enter = runtime.enter();
+            raw
+        })
+        .join()
+        .unwrap();
+        assert!(std::fs::read_link(format!("/proc/self/fd/{raw}")).is_err());
+    }
+}

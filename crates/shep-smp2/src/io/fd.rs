@@ -21,9 +21,10 @@ use std::{
 /// assert_sync::<shep_smp2::io::Fd>();
 /// ```
 ///
-/// Use [`Self::close`] to explicitly await an io_uring CLOSE. Otherwise dropping
-/// the last owner closes synchronously through std::fs::File, as a fallback.
-/// Drop does not require a live driver and ignores close errors.
+/// Use [`Self::close`] to explicitly await an io_uring CLOSE. Dropping the last
+/// owner otherwise publishes a detached CLOSE through the currently entered
+/// runtime. Outside a runtime, or if its driver is busy/closed/full, close is
+/// synchronous. Drop ignores close errors and stores no runtime reference.
 ///
 /// The descriptor must be live, uniquely owned, and must not refer to an
 /// io_uring instance. Duplicates with distinct descriptor numbers are allowed.
@@ -41,7 +42,7 @@ use std::{
 /// ```
 #[derive(Debug)]
 pub struct Fd {
-    file: File,
+    file: Option<File>,
     _local: PhantomData<Rc<()>>,
 }
 
@@ -49,8 +50,8 @@ impl Fd {
     /// Consume the descriptor and await an io_uring CLOSE.
     ///
     /// The caller must keep driving the supplied Io's driver. This future is
-    /// lazy: dropping it before its first poll closes synchronously. Admission
-    /// failure likewise drops the still-owned descriptor and returns the error.
+    /// lazy: dropping it before its first poll follows the descriptor's drop
+    /// policy. Admission failure closes synchronously and returns the error.
     /// After publication, cancellation only abandons the result; the driver
     /// completes the CLOSE, including during shutdown. Flush errors are returned
     /// without retrying a descriptor number that may already have been reused.
@@ -110,7 +111,7 @@ impl Fd {
     /// Ordinary filesystem descriptors, sockets, eventfd and epoll are valid.
     pub unsafe fn from_owned_fd_unchecked(fd: OwnedFd) -> Self {
         Self {
-            file: fd.into(),
+            file: Some(fd.into()),
             _local: PhantomData,
         }
     }
@@ -119,7 +120,7 @@ impl Fd {
     /// The duplicate shares its open file description (offset and status flags).
     pub fn try_clone(&self) -> io::Result<Self> {
         Ok(Self {
-            file: self.file.try_clone()?,
+            file: Some(self.as_file().try_clone()?),
             _local: PhantomData,
         })
     }
@@ -127,33 +128,51 @@ impl Fd {
     /// Borrow the standard File for synchronous I/O or metadata operations.
     /// No mutable reference is exposed that could replace the owned descriptor.
     pub fn as_file(&self) -> &File {
-        &self.file
+        self.file.as_ref().expect("owned descriptor")
+    }
+}
+
+impl Drop for Fd {
+    fn drop(&mut self) {
+        let Some(file) = self.file.take() else { return };
+        let Some(io) = crate::rt::context::try_io() else {
+            return;
+        };
+        // Operation::close transfers the File out of Fd, so rejection closes
+        // synchronously rather than recursively consulting the runtime again.
+        let fd = Self {
+            file: Some(file),
+            _local: PhantomData,
+        };
+        if let Ok(mut close) = io.push(super::Operation::close(fd)) {
+            close.release(&io);
+        }
     }
 }
 
 impl AsFd for Fd {
     fn as_fd(&self) -> BorrowedFd<'_> {
-        self.file.as_fd()
+        self.as_file().as_fd()
     }
 }
 impl AsRawFd for Fd {
     fn as_raw_fd(&self) -> RawFd {
-        self.file.as_raw_fd()
+        self.as_file().as_raw_fd()
     }
 }
 impl IntoRawFd for Fd {
-    fn into_raw_fd(self) -> RawFd {
-        self.file.into_raw_fd()
+    fn into_raw_fd(mut self) -> RawFd {
+        self.file.take().unwrap().into_raw_fd()
     }
 }
 impl From<Fd> for File {
-    fn from(fd: Fd) -> Self {
-        fd.file
+    fn from(mut fd: Fd) -> Self {
+        fd.file.take().unwrap()
     }
 }
 impl From<Fd> for OwnedFd {
-    fn from(fd: Fd) -> Self {
-        fd.file.into()
+    fn from(mut fd: Fd) -> Self {
+        fd.file.take().unwrap().into()
     }
 }
 
@@ -175,3 +194,77 @@ checked_import!(
     std::os::unix::net::UnixStream,
     std::os::unix::net::UnixDatagram,
 );
+
+#[cfg(all(test, not(miri)))]
+mod tests {
+    use super::*;
+    use crate::{
+        Runtime,
+        io::{Driver, Operation, Progress},
+    };
+
+    #[test]
+    fn final_owner_in_a_completed_operation_uses_the_current_runtime() {
+        // The descriptor was created outside any runtime and used on another
+        // driver. Its final drop must use the runtime entered at that point.
+        let mut driver = Driver::new(1).unwrap();
+        let fd = Rc::new(Fd::new(tempfile::tempfile().unwrap()).unwrap());
+        let raw = fd.as_raw_fd();
+        let mut operation = driver
+            .push(Operation::Fsync {
+                file: fd.clone(),
+                data_only: false,
+            })
+            .unwrap();
+        drop(fd);
+        operation.release(driver.io());
+        let mut runtime = Runtime::new(Default::default()).unwrap();
+        let io = runtime.io();
+        let baseline = io.in_flight();
+        let enter = runtime.enter();
+        loop {
+            driver.submit_and_wait(None).unwrap();
+            if driver.reap_into(&mut Progress::default()) != 0 {
+                break;
+            }
+        }
+        assert_eq!(driver.in_flight(), 0);
+        assert_eq!(io.in_flight(), baseline + 1);
+        assert!(std::fs::read_link(format!("/proc/self/fd/{raw}")).is_ok());
+        runtime.shutdown().unwrap();
+        assert!(std::fs::read_link(format!("/proc/self/fd/{raw}")).is_err());
+        drop(enter);
+    }
+
+    #[test]
+    fn conversions_transfer_ownership_without_queuing_a_close() {
+        let runtime = Runtime::new(Default::default()).unwrap();
+        let io = runtime.io();
+        let _enter = runtime.enter();
+        let baseline = io.in_flight();
+        let fd = Fd::new(tempfile::tempfile().unwrap()).unwrap();
+        let duplicate = fd.try_clone().unwrap();
+        let raw = fd.as_raw_fd();
+        let file = File::from(fd);
+        assert_eq!(io.in_flight(), baseline);
+        assert!(std::fs::read_link(format!("/proc/self/fd/{raw}")).is_ok());
+        drop(file);
+        drop(duplicate);
+        assert_eq!(io.in_flight(), baseline + 1);
+    }
+
+    #[test]
+    fn dropping_while_the_arena_is_borrowed_falls_back_without_panicking() {
+        let runtime = Runtime::new(Default::default()).unwrap();
+        let io = runtime.io();
+        let _enter = runtime.enter();
+        let baseline = io.in_flight();
+        let fd = Fd::new(tempfile::tempfile().unwrap()).unwrap();
+        let raw = fd.as_raw_fd();
+        let borrow = io.shared.arena.borrow_mut();
+        drop(fd);
+        assert!(std::fs::read_link(format!("/proc/self/fd/{raw}")).is_err());
+        drop(borrow);
+        assert_eq!(io.in_flight(), baseline);
+    }
+}

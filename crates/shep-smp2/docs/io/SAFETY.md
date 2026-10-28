@@ -144,17 +144,32 @@ Successful open/socket/accept CQEs return fresh non-ring descriptors, so the
 unsafe adoption boundary constructs Fd directly without a validation syscall.
 All descriptor-bearing operations take Fd (shared through Rc where needed).
 
-Fd is !Send and !Sync through a PhantomData<Rc<()>> marker. It has no driver
-reference or deferred cleanup queue. Its File field closes synchronously on drop,
-including abandoned outputs and final input references retired by the driver.
-This is a fallback; callers can explicitly await Fd::close(&io) to use io_uring.
-That future publishes an ordinary Close operation and releases its handle if
-canceled. Before publication, dropping the future or rejecting admission drops
-the still-owned Fd synchronously. After publication, only the kernel closes it;
-canceling the future abandons its result but does not cancel the CLOSE.
+Fd is !Send and !Sync through a PhantomData<Rc<()>> marker. It stores no
+runtime reference. The final owner takes its optional File and looks up the
+currently entered runtime's Io through TLS, releasing the context borrow before
+publishing a detached Close. This also applies when an operation record owns
+the last Rc<Fd>, regardless of where the descriptor was created or used.
+Converting Fd into File, OwnedFd, or RawFd takes the descriptor out and disables
+its destructor cleanup.
+
+Outside an entered runtime, during TLS teardown, or while the context is
+mutably borrowed, destruction falls back to synchronous File close. The same
+fallback applies when the current driver is gone, closed, full, or borrowed.
+Close stores the validated descriptor as a plain File, so rejecting or dropping
+an unpublished Close cannot recursively resubmit through Fd::drop. Publication
+uses fallible ring/arena borrows for reentrant final-owner destruction.
+Accepted detached closes release their submitter claim immediately and retain
+kernel ownership until completion. CLOSE SQEs use IOSQE_ASYNC to keep potentially
+blocking release work (including socket linger) off the submitting thread.
+Synchronous fallback and driver teardown can still wait for that work.
+
+Callers can explicitly await Fd::close(&io). Before the first poll, dropping
+that future follows the descriptor's drop policy. Admission rejection closes
+synchronously. After publication, canceling the future abandons its result but
+does not cancel the CLOSE.
 
 Close accepts a unique Fd and transfers it with into_raw_fd after successful
-SQ publication, suppressing its destructor. The driver retains no raw fd to
+SQ publication, leaving its destructor with no descriptor to close. The driver retains no raw fd to
 reclaim: even ECANCELED may be a filesystem flush error after the descriptor
 has been removed and reused. Public cancellation of an unconsumed Close is
 rejected with Unsupported, and teardown skips Close when choosing cancellation

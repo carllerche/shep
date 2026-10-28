@@ -54,8 +54,16 @@ pending accepts, sends, receives and connection readiness waits can retire even
 when the single driver cancellation reserve is occupied. Operations retain their
 owned descriptors and buffers until the driver reaps them. Runtime shutdown
 drops task consumers before draining the driver, triggering this cleanup.
-Dropping a stream also shuts down its socket; callers importing standard sockets
-must not retain aliases that perform I/O or change socket flags.
+Dropping a stream also shuts down its socket. The last descriptor owner then
+publishes a detached io_uring CLOSE through the currently entered runtime,
+even if an outstanding operation retained the descriptor beyond the stream's
+lifetime. CLOSE runs on an io_uring worker
+so a positive SO_LINGER setting does not block normal drop or ring submission.
+The driver must continue to be driven to finish accepted closes. If the driver
+is gone, closed, full, or currently borrowed, or no runtime is entered,
+destruction falls back to a synchronous close; that fallback can still wait for
+linger. The descriptor stores no runtime reference. Callers importing standard sockets must not retain
+aliases that perform I/O or change socket flags.
 
 Connect takes a numeric `SocketAddr`, starts a nonblocking connection through
 safe `shep-sys` calls, waits using io_uring `PollAdd`, and checks `SO_ERROR`. It then

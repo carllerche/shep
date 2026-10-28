@@ -122,14 +122,32 @@ impl Shared {
         if let Err(error) = validate(&operation, self) {
             return Err(Rejected { error, operation });
         }
-        let mut ring = self.ring.borrow_mut();
+        // Final descriptor owners may drop during a driver borrow. Reject
+        // reentrant publication so their destructor can close synchronously.
+        let mut ring = match self.ring.try_borrow_mut() {
+            Ok(ring) => ring,
+            Err(_) => {
+                return Err(Rejected {
+                    error: io::ErrorKind::WouldBlock.into(),
+                    operation,
+                });
+            }
+        };
         let Some(ring) = ring.as_mut() else {
             return Err(Rejected {
                 operation,
                 error: io::ErrorKind::BrokenPipe.into(),
             });
         };
-        let mut arena = self.arena.borrow_mut();
+        let mut arena = match self.arena.try_borrow_mut() {
+            Ok(arena) => arena,
+            Err(_) => {
+                return Err(Rejected {
+                    error: io::ErrorKind::WouldBlock.into(),
+                    operation,
+                });
+            }
+        };
         let id = arena.insert(operation)?;
         let operation = arena.record(id).operation.as_mut().unwrap();
         let entry = entry(operation).user_data(id.raw());
@@ -592,7 +610,11 @@ fn entry(operation: &mut Operation) -> io_uring::squeue::Entry {
         .mode(*mode)
         .build(),
         Operation::Close(close) => {
-            opcode::Close::new(types::Fd(close.file.as_ref().unwrap().as_raw_fd())).build()
+            opcode::Close::new(types::Fd(close.file.as_ref().unwrap().as_raw_fd()))
+                .build()
+                // A socket's final release can wait for SO_LINGER. Keep that
+                // work off the thread submitting the ring as well as Drop.
+                .flags(io_uring::squeue::Flags::ASYNC)
         }
         Operation::Socket {
             domain,
