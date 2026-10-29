@@ -8,6 +8,7 @@
 //! thread-local context. No context or task-collection borrow spans user code.
 #![forbid(unsafe_code)]
 
+mod backoff;
 pub(crate) mod context;
 mod driver;
 mod event;
@@ -161,20 +162,67 @@ impl Runtime {
         // Stay entered during CQEs, timers and parking preparation, not just
         // task turns, so wakes route locally and destructors can spawn.
         let _enter = context::try_enter(&self.handle);
+        let mut root = self.handle.shared().spawn(future);
+        self.drive_until(|| root.is_finished(), None)?;
+        match Pin::new(&mut root).poll(&mut Context::from_waker(Waker::noop())) {
+            Poll::Ready(result) => result.map_err(io::Error::other),
+            Poll::Pending => unreachable!("finished root has an output"),
+        }
+    }
+
+    /// SMP owns the stop condition; transport polling is part of the reactor,
+    /// with no root/dispatcher task or task-waker registration.
+    pub(crate) fn run_smp(
+        &mut self,
+        shard: std::rc::Rc<std::cell::RefCell<crate::smp::transport::Shard>>,
+        ready: impl FnOnce(),
+    ) -> io::Result<()> {
+        let _enter = context::try_enter(&self.handle);
+        let pump = crate::smp::transport::Pump::new(shard, self.driver.wake_handle());
+        // The startup channel publishes the installed wake handle to all
+        // senders before they can race the first queue scan/parking attempt.
+        ready();
+        self.drive_until(|| false, Some(pump))
+    }
+
+    fn drive_until(
+        &mut self,
+        finished: impl Fn() -> bool,
+        mut pump: Option<crate::smp::transport::Pump>,
+    ) -> io::Result<()> {
         let shared = self.handle.shared();
-        let mut root = shared.spawn(future);
+        let mut backoff = backoff::FlushBackoff::default();
         loop {
-            self.driver.tick()?;
-            self.scheduler.run_ready(&self.handle);
-            self.driver.tick()?;
-            if root.is_finished() {
-                return match Pin::new(&mut root).poll(&mut Context::from_waker(Waker::noop())) {
-                    Poll::Ready(result) => result.map_err(io::Error::other),
-                    Poll::Pending => unreachable!("finished root has an output"),
-                };
+            let mut active = self.driver.tick()? != 0;
+            active |= pump.as_mut().is_some_and(|pump| pump.tick());
+            active |= self.scheduler.run_ready(&self.handle) != 0;
+            active |= self.driver.tick()? != 0;
+            let transport_progress = pump.as_mut().is_some_and(|pump| pump.tick());
+            active |= transport_progress;
+            if finished() || pump.as_ref().is_some_and(|pump| pump.closed()) {
+                return Ok(());
             }
-            self.driver
-                .park_if_idle(|| self.scheduler.has_ready(shared))?;
+            if active {
+                backoff.reset();
+            }
+            // Keep flushing on busy turns; only a stalled flush reaches the
+            // idle wait. The final tick below also runs after publishing PARKING.
+            if transport_progress {
+                continue;
+            }
+            self.driver.park_if_idle(|| {
+                let progress = pump.as_mut().is_some_and(|pump| pump.tick());
+                let ready = progress
+                    || finished()
+                    || pump.as_ref().is_some_and(|pump| pump.closed())
+                    || self.scheduler.has_ready(shared);
+                if ready {
+                    backoff.reset();
+                    return (true, None);
+                }
+                let pending = pump.as_ref().is_some_and(|pump| pump.pending_flush());
+                (false, backoff.deadline(std::time::Instant::now(), pending))
+            })?;
         }
     }
 
@@ -229,6 +277,52 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
     };
     use std::task::Wake;
+    #[test]
+    fn idle_retry_deadline_and_late_registered_application_timer_use_the_earlier_wait() {
+        use std::time::{Duration, Instant};
+        for timer_first in [false, true] {
+            let mut runtime = Runtime::new(Config::default()).unwrap();
+            let _enter = runtime.enter();
+            let now = Instant::now();
+            let early = now + Duration::from_secs(3600);
+            let late = now + Duration::from_secs(7200);
+            let (timer, retry) = if timer_first {
+                (early, late)
+            } else {
+                (late, early)
+            };
+            loop {
+                runtime.driver.tick().unwrap();
+                let mut sleep = Box::pin(crate::time::sleep_until(timer));
+                let mut checks = 0;
+                let mut prepared = runtime
+                    .driver
+                    .prepare_park_if_idle(|| {
+                        checks += 1;
+                        // Register during the final check, after the parking handshake.
+                        let ready = checks == 2
+                            && sleep
+                                .as_mut()
+                                .poll(&mut Context::from_waker(Waker::noop()))
+                                .is_ready();
+                        (ready, Some(retry))
+                    })
+                    .unwrap();
+                let Some((park, deadline)) = prepared.take() else {
+                    // SQ consumption can still be pending after submission.
+                    continue;
+                };
+                assert_eq!(checks, 2);
+                // Inspect the actual wait deadline, independent of OS scheduling.
+                drop(park);
+                drop(prepared);
+                let timer_wake = runtime.driver.timer.next_wake().unwrap();
+                assert_eq!(deadline, Some(timer_wake.min(retry)));
+                break;
+            }
+            runtime.shutdown().unwrap();
+        }
+    }
     struct CountDriver {
         wakes: Arc<AtomicUsize>,
         inner: Waker,

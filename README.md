@@ -22,7 +22,7 @@ replicates.
 | `crates/shep-util-slab` | Safe reusable indexed storage, with the small API needed by runtime components |
 | `crates/shep-smp-io` | Core-local io_uring files, owned aligned buffers, and explicit I/O lifetime management |
 | `crates/shep-smp-io-scheduler` | Weighted admission with shared physical-device capacity and per-class metrics |
-| `crates/shep-smp2` | Parallel single-core native runtime: `task` (Monoio-derived tasks and FIFO executor), `time` (hierarchical timing wheel), `io` (safe owned-operation io_uring driver), `fs` (positional owned-buffer files) and `net` (owned-buffer TCP); see [design](docs/io2.md) |
+| `crates/shep-smp2` | Native runtime and state-free SMP orchestration: `task` (Monoio-derived tasks and FIFO executor), `time` (hierarchical timing wheel), `io` (safe owned-operation io_uring driver), `fs` (positional owned-buffer files) and `net` (owned-buffer TCP); see [design](docs/io2.md) |
 | `crates/shep-append` | Format-independent buffered append files with explicit written and durable positions |
 | `crates/shep-storage` | Per-core storage, after Redpanda's: segmented logs with coalesced fsync and crash recovery, and a key-value store |
 | `crates/shep-raft-engine` | openraft 0.10.0-alpha.37, forked (see its `FORK.md`), with its test suite |

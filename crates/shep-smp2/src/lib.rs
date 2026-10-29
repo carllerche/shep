@@ -1,6 +1,5 @@
-//! Native single-core runtime: bounded task turns, io_uring, and timer deadlines.
-//! This parallel implementation leaves shep-smp and its consumers unchanged.
-//! Thread-per-core orchestration is subsequent.
+//! Native per-core runtimes and SMP orchestration: tasks, io_uring and timers.
+//! [`smp`] adds worker threads and cross-core execution without application state.
 //!
 //! - [`rt`]: the runtime owning tasks, timers and the I/O driver.
 //! - [`task`]: local tasks, [`spawn`] and task IDs.
@@ -31,11 +30,13 @@ pub mod fs;
 pub mod io;
 pub mod net;
 pub mod rt;
+pub mod smp;
 pub mod task;
 pub mod time;
 
 pub use fs::File;
 pub use io::{Buffer, Io};
 pub use rt::{Config, Handle, Runtime};
+pub use smp::{CoreId, Smp, SmpConfig, SmpError, current_core};
 pub use task::{JoinError, JoinHandle, spawn};
 pub use time::{sleep, sleep_until, timeout};

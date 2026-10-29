@@ -1,4 +1,4 @@
-//! The single scoped thread-local that tracks the entered runtime.
+//! The single thread-local for worker identity and scoped runtime execution.
 //!
 //! A thread enters at most one runtime at a time; entering never nests, so a
 //! guard only clears what it installed. Readers must not run user code, wake
@@ -10,12 +10,15 @@ use std::marker::PhantomData;
 use std::rc::Rc;
 
 use super::{Handle, scheduler::Core};
-use crate::task::TaskId;
+use crate::{smp::CoreId, task::TaskId};
 
 struct Context {
+    /// Worker identity spans runtime construction, execution and destruction.
+    core_id: Cell<Option<CoreId>>,
     /// The runtime entered on this thread.
     current: RefCell<Option<Handle>>,
     scheduler: RefCell<Option<Core>>,
+    smp: RefCell<Option<Rc<RefCell<crate::smp::transport::Shard>>>>,
     /// The task whose future is being polled or dropped.
     current_task_id: Cell<Option<TaskId>>,
 }
@@ -23,11 +26,51 @@ struct Context {
 thread_local! {
     static CONTEXT: Context = const {
         Context {
+            core_id: Cell::new(None),
             current: RefCell::new(None),
             scheduler: RefCell::new(None),
+            smp: RefCell::new(None),
             current_task_id: Cell::new(None),
         }
     };
+}
+
+/// Worker identity scope, independent of entered runtime/task scopes.
+#[must_use = "worker identity is restored when the guard is dropped"]
+pub(crate) struct CoreGuard {
+    previous: Option<CoreId>,
+    _local: PhantomData<Rc<()>>,
+}
+
+impl Drop for CoreGuard {
+    fn drop(&mut self) {
+        let _ = CONTEXT.try_with(|cx| cx.core_id.set(self.previous));
+    }
+}
+
+pub(crate) fn enter_core(core: CoreId) -> CoreGuard {
+    let previous = CONTEXT.with(|cx| cx.core_id.replace(Some(core)));
+    CoreGuard {
+        previous,
+        _local: PhantomData,
+    }
+}
+
+pub(crate) fn current_core() -> Option<CoreId> {
+    CONTEXT.try_with(|cx| cx.core_id.get()).ok().flatten()
+}
+
+pub(crate) fn smp() -> Option<Rc<RefCell<crate::smp::transport::Shard>>> {
+    CONTEXT
+        .try_with(|cx| cx.smp.borrow().clone())
+        .ok()
+        .flatten()
+}
+
+pub(crate) fn set_smp(shard: Option<Rc<RefCell<crate::smp::transport::Shard>>>) {
+    // Destructors can submit work; never drop the old transport under a TLS borrow.
+    let previous = CONTEXT.with(|cx| cx.smp.replace(shard));
+    drop(previous);
 }
 
 /// Runtime context for the current thread, cleared on drop or unwind.

@@ -1,13 +1,22 @@
 [package]
 name = "shep-smp2"
-description = "Native io_uring single-core runtime for Shep SMP: tasks, timers, I/O, files and TCP"
+description = "Native io_uring runtimes and SMP orchestration: tasks, timers, files and TCP"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
+
+[package.metadata.weft]
+# The three-shard overflow test completes 771 cross-shard calls plus replies;
+# its finite workload exceeds Weft's default 100,000 scheduling steps.
+max-steps = 500000
+
 [lints]
 workspace = true
 [dependencies]
+atomic-waker = "1.1"
+ringbuf = "0.5.3"
+core_affinity.workspace = true
 io-uring.workspace = true
 libc.workspace = true
 pin-project-lite.workspace = true
@@ -24,6 +33,10 @@ tokio = { version = "1", default-features = false, features = ["sync", "rt"] }
 
 [[bench]]
 name = "runtime"
+harness = false
+
+[[bench]]
+name = "smp"
 harness = false
 
 [[bench]]

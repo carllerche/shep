@@ -229,8 +229,10 @@ not a wall-clock latency threshold. Submission latency is a performance property
 these ownership assertions alone do not measure whether kernel submission blocks.
 
 Remaining steps before production migration include buffer-pool networking,
-filesystem resource close/flush APIs, filesystem metadata policy, thread-per-core
-startup/shutdown and submit_to, RPC integration, and shep-smp-io-scheduler2.
+filesystem resource close/flush APIs, filesystem metadata policy, RPC integration,
+and shep-smp-io-scheduler2. Native thread-per-core orchestration and `submit_to`
+are implemented in `shep_smp2::smp`; service lifecycle and consumer migration
+remain higher-level work.
 
 ## Operation ownership changes
 

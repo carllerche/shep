@@ -91,21 +91,42 @@ impl Driver {
     }
     /// Park only after checking runnable work on both sides of the notification
     /// handshake. Arming can run completion callbacks and register new timers.
-    pub(super) fn park_if_idle(&mut self, mut has_ready: impl FnMut() -> bool) -> io::Result<()> {
+    pub(super) fn park_if_idle(
+        &mut self,
+        idle: impl FnMut() -> (bool, Option<Instant>),
+    ) -> io::Result<()> {
+        if let Some((park, deadline)) = self.prepare_park_if_idle(idle)? {
+            park.wait(deadline)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn prepare_park_if_idle(
+        &mut self,
+        mut idle: impl FnMut() -> (bool, Option<Instant>),
+    ) -> io::Result<Option<(Park<'_>, Option<Instant>)>> {
         self.timer.advance(crate::time::Instant::now());
-        if has_ready() || self.driver.has_pending() {
-            return Ok(());
+        if idle().0 || self.driver.has_pending() {
+            return Ok(None);
         }
         let park = self.prepare_park()?;
         park.reactor.timer.advance(crate::time::Instant::now());
-        let deadline = park.reactor.timer.next_wake();
         // Must follow PARKING: synchronize inbox publication or retain an
         // eventfd notification from a producer racing this final check.
-        if has_ready() || park.reactor.driver.has_pending() {
-            return Ok(());
+        let (ready, retry) = idle();
+        if ready || park.reactor.driver.has_pending() {
+            return Ok(None);
         }
-        park.wait(deadline)?;
-        Ok(())
+        // The final readiness check may execute transport commands and register
+        // timers. Read both deadlines after it, and honor whichever is earlier.
+        let deadline = park
+            .reactor
+            .timer
+            .next_wake()
+            .into_iter()
+            .chain(retry)
+            .min();
+        Ok(Some((park, deadline)))
     }
 
     pub fn shutdown(&mut self) -> io::Result<()> {
@@ -200,7 +221,7 @@ mod tests {
         reactor
             .park_if_idle(|| {
                 checks += 1;
-                checks == 2
+                (checks == 2, None)
             })
             .unwrap();
         assert_eq!(checks, 2, "work appeared after the parking handshake");
