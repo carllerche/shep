@@ -1,7 +1,7 @@
 //! The runtime's I/O driver and parking policy over ordinary PollAdd/Cancel operations.
 #![forbid(unsafe_code)]
 use super::event;
-use crate::io::{Driver as IoDriver, Io, Operation, OperationHandle, WaitOutcome};
+use crate::io::{Driver as IoDriver, Io, Op, Operation, WaitOutcome};
 pub use event::WakeHandle;
 use std::{io, sync::Arc, time::Instant};
 
@@ -9,7 +9,7 @@ pub struct Driver {
     driver: IoDriver,
     pub(super) timer: crate::time::Timer,
     pub(super) event: Option<Arc<event::Event>>,
-    watch: Option<OperationHandle>,
+    watch: Option<Op<Operation>>,
     event_fd: Option<std::rc::Rc<crate::io::Fd>>,
     closed: bool,
 }

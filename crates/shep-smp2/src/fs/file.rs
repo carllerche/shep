@@ -1,14 +1,13 @@
-use crate::fs::{Buffer, pending::finish};
-use crate::io::support::activity::{Activity, Guard};
-use crate::io::{Completion, Fd, Io, Operation, OperationHandle, Rejected, Value};
-use std::{io, rc::Rc, sync::Arc};
+use crate::fs::Buffer;
+use crate::io::{Fallocate, Fd, Fsync, Ftruncate, Io, ReadAt, Value, WriteAt};
+use std::{io, rc::Rc};
 
 struct FileInner {
     descriptor: Rc<Fd>,
-    activity: Arc<Activity>,
     alignment: usize,
 }
-/// File clones share descriptor ownership and one close gate.
+/// File clones share descriptor ownership. Higher layers coordinate admission,
+/// concurrent work, and shutdown; each operation owns its kernel resources.
 #[derive(Clone)]
 pub struct File {
     io: Io,
@@ -20,7 +19,6 @@ impl File {
             io,
             inner: Rc::new(FileInner {
                 descriptor: file,
-                activity: Arc::default(),
                 alignment,
             }),
         }
@@ -28,128 +26,110 @@ impl File {
     pub fn alignment(&self) -> usize {
         self.inner.alignment
     }
-    fn begin(&self) -> io::Result<Guard> {
-        self.inner.activity.begin()
-    }
-    fn submit_buffer(
-        &self,
-        buffer: Buffer,
-        offset: u64,
-        write: bool,
-    ) -> Result<OperationHandle, Rejected> {
-        let file = self.inner.descriptor.clone();
-        let operation = if write {
-            Operation::WriteAt {
-                file,
-                buffer,
-                offset,
-            }
-        } else {
-            Operation::ReadAt {
-                file,
-                buffer,
-                offset,
-            }
-        };
-        let guards = match self.begin() {
-            Ok(guards) => guards,
-            Err(error) => return Err(Rejected { error, operation }),
-        };
-        let buffer = operation.buffer().unwrap();
+    fn validate_buffer(&self, buffer: &Buffer, offset: u64) -> io::Result<()> {
         let a = self.alignment();
         if !offset.is_multiple_of(a as u64)
             || !buffer.len().is_multiple_of(a)
             || !buffer.as_ptr().addr().is_multiple_of(a)
         {
-            return Err(Rejected {
-                error: io::ErrorKind::InvalidInput.into(),
-                operation,
-            });
+            return Err(io::ErrorKind::InvalidInput.into());
         }
-        self.io.push_with_guard(operation, guards)
+        Ok(())
     }
     pub async fn write_at(&self, buffer: Buffer, offset: u64) -> (io::Result<usize>, Buffer) {
-        self.finish_buffer(self.submit_buffer(buffer, offset, true))
-            .await
+        if let Err(error) = self.validate_buffer(&buffer, offset) {
+            return (Err(error), buffer);
+        }
+        let operation = WriteAt {
+            file: self.inner.descriptor.clone(),
+            buffer,
+            offset,
+        };
+        let op = match self.io.submit(operation) {
+            Ok(op) => op,
+            Err(rejected) => return (Err(rejected.error), rejected.operation.buffer),
+        };
+        let completion = op.await;
+        (
+            completion.result.map(Value::into_count),
+            completion.operation.buffer,
+        )
     }
     pub async fn read_at(&self, buffer: Buffer, offset: u64) -> (io::Result<usize>, Buffer) {
-        self.finish_buffer(self.submit_buffer(buffer, offset, false))
-            .await
-    }
-    async fn finish_buffer(
-        &self,
-        operation: Result<OperationHandle, Rejected>,
-    ) -> (io::Result<usize>, Buffer) {
-        match operation {
-            Ok(handle) => {
-                let Completion { result, operation } = finish(&self.io, handle).await;
-                (
-                    result.map(Value::into_count),
-                    operation.into_buffer().unwrap(),
-                )
-            }
-            Err(rejected) => (
-                Err(rejected.error),
-                rejected.operation.into_buffer().unwrap(),
-            ),
+        if let Err(error) = self.validate_buffer(&buffer, offset) {
+            return (Err(error), buffer);
         }
-    }
-    async fn execute(&self, make: impl FnOnce(Rc<Fd>) -> Operation) -> io::Result<()> {
-        let guard = self.begin()?;
-        let handle = self
-            .io
-            .push_with_guard(make(self.inner.descriptor.clone()), guard)
-            .map_err(|r| r.error)?;
-        finish(&self.io, handle).await.result.map(|_| ())
+        let operation = ReadAt {
+            file: self.inner.descriptor.clone(),
+            buffer,
+            offset,
+        };
+        let op = match self.io.submit(operation) {
+            Ok(op) => op,
+            Err(rejected) => return (Err(rejected.error), rejected.operation.buffer),
+        };
+        let completion = op.await;
+        (
+            completion.result.map(Value::into_count),
+            completion.operation.buffer,
+        )
     }
     pub async fn sync_data(&self) -> io::Result<()> {
-        self.execute(|file| Operation::Fsync {
-            file,
-            data_only: true,
-        })
-        .await
+        self.io
+            .submit(Fsync {
+                file: self.inner.descriptor.clone(),
+                data_only: true,
+            })
+            .map_err(|r| r.error)?
+            .await
+            .result
+            .map(|_| ())
     }
     pub async fn sync_all(&self) -> io::Result<()> {
-        self.execute(|file| Operation::Fsync {
-            file,
-            data_only: false,
-        })
-        .await
+        self.io
+            .submit(Fsync {
+                file: self.inner.descriptor.clone(),
+                data_only: false,
+            })
+            .map_err(|r| r.error)?
+            .await
+            .result
+            .map(|_| ())
     }
     /// Reserve space without extending logical length. Exclude conflicting operations.
     pub async fn allocate(&self, offset: u64, len: u64) -> io::Result<()> {
-        self.execute(|file| Operation::Fallocate {
-            file,
-            offset,
-            len,
-            mode: libc::FALLOC_FL_KEEP_SIZE,
-        })
-        .await
+        self.io
+            .submit(Fallocate {
+                file: self.inner.descriptor.clone(),
+                offset,
+                len,
+                mode: libc::FALLOC_FL_KEEP_SIZE,
+            })
+            .map_err(|r| r.error)?
+            .await
+            .result
+            .map(|_| ())
     }
     pub async fn set_len(&self, len: u64) -> io::Result<()> {
-        self.execute(|file| Operation::Ftruncate { file, len })
+        self.io
+            .submit(Ftruncate {
+                file: self.inner.descriptor.clone(),
+                len,
+            })
+            .map_err(|r| r.error)?
             .await
+            .result
+            .map(|_| ())
     }
     pub async fn len(&self) -> io::Result<u64> {
-        let guard = self.begin()?;
         let file = self.inner.descriptor.as_file().try_clone()?;
         self.io
             .shared
             .worker
-            .run(move || {
-                let _guard = guard;
-                Ok(file.metadata()?.len())
-            })?
+            .run(move || Ok(file.metadata()?.len()))?
             .await
     }
     pub async fn is_empty(&self) -> io::Result<bool> {
         Ok(self.len().await? == 0)
-    }
-    /// Stop admission through all clones and await accepted work, including
-    /// operations whose futures were dropped. Does not sync or close the descriptor.
-    /// Canceling an admitted shutdown leaves the shared gate closed.
-    pub async fn shutdown(&self) {
-        self.inner.activity.close();
-        self.inner.activity.idle().await;
     }
 }

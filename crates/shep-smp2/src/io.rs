@@ -13,9 +13,9 @@
 //! and reaping available completions when the bounded submission queue is full.
 //! Tracking grows independently of SQ capacity; no software pending queue is used.
 //! [`Driver::submit`] submits a batch; [`Driver::tick`] retires CQEs and delivers notifications.
-//! [`OperationHandle::poll_complete`] observes an operation's shared lifecycle.
-//! Handles contain only a packed ID. Pass the allocating Io to complete or
-//! explicitly release them; adapters release dropped futures with borrowed guards.
+//! [`Op::poll_complete`] observes an operation's shared lifecycle.
+//! Typed [`Op`] owners retain inputs and can be awaited directly. Drop abandons
+//! a result, boxing inputs only while the kernel still needs them.
 //! Cancel operations also retain their target identity until their CQE retires.
 //! ```compile_fail
 //! fn send<T: Send>() {}
@@ -39,6 +39,7 @@ pub use buffer::Buffer;
 pub use driver::{Driver, WaitOutcome};
 pub use fd::Fd;
 pub use operation::{
-    CancelTarget, Close, Completion, Operation, OperationHandle, SocketAddress, Value,
+    CancelTarget, Close, Completion, Fallocate, Fsync, Ftruncate, Op, Operation, OperationData,
+    ReadAt, SocketAddress, Value, WriteAt,
 };
 pub use producer::{Io, Rejected};

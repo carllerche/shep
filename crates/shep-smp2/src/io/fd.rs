@@ -58,20 +58,8 @@ impl Fd {
     /// completes the CLOSE, including during shutdown. Flush errors are returned
     /// without retrying a descriptor number that may already have been reused.
     pub async fn close(self, io: &crate::io::Io) -> io::Result<()> {
-        struct Pending<'a> {
-            io: &'a crate::io::Io,
-            handle: crate::io::OperationHandle,
-        }
-        impl Drop for Pending<'_> {
-            fn drop(&mut self) {
-                self.handle.release(self.io);
-            }
-        }
-        let handle = io
-            .push(crate::io::Operation::close(self))
-            .map_err(|rejected| rejected.error)?;
-        let mut pending = Pending { io, handle };
-        std::future::poll_fn(|cx| pending.handle.poll_complete(io, cx))
+        io.push(crate::io::Operation::close(self))
+            .map_err(|rejected| rejected.error)?
             .await
             .result
             .map(|_| ())

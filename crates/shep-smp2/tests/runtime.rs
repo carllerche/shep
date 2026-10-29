@@ -285,7 +285,6 @@ fn filesystem_metadata_worker_wakes_native_runtime_and_shutdown_drains_files() {
             file.sync_data().await.unwrap();
             shep_smp2::fs::sync_dir(&path).await.unwrap();
             assert_eq!(shep_smp2::fs::read_dir(&path).await.unwrap().len(), 1);
-            file.shutdown().await;
         })
         .unwrap();
     runtime.shutdown().unwrap();

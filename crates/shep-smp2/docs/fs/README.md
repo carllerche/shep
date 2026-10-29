@@ -23,7 +23,6 @@ runtime.block_on(async {
     // Await writes before syncing their durability.
     file.sync_data().await?;
     fs::sync_dir("data").await?;
-    file.shutdown().await;
     Ok::<(), std::io::Error>(())
 })??;
 # Ok::<(), std::io::Error>(())
@@ -32,8 +31,7 @@ runtime.block_on(async {
 ## File contract
 
 `File` provides positional reads/writes, data/full sync, allocation without length
-extension, truncation, and length queries. Clones share the descriptor and one
-admission gate. Independent requests may run concurrently and have no implicit
+extension, truncation, and length queries. Clones share the descriptor. Independent requests may run concurrently and have no implicit
 ordering; callers exclude conflicting mutations.
 
 Transfers own their `Buffer` and return `(Result<usize>, Buffer)`, including on
@@ -68,18 +66,18 @@ syncing it, renaming it, then syncing the containing directory. Submission order
 alone is not a durability dependency. Renaming between directories may require
 syncing both directories.
 
-`File::shutdown(&self)` stops admission through all clones and waits for accepted
-operations, including those whose futures were dropped. It returns `()`, does not
-sync, and does not await descriptor closure. Canceling a polled shutdown leaves
-the shared gate closed; another shutdown can finish waiting. Clones and retained
-completion results keep the descriptor alive until dropped. The runtime must
-continue driving completions while shutdown waits.
+File has no shutdown gate or completion activity accounting. Higher layers stop
+new work and join their outstanding operations before closing resources or the
+runtime. Dropping a file future abandons its result, retaining kernel-accessed
+inputs until terminal completion. It does not cancel the operation or disable
+other clones. Completed inputs/results can be destroyed even while cancellation
+pins retain their identities.
 
 `Io::close` stops admission for kernel and worker jobs. Driver drain finishes
 accepted kernel work and joins the worker, including abandoned jobs. Runtime
 shutdown uses the same teardown. Driver destruction also joins the worker as a
 fallback, which can block until accepted jobs finish. Storage should finish its
-transactions and shut down its files before runtime shutdown. There is no
+transactions and await its outstanding work before runtime shutdown. There is no
 separate filesystem shutdown scope.
 
 Scheduling, appender buffering, and transaction-level drain remain the

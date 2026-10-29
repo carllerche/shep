@@ -157,30 +157,28 @@ fn pressure_callbacks_finish_before_the_new_operation_is_published() {
     let io = driver.io().clone();
     let called = Rc::new(Cell::new(false));
     let drops = Rc::new(Cell::new(0));
-    let mut first = io
-        .push_with_guard(
-            Operation::Nop,
-            Reenter {
-                io: io.clone(),
-                called: called.clone(),
-            },
-        )
-        .unwrap();
+    let mut first = on_complete(
+        &io,
+        Operation::Nop,
+        Reenter {
+            io: io.clone(),
+            called: called.clone(),
+        },
+    )
+    .unwrap();
     // Make its CQE available without reaping, then fill the SQ.
     driver.submit_and_wait(None).unwrap();
     let mut filler = io.push(Operation::Nop).unwrap();
-    let mut guarded = io
-        .push_with_guard(Operation::Nop, Count(drops.clone()))
-        .unwrap();
+    let mut newest = on_complete(&io, Operation::Nop, Count(drops.clone())).unwrap();
     assert!(called.get());
-    assert_eq!(drops.get(), 0, "new guard is still awaiting completion");
+    assert_eq!(drops.get(), 0, "new waiter is still awaiting completion");
     assert!(
-        guarded.try_complete(&io).is_none(),
+        newest.try_complete(&io).is_none(),
         "no reaping after publication"
     );
     driver.drain().unwrap();
     assert_eq!(drops.get(), 1);
-    for handle in [&mut first, &mut filler, &mut guarded] {
+    for handle in [&mut first, &mut filler, &mut newest] {
         handle.try_complete(&io).unwrap().result.unwrap();
     }
 }
@@ -258,9 +256,7 @@ fn pressure_callback_closing_admission_rejects_the_unpublished_request() {
     }
     let mut driver = Driver::new(1).unwrap();
     let io = driver.io().clone();
-    let mut first = io
-        .push_with_guard(Operation::Nop, CloseAdmission(io.clone()))
-        .unwrap();
+    let mut first = on_complete(&io, Operation::Nop, CloseAdmission(io.clone())).unwrap();
     driver.submit_and_wait(None).unwrap();
     let mut filler = io.push(Operation::Nop).unwrap();
     let file = Rc::new(Fd::new(tempfile::tempfile().unwrap()).unwrap());
@@ -289,7 +285,7 @@ fn complete_nops(io: &Io, count: usize) {
 }
 
 #[test]
-fn tick_delivers_each_guard_before_retiring_the_next_cqe() {
+fn tick_delivers_each_waiter_before_retiring_the_next_cqe() {
     struct Observe {
         io: Io,
         observations: Rc<RefCell<Vec<usize>>>,
@@ -304,7 +300,8 @@ fn tick_delivers_each_guard_before_retiring_the_next_cqe() {
     let observations = Rc::new(RefCell::new(Vec::new()));
     let mut handles: Vec<_> = (0..2)
         .map(|_| {
-            io.push_with_guard(
+            on_complete(
+                &io,
                 Operation::Nop,
                 Observe {
                     io: io.clone(),
@@ -338,7 +335,8 @@ fn nested_tick_consumes_remaining_cqes_without_duplicate_retirement() {
     let nested = Rc::new(Cell::new(0));
     let mut handles: Vec<_> = (0..2)
         .map(|_| {
-            io.push_with_guard(
+            on_complete(
+                &io,
                 Operation::Nop,
                 Reenter {
                     io: io.clone(),
@@ -370,10 +368,7 @@ fn tick_rechecks_ring_after_a_callback_destroys_the_driver() {
     let io = driver.io().clone();
     let owner = Rc::new(RefCell::new(Some(driver)));
     let mut handles: Vec<_> = (0..2)
-        .map(|_| {
-            io.push_with_guard(Operation::Nop, Destroy(owner.clone()))
-                .unwrap()
-        })
+        .map(|_| on_complete(&io, Operation::Nop, Destroy(owner.clone())).unwrap())
         .collect();
     complete_nops(&io, 2);
     // Use the shared driving path, as publication does; no borrow of the owner
@@ -394,7 +389,7 @@ fn tick_rechecks_ring_after_a_callback_destroys_the_driver() {
 fn tick_budget_excludes_work_published_by_its_callback() {
     struct Refill {
         io: Io,
-        next: Rc<RefCell<Option<OperationHandle>>>,
+        next: Rc<RefCell<Option<Op<Operation>>>>,
     }
     impl Drop for Refill {
         fn drop(&mut self) {
@@ -406,15 +401,15 @@ fn tick_budget_excludes_work_published_by_its_callback() {
     let mut driver = Driver::new(1).unwrap();
     let io = driver.io().clone();
     let next = Rc::new(RefCell::new(None));
-    let mut first = io
-        .push_with_guard(
-            Operation::Nop,
-            Refill {
-                io: io.clone(),
-                next: next.clone(),
-            },
-        )
-        .unwrap();
+    let mut first = on_complete(
+        &io,
+        Operation::Nop,
+        Refill {
+            io: io.clone(),
+            next: next.clone(),
+        },
+    )
+    .unwrap();
     complete_nops(&io, 1);
     assert_eq!(driver.tick(), 1);
     first.try_complete(&io).unwrap().result.unwrap();
@@ -423,4 +418,78 @@ fn tick_budget_excludes_work_published_by_its_callback() {
     assert!(next.try_complete(&io).is_none());
     assert_eq!(driver.tick(), 1);
     next.try_complete(&io).unwrap().result.unwrap();
+}
+
+// Exercise callbacks through the supported waiter API, not completion guards.
+fn on_complete<G: 'static>(io: &Io, operation: Operation, callback: G) -> Result<Op, Rejected> {
+    type Callback = Option<Box<dyn FnOnce()>>;
+    thread_local! {
+        static CALLBACKS: RefCell<Vec<Callback>> = RefCell::default();
+    }
+    struct Notify(usize);
+    impl std::task::Wake for Notify {
+        fn wake(self: std::sync::Arc<Self>) {
+            let callback = CALLBACKS.with(|callbacks| callbacks.borrow_mut()[self.0].take());
+            if let Some(callback) = callback {
+                callback();
+            }
+        }
+    }
+    let mut op = io.push(operation)?;
+    let index = CALLBACKS.with(|callbacks| {
+        let mut callbacks = callbacks.borrow_mut();
+        let index = callbacks.len();
+        callbacks.push(Some(Box::new(move || drop(callback))));
+        index
+    });
+    let wake = Waker::from(std::sync::Arc::new(Notify(index)));
+    assert!(
+        op.poll_complete(io, &mut Context::from_waker(&wake))
+            .is_pending()
+    );
+    Ok(op)
+}
+
+#[test]
+fn dropping_replaced_waker_can_reap_the_operation_before_poll_returns() {
+    thread_local! {
+        static CALLBACK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::default();
+    }
+    struct ReenterOnDrop;
+    // This waker exists to exercise its destructor, not its wake method.
+    #[allow(clippy::manual_noop_waker)]
+    impl std::task::Wake for ReenterOnDrop {
+        fn wake(self: std::sync::Arc<Self>) {}
+    }
+    impl Drop for ReenterOnDrop {
+        fn drop(&mut self) {
+            let callback = CALLBACK.with(|slot| slot.borrow_mut().take());
+            if let Some(callback) = callback {
+                callback();
+            }
+        }
+    }
+    let driver = Driver::new(1).unwrap();
+    let io = driver.io().clone();
+    let mut op = io.push(Operation::Nop).unwrap();
+    let callback_io = io.clone();
+    CALLBACK.with(|slot| {
+        *slot.borrow_mut() = Some(Box::new(move || {
+            assert_eq!(callback_io.shared.tick(), 1);
+        }))
+    });
+    let waker = Waker::from(std::sync::Arc::new(ReenterOnDrop));
+    assert!(
+        op.poll_complete(&io, &mut Context::from_waker(&waker))
+            .is_pending()
+    );
+    drop(waker); // the arena now holds the final reference
+    complete_nops(&io, 1);
+    // Replacement drops the old waker outside the borrow; its Drop reaps this
+    // operation. The post-callback recheck must observe that completion.
+    assert!(
+        op.poll_complete(&io, &mut Context::from_waker(Waker::noop()))
+            .is_ready()
+    );
+    assert_eq!(io.in_flight(), 0);
 }

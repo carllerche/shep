@@ -3,16 +3,14 @@
 //! Transfers own their buffers and expose short results. A full submission queue
 //! triggers bounded progress; stalled publication returns WouldBlock. Namespace and metadata helpers use a bounded worker, never the
 //! core thread. Callers order writes, syncs and directory syncs explicitly.
-//! File shutdown waits for accepted work, including abandoned result waiters; it
-//! does not flush appender buffers or imply durability. The runtime must keep
-//! driving the I/O driver while these futures wait.
+//! Higher layers coordinate admission and shutdown. Each operation retains its
+//! kernel resources, including when its future is abandoned.
 #![forbid(unsafe_code)]
 #![doc = include_str!("../docs/fs/README.md")]
 
 mod file;
 mod filesystem;
 mod open_options;
-mod pending;
 
 pub use crate::io::Buffer;
 pub use file::File;

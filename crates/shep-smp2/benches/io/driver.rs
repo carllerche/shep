@@ -1,7 +1,7 @@
 //! Driver costs without executor/task allocations or an admission backlog.
 #![forbid(unsafe_code)]
 use criterion::{BenchmarkId, Criterion, Throughput};
-use shep_smp2::io::{Buffer, Driver, Fd, Operation};
+use shep_smp2::io::{Buffer, Driver, Fd, Operation, WriteAt};
 use std::{hint::black_box, time::Duration};
 
 fn retire(driver: &mut Driver) {
@@ -56,7 +56,8 @@ fn main() {
                 for (offset, buffer) in buffers.drain(..).enumerate() {
                     handles.push(
                         driver
-                            .push(Operation::WriteAt {
+                            .io()
+                            .submit(WriteAt {
                                 file: file.clone(),
                                 buffer,
                                 offset: (offset * 4096) as u64,
@@ -68,7 +69,7 @@ fn main() {
                 for mut handle in handles.drain(..) {
                     let completion = handle.try_complete(driver.io()).unwrap();
                     assert_eq!(completion.result.unwrap().into_count(), 4096);
-                    buffers.push(black_box(completion.operation.into_buffer().unwrap()));
+                    buffers.push(black_box(completion.operation.buffer));
                 }
             });
         });
@@ -93,5 +94,53 @@ fn main() {
     });
     completed.try_complete(driver.io()).unwrap().result.unwrap();
     driver.drain().unwrap();
+    // Each iteration issues real cancellation SQEs against pending watches.
+    // Retain the same descriptor and vectors so abandonment boxing is included
+    // without per-iteration socket or vector creation.
+    let mut group = criterion.benchmark_group("driver/cancel_batch_256");
+    for abandon_percent in [0usize, 1, 10, 50, 100] {
+        let mut driver = Driver::new(512).unwrap();
+        let (socket, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let file = std::rc::Rc::new(Fd::new(socket).unwrap());
+        let mut owners = Vec::with_capacity(256);
+        group.throughput(Throughput::Elements(256));
+        group.bench_with_input(
+            BenchmarkId::from_parameter(abandon_percent),
+            &abandon_percent,
+            |bench, &percent| {
+                bench.iter(|| {
+                    for index in 0..256 {
+                        let owner = driver
+                            .push(Operation::PollAdd {
+                                file: file.clone(),
+                                events: libc::POLLIN as u32,
+                            })
+                            .unwrap();
+                        let target = owner.cancel_target(driver.io());
+                        drop(driver.push(Operation::Cancel(target)).unwrap());
+                        if index < 256 * percent / 100 {
+                            drop(owner);
+                        } else {
+                            owners.push(owner);
+                        }
+                    }
+                    retire(&mut driver);
+                    for mut owner in owners.drain(..) {
+                        assert_eq!(
+                            owner
+                                .try_complete(driver.io())
+                                .unwrap()
+                                .result
+                                .unwrap_err()
+                                .raw_os_error(),
+                            Some(libc::ECANCELED)
+                        );
+                    }
+                })
+            },
+        );
+        driver.drain().unwrap();
+    }
+    group.finish();
     criterion.final_summary();
 }

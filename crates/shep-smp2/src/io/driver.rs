@@ -1,8 +1,8 @@
 //! The unsafe SQ publication, ring-driving, and descriptor-adoption boundary.
 #![allow(unsafe_code)]
 use crate::io::{
-    Fd, Io, Operation, OperationHandle, Rejected, Value,
-    arena::{Arena, OperationId, Record},
+    Fd, Io, Op, Operation, Rejected, Value,
+    arena::{Arena, Kind, OperationId, Retired},
 };
 use io_uring::{IoUring, opcode, types};
 use std::{
@@ -53,24 +53,11 @@ impl DriverId {
     }
 }
 
-/// Effects of one terminal CQE, delivered only after releasing driver state.
-#[derive(Default)]
-struct CompletionEffects {
-    wake: Option<Waker>,
-    guard: Option<Box<dyn std::any::Any>>,
-    discarded: [Option<Record>; 2],
-}
-impl CompletionEffects {
+impl Retired {
     fn deliver(self) {
-        let Self {
-            wake,
-            guard,
-            discarded,
-        } = self;
-        drop(discarded);
-        if let Some(guard) = guard {
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(guard)));
-        }
+        let Self { wake, data, result } = self;
+        drop(data);
+        drop(result);
         if let Some(waker) = wake {
             wake_safely(waker);
         }
@@ -80,27 +67,19 @@ fn wake_safely(waker: Waker) {
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| waker.wake()));
 }
 
-/// Teardown alone defers notifications until all kernel access has ended.
+/// Teardown defers waiter callbacks until every kernel request has retired.
 #[derive(Default)]
 struct ShutdownNotifications {
     wakes: Vec<Waker>,
-    guards: Vec<Box<dyn std::any::Any>>,
 }
 impl ShutdownNotifications {
-    fn defer(&mut self, effects: CompletionEffects) {
-        let CompletionEffects {
-            wake,
-            guard,
-            discarded,
-        } = effects;
-        drop(discarded);
+    fn defer(&mut self, effects: Retired) {
+        let Retired { wake, data, result } = effects;
+        drop(data);
+        drop(result);
         self.wakes.extend(wake);
-        self.guards.extend(guard);
     }
     fn deliver(self) {
-        for guard in self.guards {
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(guard)));
-        }
         for wake in self.wakes {
             wake_safely(wake);
         }
@@ -138,7 +117,7 @@ impl SubmitFault {
             0
         } else {
             // SAFETY: Only already-published SQEs are submitted; no wait, flags,
-            // or argument pointers. Their inputs remain owned by the arena.
+            // or argument pointers. Their owners or abandonment boxes retain their inputs.
             unsafe {
                 ring.submitter()
                     .enter::<libc::sigset_t>(count, 0, 0, None)?
@@ -154,7 +133,10 @@ impl SubmitFault {
 impl Shared {
     /// Make room before publishing, as in Monoio's submit_with_data path.
     /// Unlike Monoio's retry loop, progress attempts here are bounded.
-    pub(crate) fn push(&self, mut operation: Operation) -> Result<OperationHandle, Rejected> {
+    pub(crate) fn push(
+        &self,
+        mut operation: Operation,
+    ) -> Result<(OperationId, Operation), Rejected> {
         for attempt in 0..=2 {
             match self.try_publish(operation) {
                 Ok(handle) => return Ok(handle),
@@ -175,8 +157,8 @@ impl Shared {
     }
 
     /// No callbacks, submission, or reaping after successful publication. This
-    /// lets adapters attach completion guards immediately after push returns.
-    fn try_publish(&self, operation: Operation) -> Result<OperationHandle, Rejected> {
+    /// ensures the returned owner is established before any completion callback.
+    fn try_publish(&self, mut operation: Operation) -> Result<(OperationId, Operation), Rejected> {
         let mut state = match self.state.try_borrow_mut() {
             Ok(state) => state,
             Err(_) => {
@@ -193,8 +175,8 @@ impl Shared {
                 error: io::ErrorKind::BrokenPipe.into(),
             });
         };
-        if let Err(error) =
-            validate(&operation, self, arena).and_then(|()| arena.check_admission(&operation))
+        if let Err(error) = validate(&operation, self, arena)
+            .and_then(|()| arena.check_admission(operation.is_cancel()))
         {
             return Err(Rejected { operation, error });
         }
@@ -204,21 +186,42 @@ impl Shared {
                 error: io::ErrorKind::WouldBlock.into(),
             });
         }
-        let id = arena.insert(operation)?;
-        let operation = arena.record(id).operation.as_mut().unwrap();
-        let entry = entry(operation).user_data(id.raw());
-        // SAFETY: Stable owned inputs reside in the arena until terminal CQE.
-        // The SQ has space and no callback can consume it between check and push.
-        // Keep rollback defensive: a failed push has published nothing.
+        let kind = kind(&operation);
+        let retain_data = !matches!(
+            operation,
+            Operation::Nop | Operation::Close(_) | Operation::Socket { .. } | Operation::Cancel(_)
+        );
+        let id = match arena.insert(kind, retain_data) {
+            Ok(id) => id,
+            Err(error) => return Err(Rejected { operation, error }),
+        };
+        let entry = entry(&mut operation).user_data(id.raw());
+        // SAFETY: Only stable backing allocations are referenced. The returned
+        // owner retains inputs, transferring them to the arena if abandoned.
+        // No callbacks or fallible work occur after successful publication.
         if unsafe { ring.submission().push(&entry) }.is_err() {
-            return Err(arena.reject(id, io::ErrorKind::WouldBlock.into()));
+            arena.reject(id);
+            return Err(Rejected {
+                operation,
+                error: io::ErrorKind::WouldBlock.into(),
+            });
         }
-        if let Operation::Close(close) = operation {
-            // Transfer exactly once, only after publication. A CLOSE error may
-            // follow removal/reuse of this descriptor number.
-            let _ = close.file.take().unwrap().into_raw_fd();
-        }
-        Ok(OperationHandle::new(id))
+        let retired_io = match &mut operation {
+            Operation::Close(close) => {
+                let _ = close.file.take().unwrap().into_raw_fd();
+                None
+            }
+            Operation::Cancel(target) => {
+                arena.record(id).dependency = Some(target.id());
+                target.disarm()
+            }
+            _ => None,
+        };
+        drop(state);
+        // The caller's Io keeps Shared alive, so releasing this redundant clone
+        // cannot run user destruction or reap between publication and return.
+        drop(retired_io);
+        Ok((id, operation))
     }
 
     /// Make progress before publication, with no callbacks under state borrows.
@@ -256,10 +259,10 @@ impl Shared {
     /// Process at most the CQ length observed on entry. Callbacks may reenter,
     /// consume remaining CQEs, publish more work, or destroy the owning driver.
     fn tick(&self) -> usize {
-        self.tick_with(CompletionEffects::deliver)
+        self.tick_with(Retired::deliver)
     }
 
-    fn tick_with(&self, mut deliver: impl FnMut(CompletionEffects)) -> usize {
+    fn tick_with(&self, mut deliver: impl FnMut(Retired)) -> usize {
         let budget = self
             .state
             .borrow_mut()
@@ -300,7 +303,7 @@ impl Shared {
 
 impl IoState {
     #[inline]
-    fn retire_one(&mut self, owner: DriverId) -> Option<CompletionEffects> {
+    fn retire_one(&mut self, owner: DriverId) -> Option<Retired> {
         // Drop the CQ view to publish its consumed head before any callback.
         let cqe = self.ring.as_mut()?.completion().next()?;
         if cqe.user_data() == SHUTDOWN_CANCEL {
@@ -315,7 +318,7 @@ impl IoState {
                 result == 0 || result == -libc::ENOENT || result == -libc::EALREADY,
                 "shutdown cancellation failed: {result}"
             );
-            return Some(CompletionEffects::default());
+            return Some(Retired::default());
         }
         let id = OperationId::from_raw(cqe.user_data());
         id.check(owner);
@@ -326,20 +329,13 @@ impl IoState {
             "unsupported nonterminal CQE"
         );
         let record = self.arena.record(id);
-        let operation = record.operation.as_mut().expect("kernel-owned operation");
-        let dependency = match operation {
-            Operation::Cancel(target) => target.disarm(),
-            _ => None,
-        };
-        let result = value(operation, cqe.result());
-        let guard = record.completion_guard.take();
-        let (wake, released) = self.arena.complete(id, result);
-        let target = dependency.and_then(|target| self.arena.unpin(target));
-        Some(CompletionEffects {
-            wake,
-            guard,
-            discarded: [released, target],
-        })
+        let dependency = record.dependency.take();
+        let result = value(record.kind, cqe.result());
+        let effects = self.arena.complete(id, result);
+        if let Some(target) = dependency {
+            self.arena.unpin(target);
+        }
+        Some(effects)
     }
 }
 
@@ -396,7 +392,7 @@ impl Driver {
         &self.io
     }
     /// Publish through [`Io::push`], with the same admission and lifecycle rules.
-    pub fn push(&self, operation: Operation) -> Result<OperationHandle, Rejected> {
+    pub fn push(&self, operation: Operation) -> Result<Op, Rejected> {
         self.io.push(operation)
     }
     /// Count requests awaiting their original CQEs; see [`Io::in_flight`].
@@ -646,10 +642,7 @@ fn validate(operation: &Operation, shared: &Shared, arena: &mut Arena) -> io::Re
         ));
     }
     if let Operation::Cancel(target) = operation
-        && matches!(
-            arena.record(target.id()).operation,
-            Some(Operation::Close(_))
-        )
+        && matches!(arena.record(target.id()).kind, Kind::Close)
     {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
@@ -786,26 +779,38 @@ fn entry(operation: &mut Operation) -> io_uring::squeue::Entry {
 }
 /// Translate a terminal CQE into a typed result, adopting successful fresh fds
 /// even when the submitter abandoned interest. Does not update the arena itself.
-fn value(operation: &Operation, result: i32) -> io::Result<Value> {
+fn value(kind: Kind, result: i32) -> io::Result<Value> {
     if result < 0 {
         return Err(io::Error::from_raw_os_error(-result));
     }
-    Ok(match operation {
-        Operation::OpenAt { .. } | Operation::Socket { .. } | Operation::Accept { .. } => {
-            // SAFETY: These constructors return a fresh, exclusively owned fd on
-            // success, never an io_uring instance. Adopt it without revalidation
-            // even for ignored operations so it cannot leak.
+    Ok(match kind {
+        Kind::File => {
+            // SAFETY: Descriptor-producing opcodes return fresh exclusive fds.
+            // Adopt even ignored results so successful abandoned opens cannot leak.
             Value::File(unsafe { Fd::from_owned_fd_unchecked(OwnedFd::from_raw_fd(result)) })
+        }
+        Kind::Count => Value::Count(result as usize),
+        Kind::Poll => Value::Poll(result as u32),
+        _ => Value::Done,
+    })
+}
+fn kind(operation: &Operation) -> Kind {
+    match operation {
+        Operation::OpenAt { .. } | Operation::Socket { .. } | Operation::Accept { .. } => {
+            Kind::File
         }
         Operation::ReadAt { .. }
         | Operation::WriteAt { .. }
         | Operation::Send { .. }
         | Operation::SendRange { .. }
-        | Operation::Recv { .. } => Value::Count(result as usize),
-        Operation::PollAdd { .. } => Value::Poll(result as u32),
-        _ => Value::Done,
-    })
+        | Operation::Recv { .. } => Kind::Count,
+        Operation::PollAdd { .. } => Kind::Poll,
+        Operation::Close(_) => Kind::Close,
+        Operation::Cancel(_) => Kind::Cancel,
+        _ => Kind::Done,
+    }
 }
+
 #[cfg(test)]
 mod tests {
     #![forbid(unsafe_code)]

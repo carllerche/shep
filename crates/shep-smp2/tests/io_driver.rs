@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 #![cfg(not(miri))]
-use shep_smp2::io::{Buffer, Completion, Driver, Fd, Operation, OperationHandle, Value};
+use shep_smp2::io::{Buffer, Completion, Driver, Fd, Op, Operation, Value};
 use std::{
     ffi::CString,
     fs::{File, OpenOptions},
@@ -11,7 +11,7 @@ use std::{
     task::{Context, Waker},
 };
 
-fn finish(driver: &mut Driver, handle: &mut OperationHandle) -> Completion {
+fn finish(driver: &mut Driver, handle: &mut Op<Operation>) -> Completion {
     loop {
         driver.tick();
         if let Some(done) = handle.try_complete(driver.io()) {
@@ -730,9 +730,9 @@ fn close_rejects_cancellation_and_finishes_during_teardown() {
 }
 
 #[test]
-fn handle_is_one_word_and_wrong_io_never_accesses_a_matching_slab_slot() {
+fn owning_handle_rejects_wrong_io_before_accessing_a_matching_slot() {
     use std::panic::{AssertUnwindSafe, catch_unwind};
-    assert_eq!(size_of::<OperationHandle>(), size_of::<u64>());
+    assert_eq!(size_of::<Op<Operation>>(), 88);
     let mut first = Driver::new(1).unwrap();
     let mut other = Driver::new(1).unwrap();
     let mut a = first.push(Operation::Nop).unwrap();
@@ -777,7 +777,7 @@ fn release_is_idempotent_and_keeps_kernel_resources_until_reaping() {
 }
 
 #[test]
-fn handles_do_not_keep_the_driver_alive_and_new_drivers_reject_old_ids() {
+fn owners_retain_completed_inputs_after_driver_drop_and_reject_foreign_io() {
     use std::panic::{AssertUnwindSafe, catch_unwind};
     let mut driver = Driver::new(1).unwrap();
     let file = std::rc::Rc::new(Fd::new(tempfile::tempfile().unwrap()).unwrap());
@@ -793,15 +793,16 @@ fn handles_do_not_keep_the_driver_alive_and_new_drivers_reject_old_ids() {
         .push(Operation::Cancel(handle.cancel_target(driver.io())))
         .unwrap();
     driver.drain().unwrap();
-    // A forgotten submitter claim retains its result until Io destruction;
-    // the handle itself owns no Io reference and cannot keep that result alive.
+    // The owner retains its inputs and shared completion state after ring teardown.
     drop(driver);
-    assert!(weak.upgrade().is_none());
+    assert!(weak.upgrade().is_some());
     let mut driver = Driver::new(1).unwrap();
     let mut current = driver.push(Operation::Nop).unwrap();
     assert!(catch_unwind(AssertUnwindSafe(|| handle.try_complete(driver.io()))).is_err());
     finish(&mut driver, &mut current).result.unwrap();
     driver.drain().unwrap();
+    drop(handle);
+    assert!(weak.upgrade().is_none());
 }
 
 #[test]
@@ -883,9 +884,8 @@ fn drop_cancels_queued_and_submitted_work_at_full_capacity() {
                         Some(libc::ENOENT | libc::EALREADY)
                     )
             );
-            // An external cancellation identity still pins the ignored record;
-            // releasing it after Driver destruction must reclaim its resources.
-            assert!(weak.upgrade().is_some());
+            // A pin retains identity only, not completed inputs.
+            assert!(weak.upgrade().is_none());
             drop(pin);
             assert!(weak.upgrade().is_none());
             drop(peer);
@@ -967,57 +967,6 @@ fn drop_notifies_waiters_after_all_results_retire_and_ring_is_closed() {
     drop(driver);
     assert!(observed.load(std::sync::atomic::Ordering::Relaxed));
     assert!(first.try_complete(&io).is_some());
-}
-
-#[test]
-fn completion_guards_outlive_claims_and_release_outside_borrows() {
-    use std::{cell::Cell, rc::Rc};
-    struct Guard {
-        io: shep_smp2::io::Io,
-        drops: Rc<Cell<usize>>,
-    }
-    impl Drop for Guard {
-        fn drop(&mut self) {
-            // Reenter the arena; no kernel/arena borrow may span this callback.
-            let _ = self.io.in_flight();
-            self.drops.set(self.drops.get() + 1);
-        }
-    }
-    let mut driver = Driver::new(1).unwrap();
-    let io = driver.io().clone();
-    let drops = Rc::new(Cell::new(0));
-    let guard = || Guard {
-        io: io.clone(),
-        drops: drops.clone(),
-    };
-    let mut handle = io.push_with_guard(Operation::Nop, guard()).unwrap();
-    assert!(
-        io.push_with_guard(
-            Operation::Ftruncate {
-                file: std::rc::Rc::new(Fd::new(tempfile::tempfile().unwrap()).unwrap()),
-                len: u64::MAX,
-            },
-            guard()
-        )
-        .is_err()
-    );
-    assert_eq!(drops.get(), 1, "rejection releases guard immediately");
-    handle.release(&io);
-    assert_eq!(drops.get(), 1, "abandonment must retain guard");
-
-    // A successful wait attempt is not proof of completion. Reap until the
-    // request retires and tick releases its guard.
-    while io.in_flight() != 0 {
-        driver.submit_and_wait(None).unwrap();
-        driver.tick();
-    }
-    assert_eq!(io.in_flight(), 0);
-
-    assert_eq!(drops.get(), 2);
-    let mut pending = io.push_with_guard(Operation::Nop, guard()).unwrap();
-    pending.release(&io);
-    drop(driver);
-    assert_eq!(drops.get(), 3, "driver teardown releases guards");
 }
 
 #[test]
@@ -1143,9 +1092,45 @@ fn drop_retires_more_blocked_reads_than_ring_capacity_with_retained_pins() {
         );
     }
     assert!(
-        weak.upgrade().is_some(),
-        "unpublished cancellation still pins its target"
+        weak.upgrade().is_none(),
+        "unpublished cancellation pins identity but not retired resources"
     );
     drop(pin);
     assert!(weak.upgrade().is_none());
+}
+
+#[test]
+fn completed_abandoned_open_closes_result_while_identity_remains_pinned() {
+    let original = tempfile::NamedTempFile::new().unwrap();
+    let mut driver = Driver::new(2).unwrap();
+    let io = driver.io().clone();
+    let op = io
+        .push(Operation::OpenAt {
+            directory: None,
+            path: std::ffi::CString::new(original.path().as_os_str().as_encoded_bytes()).unwrap(),
+            flags: libc::O_RDONLY,
+            mode: 0,
+        })
+        .unwrap();
+    let pin = op.cancel_target(&io);
+    while io.in_flight() != 0 {
+        driver.submit_and_wait(None).unwrap();
+        driver.tick();
+    }
+    assert_eq!(descriptors_for(original.path()), 2);
+    drop(op);
+    assert_eq!(
+        descriptors_for(original.path()),
+        1,
+        "pin must not retain a returned fd"
+    );
+    // The identity still accepts its delayed cancellation after resource cleanup.
+    let mut cancel = io.push(Operation::Cancel(pin)).unwrap();
+    assert_eq!(
+        finish(&mut driver, &mut cancel)
+            .result
+            .unwrap_err()
+            .raw_os_error(),
+        Some(libc::ENOENT)
+    );
 }

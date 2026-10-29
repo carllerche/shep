@@ -40,3 +40,7 @@ harness = false
 name = "timers"
 path = "benches/time/timers.rs"
 harness = false
+
+[features]
+# Native allocator instrumentation; incompatible with weft's simulated allocator.
+allocation-tests = []

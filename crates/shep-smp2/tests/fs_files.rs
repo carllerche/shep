@@ -62,81 +62,9 @@ fn storage_file_contract_allocation_trimming_and_publication() {
                 fs::read_dir(&nested).await.unwrap(),
                 vec![nested.join("manifest")]
             );
-            file.shutdown().await;
             assert_eq!(std::fs::read(nested.join("manifest")).unwrap(), b"record");
             fs::remove_file(nested.join("manifest")).await.unwrap();
             fs::sync_dir(&nested).await.unwrap();
-        })
-        .unwrap();
-}
-
-#[test]
-fn shutdown_tracks_abandoned_futures_and_retained_results() {
-    use shep_smp2::fs::OpenOptions;
-    let dir = tempfile::tempdir().unwrap();
-    let mut runtime = Runtime::new(Config {
-        submission_queue_capacity: 8,
-    })
-    .unwrap();
-    let io = runtime.io();
-    runtime
-        .block_on(async move {
-            let file = File::open(
-                dir.path().join("data"),
-                OpenOptions {
-                    create_new: true,
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
-            let mut abandoned = Box::pin(file.write_at(Buffer::from_slice(b"data", 1).unwrap(), 0));
-            assert!(poll(abandoned.as_mut()).is_pending());
-            drop(abandoned);
-            let mut retained = Box::pin(file.read_at(Buffer::new(0, 1).unwrap(), 0));
-            assert!(poll(retained.as_mut()).is_pending());
-            let mut shutdown = Box::pin(file.shutdown());
-            assert!(poll(shutdown.as_mut()).is_pending());
-            let (result, buffer) = file
-                .write_at(Buffer::from_slice(b"rejected", 1).unwrap(), 4)
-                .await;
-            assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::BrokenPipe);
-            assert_eq!(&*buffer, b"rejected");
-            shutdown.await;
-            // Completion consumption is not required for shutdown.
-            assert!(retained.await.0.is_ok());
-            assert_eq!(std::fs::read(dir.path().join("data")).unwrap(), b"data");
-            assert_eq!(
-                file.len().await.unwrap_err().kind(),
-                std::io::ErrorKind::BrokenPipe
-            );
-            // Shutting down a file leaves the shared driver usable.
-            let mut nop = io.push(shep_smp2::io::Operation::Nop).unwrap();
-            nop.release(&io);
-        })
-        .unwrap();
-}
-
-#[test]
-fn dropping_async_write_and_canceling_shutdown_does_not_reopen_gate() {
-    let mut runtime = Runtime::new(Config {
-        submission_queue_capacity: 4,
-    })
-    .unwrap();
-    runtime
-        .block_on(async move {
-            let file = File::from_std(tempfile::tempfile().unwrap()).await.unwrap();
-            let mut write = Box::pin(file.write_at(Buffer::new(4096, 1).unwrap(), 0));
-            assert!(poll(write.as_mut()).is_pending());
-            drop(write);
-            let mut shutdown = Box::pin(file.shutdown());
-            assert!(poll(shutdown.as_mut()).is_pending());
-            drop(shutdown);
-            file.shutdown().await;
-            assert_eq!(
-                file.sync_data().await.unwrap_err().kind(),
-                std::io::ErrorKind::BrokenPipe
-            );
         })
         .unwrap();
 }
@@ -191,7 +119,6 @@ fn direct_io_discovers_alignment_validates_inputs_and_imports() {
                 File::from_std(imported).await.unwrap().alignment(),
                 alignment
             );
-            file.shutdown().await;
         })
         .unwrap();
 }
@@ -253,7 +180,7 @@ fn invalid_open_and_exclusive_creation_reject_but_sq_pressure_makes_progress() {
             .await
             .unwrap();
             assert!(other.exists());
-            file.shutdown().await;
+            drop(file);
             handle.release(&io);
         })
         .unwrap();
@@ -291,8 +218,6 @@ fn constructors_and_namespace_futures_resolve_context_only_when_polled() {
             let file = open.await.unwrap();
             let imported = import.await.unwrap();
             assert_eq!(imported.alignment(), 1);
-            // Unpolled shutdown does not close admission.
-            drop(file.shutdown());
             assert_eq!(
                 file.write_at(Buffer::new(1, 1).unwrap(), 0)
                     .await
@@ -300,8 +225,6 @@ fn constructors_and_namespace_futures_resolve_context_only_when_polled() {
                     .unwrap(),
                 1
             );
-            file.shutdown().await;
-            imported.shutdown().await;
         })
         .unwrap();
     assert!(path.join("file").exists());

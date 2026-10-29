@@ -1,4 +1,4 @@
-use crate::fs::{File, OpenOptions, pending::finish};
+use crate::fs::{File, OpenOptions};
 use crate::io::{Fd, Operation, Value};
 use std::{ffi::CString, io, os::unix::ffi::OsStrExt, path::PathBuf, rc::Rc};
 
@@ -23,7 +23,7 @@ impl File {
                 mode: 0o666,
             })
             .map_err(|r| r.error)?;
-        let completion = finish(&io, handle).await;
+        let completion = handle.await;
         let Value::File(file) = completion.result? else {
             unreachable!("open result")
         };

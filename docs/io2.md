@@ -53,30 +53,40 @@ The private driver module owns the ring, shared storage, and DriverId allocator.
 The io module exposes the safe producer and admission errors. Operation owns
 requests, handles, cancellation tokens, and typed completion values. Arena owns
 the slab, its records, outstanding counts, and packed OperationId keys.
-Lifecycle defines the per-operation Submitted/Waiting/Ignored/Completed states;
+Lifecycle defines Submitted/Waiting/Ignored/Completed and empty pinned states;
 the arena combines their transitions with kernel-reference counts to decide
 slot retirement.
 
-OperationHandle is an eight-byte opaque ID, with no Io reference and no Future
-implementation. Use handle.try_complete(&io), handle.poll_complete(&io, cx), or
-poll_fn(|cx| handle.poll_complete(&io, cx)).await. Pass the allocating Io to
-handle.release(&io) when abandoning a result. File adapters use borrowed guards
-to release claims on dropped futures; raw-token callers own that responsibility.
-A bare token drop retains its slab claim until Io destruction. The registered
-waker belongs to the operation's slab record; no per-request Rc clone or
-Rc/RefCell mailbox is needed for ordinary operations.
+`Io::submit(T)` accepts sealed concrete operation data and returns `Op<T>`, an
+owning future retaining the originating Io and inputs. Files use concrete ReadAt,
+WriteAt, Fsync, Fallocate and Ftruncate data. `Io::push(Operation)` remains the
+enum convenience API and returns `Op<Operation>`. The
+try_complete/poll_complete/release methods accept the originating Io and reject
+foreign drivers. Drop automatically abandons the
+result without canceling the operation.
+
+Normal inputs live in the owner, outside the arena. The arena holds lifecycle,
+owned result, waker, completion kind and cancellation identity accounting. Dropping
+an unfinished data-bearing owner moves concrete inputs into one abandonment box;
+completed owners never need that box. Nop, published Close, Socket and Cancel
+need no retained input box. Cancel pins transfer into the cancellation record at
+publication and retire at its CQE, independently of the cancellation owner.
 
 A static atomic allocates nonzero 24-bit DriverIds once per driver, never
 recycling or wrapping them. Io clones share their driver's identity. The CQE's u64 packs that owner ID above a 40-bit slab index
 (24 + 40 = 64). Passing a token to the wrong Io panics before accessing the
-slab. Cancellation tokens retain their allocating Io while their pin is active;
-retirement releases that reference.
+slab. Unsubmitted cancellation tokens retain their allocating Io. Publication
+transfers their pin to the arena and releases that redundant Io reference; the
+cancellation CQE releases the pin.
 
 The shared Submitted/Waiting/Ignored/Completed lifecycle follows Monoio's model:
 slots remain occupied until both the submitter and kernel release their claims.
-Releasing a handle marks its request Ignored without freeing kernel-owned data.
+Dropping or releasing an owner marks its request Ignored without freeing kernel-owned data.
 Completed results remain available
-after driver destruction when the caller retains its Io. Retained completed results may grow the slab.
+after driver destruction through their owners. Retained completed results may grow the slab.
+Completed resource destruction does not wait for identity pins; only an empty
+tombstone remains until the last pin retires. Forgetting an Op leaks its inputs
+and Io reference; dropping it performs abandonment.
 
 A CancelTarget pins a live identity until its token is dropped unsubmitted or
 its cancellation CQE arrives. The original operation may complete and its
@@ -105,9 +115,10 @@ Namespace functions live in fs. Positional read_at/write_at return
 (Result<usize>, Buffer); futures are lazy until polled. Short I/O and partial
 effects are exposed, and there are no shared file cursors. sync_data/sync_all
 await their own completion; callers establish prerequisite write completion.
-File::shutdown stops admission across clones and awaits accepted work without
-syncing or closing the descriptor. The lower layer's Close takes a uniquely
-owned descriptor. Detached CLOSEs use the same SQ progress path before fallback.
+There is no File::shutdown, activity counter, or generic completion guard API.
+Higher layers coordinate admission, outstanding requests, and resource shutdown.
+The lower layer's Close takes a uniquely owned descriptor. Detached CLOSEs use
+the same SQ progress path before fallback.
 
 The driver owns no write backlog, resource-readiness waiter collection,
 durability frontier or background error policy. Higher layers track concurrent completion and durability. The [net adapter](../crates/shep-smp2/docs/net/README.md) provides TCP
@@ -176,6 +187,7 @@ cell or systemwide memory-barrier mechanisms.
 
 ```sh
 cargo nextest run -p shep-smp2
+cargo nextest run -p shep-smp2 --features allocation-tests --test io_allocations
 cargo weft test -p shep-smp2
 cargo weft test -p shep-smp2 --test rt_park --weft-runs 1000
 cargo test -p shep-smp2 --doc
@@ -187,8 +199,9 @@ Pure lifecycle and buffer tests run under Miri; actual io_uring/eventfd tests
 run against a native kernel or weft’s Linux simulation. Compile-fail docs enforce local-only driver/runtime
 ownership. The [13-case runtime benchmarks](../crates/shep-smp2/benches/README.md)
 cover scheduling, timers, foreign handoff, file batches and parking.
-[Eight driver-only cases](../crates/shep-smp2/benches/io/README.md) isolate
-batching, owned-buffer reuse, ignored completions and identity pins. Historical
+[Thirteen driver-only cases](../crates/shep-smp2/benches/io/README.md) isolate
+batching, owned-buffer reuse, ignored completions, identity pins and real
+cancellation at several abandonment rates. Historical
 archives retain their original source paths and hashes, including the former
 io2-core crate and former core module. They are measurement records.
 
@@ -208,3 +221,33 @@ these ownership assertions alone do not measure whether kernel submission blocks
 Remaining steps before production migration include buffer-pool networking,
 filesystem resource close/flush APIs, filesystem metadata policy, thread-per-core
 startup/shutdown and submit_to, RPC integration, and shep-smp-io-scheduler2.
+
+## Operation ownership changes
+
+The Monoio ownership proposal is implemented with these decisions:
+
+- Keep concrete inputs in typed owners during normal execution; box only inputs
+  needed after unfinished abandonment. Adopt returned descriptors at retirement.
+- Remove file activity accounting, File::shutdown and generic completion guards.
+  Application shutdown coordination belongs above smp.
+- Keep safe RefCell borrowing, per-CQE effects outside borrows, cancellation pins,
+  bounded publication pressure, and owned inputs on rejection.
+- Keep defensive cancel-and-drain driver destruction as the memory-safety fallback.
+  No new abort-on-unresolved-drop contract is introduced. Runtime shutdown remains
+  an explicit higher-level coordinator; it cancels its watch before drain.
+- Use sealed conversions through the existing Operation dispatcher at publication;
+  no custom raw-SQE or unsafe buffer interface is added.
+
+On x86_64 with rustc 1.97.1, Record and its slab slot shrink from 128 to 48 bytes.
+Op<ReadAt> is 72 bytes (56 bytes of data plus owner bookkeeping), while the enum
+owner is 88 bytes. Thus minimal read bookkeeping is 120 bytes, versus the old
+128-byte record + 16-byte Pending + 8-byte guard allocation = 152 bytes. These
+figures exclude buffer storage, shared resources, allocator overhead and enclosing
+future frames; the owner data has moved, not disappeared. See the driver benchmark
+README for complete future sizes and validation.
+
+Native allocation tests reserve arena capacity and construct buffers/resources
+before measuring. Normal typed read/write submission, retirement and consumption
+allocate zero times. Unfinished read abandonment allocates once; completed pinned
+abandonment allocates zero times. Explicit cancellation and abandonment of the
+cancellation owner allocate zero times. Arena growth remains amortized allocation.

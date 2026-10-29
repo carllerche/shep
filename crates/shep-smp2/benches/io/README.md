@@ -5,7 +5,7 @@ cargo bench -p shep-smp2 --bench driver -- --save-baseline owned-driver
 cargo bench -p shep-smp2 --bench driver -- --test
 ```
 
-Eight cases isolate the driver from task scheduling and file-adapter futures:
+Thirteen cases isolate the driver from task scheduling and file-adapter futures:
 
 - Nop batches at 1/32/256 operations: push a batch, explicitly submit/tick,
   then consume each completion. The handle vector is reserved and reused.
@@ -14,6 +14,9 @@ Eight cases isolate the driver from task scheduling and file-adapter futures:
   allocation, file creation, fsync and task scheduling are outside measurement.
 - Ignored Nop batch of 256: explicitly release submitter handles before submission and retire
   the kernel-owned records. Includes abandoned-record destruction during tick.
+- Real cancellation batches of 256 pending PollAdd operations at 0/1/10/50/100%
+  target-owner abandonment. Cancellation owners are always dropped immediately;
+  target abandonment boxing and kernel cancellation are inside measurement.
 - Cancel identity pin/release: acquire/drop a CancelTarget for an unconsumed,
   completed operation. Measures safe identity bookkeeping, without a cancel SQE
   or syscall. Actual kernel cancellation has native correctness tests.
@@ -29,12 +32,48 @@ Compiler, kernel, source hashes and estimates are retained in driver.json;
 Criterion raw samples remain under target/criterion. VM timing variation limits
 small performance conclusions; dedicated-machine runs are still required.
 
-Operation handles now contain only an eight-byte packed owner/slot ID. The
-caller supplies Io for polling and explicitly releasing raw claims; async file
-adapters release through borrowed guards. [OWNERLESS.md](OWNERLESS.md) and
-ownerless.json retain the comparison with Io-owning handles, including owner
-validation costs and all measured regressions. Earlier driver.json remains a
-historical snapshot of the preceding implementation.
+Typed operation owners now retain their Io and concrete data. The arena contains
+completion metadata and only receives boxed inputs on unfinished abandonment.
+Write batches use concrete WriteAt owners; older archives used enum operations.
+[OWNERLESS.md](OWNERLESS.md) and ownerless.json describe the historical eight-byte
+ID-only API and its comparisons, not the current ownership contract.
+
+## Typed ownership measurements
+
+Measured with rustc 1.97.1 on x86_64-unknown-linux-gnu using
+`RUSTC_BOOTSTRAP=1 cargo rustc -p shep-smp2 --lib -- -Zprint-type-sizes`.
+The baseline is commit ad4fd4c7ff531826a61b6f3272f0c5c82e837005.
+
+| Layout | Before | After |
+|---|---:|---:|
+| Record / actual slab slot | 128 | 48 |
+| Lifecycle | 24 | 24 |
+| Enum owner | 8 (identity only) | 88 (includes data and Io) |
+| Concrete ReadAt data | in 72-byte Operation enum | 56 |
+| Op<ReadAt> | not present | 72 |
+| File read_at / write_at future | 296 | 176 |
+| Separately allocated file activity guard payload | 8 | 0 |
+| File future + slab slot + guard payload | 432 | 224 |
+
+Sizes are bytes and include data moved out of the arena. Future sizes include
+their embedded operation owners; do not add those again. Totals exclude backing
+buffer storage, shared objects, spare slab capacity and allocator overhead.
+The per-slot reduction is 62.5%; the measured file-future-plus-slot reduction is
+48.1%. This is a memory comparison, not evidence of throughput improvement.
+
+Native allocation assertions use preallocated arena capacity and reused resources:
+
+```sh
+cargo nextest run -p shep-smp2 --features allocation-tests --test io_allocations
+```
+
+They verify zero allocations for normal typed file submission, retirement and
+consumption, closed-admission rejection, explicit cancellation and cancellation
+owner abandonment. Unfinished read abandonment allocates once; completed pinned
+abandonment allocates zero times. The feature enables a test-only System allocator
+wrapper; do not enable it for weft, whose simulated allocator is incompatible.
+The ordinary `cargo weft test -p shep-smp2` suite covers ownership without that
+instrumentation. Driver and runtime benchmark smoke tests use `-- --test`.
 
 ## Per-CQE tick comparison
 

@@ -7,23 +7,26 @@ Dependencies (including io-uring and shep-sys) retain their own unsafe internals
 
 Callers supply owned operations, never raw SQEs, pointers, borrowed buffers,
 raw descriptors, or unsafe buffer traits. The driver and Io are local, backed
-by one shared Rc. Operation handles contain only an opaque packed ID and do not
-retain the Io. A submitter cannot inspect or mutate a buffer while the kernel
+by one shared Rc. Typed operation owners retain their originating Io and concrete inputs. A submitter cannot inspect or mutate a buffer while the kernel
 owns it. Only the private driver constructs SQEs and processes
 CQEs. The driver owns shared ring storage and DriverId allocation. The io module
-provides the safe producer and Rejected admission errors; operation owns handles,
+provides the safe producer and Rejected admission errors; operation owns typed owners,
 cancellation tokens, completion values, and request inputs. Arena owns slab
 records, packed OperationIds, and retirement helpers; lifecycle defines their
 submitter/completion states. These implementation modules are crate-private.
 
 ## Publication and memory ownership
 
-`Io::push` stores an owned operation in the slab before publishing its SQE.
+`Io::submit(T)` takes sealed concrete operation data; `Io::push(Operation)` is
+its enum convenience API. Publication temporarily dispatches through Operation,
+then infallibly recovers T without allocating or invoking user code. The returned
+Op<T> owns inputs and an Io clone. The arena stores only lifecycle/result metadata,
+completion kind, cancellation dependencies and identity counts during normal use.
+
 Buffer backing allocations, CString paths and boxed socket addresses remain
-stable across operation moves and slab growth. Rc<Fd> retains input
-file descriptors. Buffer storage is initialized, so short reads and errors
-never expose uninitialized memory. Lengths fit the kernel's signed result size;
-positional offsets reject the current-position sentinel and signed overflow.
+stable across owner moves and slab growth. No SQE points into the movable owner.
+Rc<Fd> retains input descriptors. Initialized Buffer storage prevents uninitialized
+reads after short/error completions. Offsets and lengths retain their validation.
 
 Push normally only publishes. A full SQ triggers at most two nonblocking
 submit/reap attempts, retrying publication after each. Transient errors and zero
@@ -37,19 +40,10 @@ Pressure callbacks and destructors run only after ring and arena borrows end.
 Like Monoio's submit_with_data ordering, pressure is handled before creating and
 publishing the new operation. After callbacks, publication reacquires borrows and
 rechecks admission and SQ space. No callbacks run after successful publication,
-so push_with_guard can attach its guard immediately after push returns. Ring,
-arena and shutdown-cancellation state share one RefCell. Normal completion
-delivery uses stack-owned effects for one CQE, with no notification vectors.
-
-`Io::push_with_guard` additionally retains adapter-owned resources independently
-of the submitter claim. Rejected publication drops the guard immediately. The
-terminal CQE moves an accepted guard out of the slab; `tick` releases it outside
-all driver borrows, before notifying that operation’s waiter. Cancellation identity pins and
-unconsumed results do not retain these guards after terminal completion. During
-driver destruction guard release is deferred with the other notifications until
-kernel retirement and ring destruction. Guards must not panic in Drop; wake
-isolates a panicking guard so subsequent notifications can still run. The fs
-adapter uses guards to keep file activity counted after waiter abandonment.
+so the returned owner exists before any completion callback. Ring, arena and
+shutdown-cancellation state share one RefCell. Normal completion effects are
+stack-owned, one CQE at a time. There is no activity accounting or generic
+completion guard API; higher layers coordinate resource shutdown.
 
 The supported operations are Nop, positional ReadAt/WriteAt, Fsync, Fallocate,
 Ftruncate, OpenAt, Close, Socket, Accept, Connect, Send, Recv, Shutdown, PollAdd,
@@ -65,7 +59,7 @@ Each driver receives a process-unique nonzero 24-bit DriverId from a static
 atomic counter; its Io clones share that identity.
 Allocation stops permanently at exhaustion; IDs never wrap or recycle. The
 OperationId packs that owner into the high 24 bits and the slab index into the
-low 40 bits. NonZeroU64 makes the optional handle exactly eight bytes. Slab
+low 40 bits. NonZeroU64 makes the optional identity eight bytes; the owner also stores Io and data. Slab
 index overflow rejects admission before publication. All handle methods that
 access the slab validate the supplied Io before indexing, including release and
 cancel_target; a mismatch panics without consuming the original claim. CQE
@@ -73,31 +67,31 @@ identities are checked too. Zero is reserved for the driver's single internal
 teardown cancellation; it never indexes the slab. The index remains protected by the lifecycle and
 cancellation pins; owner bits are not per-slot generations.
 
-Each slab record owns its operation, lifecycle state, and count of remaining
-kernel identity references. An accepted SQE contributes one reference until
-its terminal CQE. Its submitter holds a separate claim until consumption or
-explicit release(&Io). A bare handle has no Drop access to the slab. File
-adapters install borrowed-Io cleanup guards before awaiting, releasing their
-claim if the future is dropped. Forgetting to release a raw handle retains its
-record until the Io is destroyed; it cannot free kernel-owned data early.
+The owner holds concrete inputs while Submitted, Waiting and Completed. Dropping
+an unfinished owner moves kernel-needed data into Ignored(Some(Box<dyn Any>)).
+Nop, Socket, published Close and Cancel require no input retention after publication
+and use Ignored(None). Their metadata still tracks terminal completion.
 
-| State | Submitter action | Terminal CQE action |
+| State | Owner action | Terminal CQE action |
 |---|---|---|
-| Submitted | Poll installs Waiting; release sets Ignored | Store Completed |
-| Waiting(waker) | Replace waker, or release and set Ignored | Extract waker and store Completed |
-| Ignored | Submitter has released its claim | Retain any owned result until kernel references are gone |
-| Completed(result) | Consume owned values or abandon them | Original CQE already retired |
+| Submitted | Poll installs Waiting; drop transfers needed data to Ignored | Store Completed |
+| Waiting | Replace waker, or abandon inputs and extract waker | Extract waker and store Completed |
+| Ignored | Owner has released its claim | Extract inputs and owned result for destruction |
+| Completed | Consume or destroy result and owner inputs | Already retired |
+| VacantPinned | No resources, only identity pins | Original CQE already retired |
 
-A slot is removed only after the submitter releases its claim AND every kernel
-identity reference retires. Completion consumption can take inner values while
-an outstanding cancellation still pins the record. This is why the inner
-operation is optional: the slot remains occupied for that cancellation's
-identity after its original operation's values have been returned.
+Completed abandonment never boxes inputs, including when pins remain. Retirement
+extracts ignored inputs/results immediately even with pins; only VacantPinned
+remains. A slot is reusable only after both owner interest and every kernel/identity
+reference end. Forgetting an Op leaks its inputs and Io clone, but cannot free
+kernel resources early. Normal Drop automatically releases interest.
 
 CancelTarget is an owned, same-ring identity reference, created from a live
 handle. Acquiring it pins the target slot even before cancellation publication.
-Its drop releases an unsubmitted reference; a cancellation CQE releases a
-submitted reference. If the target completes and is consumed first, the slot
+Its drop releases an unsubmitted reference. Publication transfers that pin into
+the cancellation record, disarming the token; a cancellation CQE releases it
+independently of the cancellation owner. The redundant Io clone is dropped after
+the publication borrow ends, while the caller still retains Shared. If the target completes and is consumed first, the slot
 cannot be reused for another SQE that a delayed cancellation could accidentally
 match. No generations or publicly reusable integer tokens are needed. Rejected
 cancellations return the token, preserving ownership. A retired token cannot
@@ -114,8 +108,7 @@ owned resources. Reaping frees CQ space and a later enter flushes overflow.
 There are no admission waiters or software submission backlogs.
 
 Driver::tick consumes and retires one CQE under a state borrow, then releases
-that borrow before destroying removed records, releasing its completion guard,
-and invoking its waker. It repeats for at most the CQ length observed on entry.
+that borrow before destroying extracted inputs/results and invoking its waker. It repeats for at most the CQ length observed on entry.
 The CQ iterator is dropped before callbacks, publishing its consumed head so a
 nested tick cannot observe the same CQE twice. No raw CQEs or slab IDs remain
 queued in a local snapshot across callbacks. Each iteration rechecks the ring:
@@ -123,21 +116,20 @@ a callback can drive more completions, reuse retired slots, or destroy the owner
 The return count excludes CQEs retired by nested calls. Later CQEs need not have
 updated their records when the first callback runs.
 
-Effects contain at most one waker, one guard, and two discarded records (the
-completed operation and a cancellation target released by its final pin).
-Replaced wakers, abandoned inputs and discarded results are destroyed outside
-state borrows. Panicking guards and wakes are isolated so subsequent completion
-notifications still run. Teardown alone accumulates guard/waker notifications
-until all kernel access has ended and the ring has been destroyed.
+Effects contain at most one waker, one abandoned input box, and one discarded
+owned result. Empty records removed by final unpin contain no user resources.
+Waker clones, replacement drops, input/result destruction and wakes occur outside
+state borrows. Wakes isolate panics. Teardown defers waiter wakes until all kernel
+access has ended and the ring has been destroyed.
 
 ## Unsafe boundaries
 
-1. SQ push publishes pointers into already-owned, stable operation data. Slab
-   ownership and lifecycle references retain it until terminal completion.
+1. SQ push publishes pointers into already-owned, stable operation data. The typed
+   owner, or an abandonment box, retains it until terminal completion.
 2. Successful OpenAt/Socket/Accept results adopt fresh descriptors using
    OwnedFd::from_raw_fd and Fd::from_owned_fd_unchecked. Adoption occurs even
    for ignored operations, so the owned
-   result is closed when its last lifecycle reference is released.
+   result is closed outside the state borrow when abandoned, without waiting for identity pins.
 3. Teardown publishes pointer-free cancellation SQEs directly. Admission has
    failed, so no target identity can be reused. Previously queued SQEs are
    submitted first, and only one internal cancellation is outstanding at a time.
@@ -162,7 +154,7 @@ All descriptor-bearing operations take Fd (shared through Rc where needed).
 Fd is !Send and !Sync through a PhantomData<Rc<()>> marker. It stores no
 runtime reference. The final owner takes its optional File and looks up the
 currently entered runtime's Io through TLS, releasing the context borrow before
-publishing a detached Close. This also applies when an operation record owns
+publishing a detached Close. This also applies when an operation owner or abandonment box owns
 the last Rc<Fd>, regardless of where the descriptor was created or used.
 Converting Fd into File, OwnedFd, or RawFd takes the descriptor out and disables
 its destructor cleanup.
@@ -219,7 +211,8 @@ alone never proves that a target's inputs can be freed.
 Only after retirement does drop close the ring and deliver accumulated waiter
 notifications outside borrows. Completed results remain consumable through
 retained Io clones, and unsubmitted CancelTargets can release their remaining
-identity pins afterward. There is no intentional unresolved-payload leak.
+identity pins afterward. Ordinary Drop does not intentionally leak unresolved payloads; explicitly forgetting
+an owner leaks its data and Io reference.
 Destruction may block indefinitely if an operation cannot finish or be canceled.
 A fatal enter/cancel error or panic before retirement aborts the process; it
 must not unwind and free kernel-owned inputs. Transient enter errors are retried.

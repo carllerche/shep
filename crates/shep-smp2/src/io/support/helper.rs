@@ -1,5 +1,5 @@
 //! One bounded blocking worker per driver. No runtime dependency.
-use super::activity::wake_safely;
+use super::wake_safely;
 use std::{
     future::Future,
     io,

@@ -1,4 +1,4 @@
-use crate::io::{Completion, Fd, Io, Operation, OperationHandle, Value};
+use crate::io::{Completion, Fd, Io, Op, Operation, Value};
 use crate::net::{Buffer, Config};
 use std::{cell::Cell, future::poll_fn, io, rc::Rc};
 
@@ -103,7 +103,7 @@ impl Drop for Socket {
 
 struct Pending<'a> {
     socket: &'a Socket,
-    handle: Option<OperationHandle>,
+    handle: Option<Op<Operation>>,
 }
 impl Drop for Pending<'_> {
     fn drop(&mut self) {
