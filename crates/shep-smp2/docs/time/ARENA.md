@@ -32,10 +32,12 @@ the last consumer is gone, even if the public Timer owner was dropped first.
 The wheel retains its six-level, 64-slot hierarchy, rounding, lazy deadline
 extensions, constant-time removal, and top-level wrapping behavior. Entry fields
 are plain data under one timer-state RefCell; per-entry Cells, waker RefCells,
-non-owning pointers, and state sentinels are gone. One consumer-side key Cell
-allows safe access through the existing pinned interface. Sleep remains !Unpin
+non-owning pointers, and state sentinels are gone. Consumer-side keys are ordinary
+optional IDs in movable SleepState. Sleep remains !Unpin through a wrapper marker
 for API compatibility and !Send/!Sync through its local owner handle; its address
-has no role in the wheel. Interval boxing is unchanged.
+has no role in the wheel. Interval stores SleepState inline without a Box.
+The immutable clock epoch lives once beside the shared state, outside its RefCell;
+each handle contains only an Rc. Deadline conversion needs no additional borrow.
 
 ## Reservation and retention
 
@@ -46,8 +48,9 @@ Reservation does not occupy entries or impose a limit: storage grows when full
 and keeps capacity for reuse. Capacity covers all slot-owning sleeps, including
 elapsed ones not yet dropped.
 
-On the measured x86_64 build, Sleep is 48 bytes (previously 120), each slab slot
-is 56 bytes, and the default slot reservation alone requests 57,344 bytes.
+On the measured x86_64 build, Sleep is 32 bytes (48 before sharing the epoch),
+Interval is 56 bytes with no separate allocation, and each slab slot is 56 bytes.
+The default slot reservation alone requests 57,344 bytes.
 Future size is not total memory usage: a full arena amortizes that reservation,
 but low occupancy and bursts followed by drops retain unused capacity. The
 minimal slab intentionally has no shrinking/compaction API; reclamation would

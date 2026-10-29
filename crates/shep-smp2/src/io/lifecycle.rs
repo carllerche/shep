@@ -10,3 +10,10 @@ pub(crate) enum Lifecycle {
     /// Only cancellation identity pins remain. No input/result resources remain.
     VacantPinned,
 }
+
+impl Lifecycle {
+    /// Original kernel ownership ended; only a result or identity pins remain.
+    pub(crate) fn is_complete(&self) -> bool {
+        matches!(self, Self::Completed(_) | Self::VacantPinned)
+    }
+}

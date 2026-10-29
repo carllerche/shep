@@ -1,4 +1,4 @@
-use crate::io::{Fd, Io, Operation, Value};
+use crate::io::{Accept, Fd, Io, Value};
 use crate::net::{Config, TcpStream, socket::Socket};
 use std::{io, net::SocketAddr, os::fd::OwnedFd};
 
@@ -30,11 +30,11 @@ impl TcpListener {
         self.socket.check()?;
         let completion = self
             .socket
-            .run(Operation::Accept {
+            .run(Accept {
                 socket: self.socket.file.clone(),
             })
-            .await
-            .map_err(|r| r.error)?;
+            .map_err(|r| r.error)?
+            .await;
         match completion.result? {
             Value::File(file) => Ok(TcpStream {
                 socket: Socket::new(&self.socket.io, file, self.socket.config),

@@ -44,8 +44,7 @@ batch measured about 33.6 / 34.4 / 34.6 us (Criterion slope estimates), with
 overlapping intervals. The 256-operation batch measured 678 / 749 / 665 us:
 the new version was about 11-13% slower than the adjacent baseline runs.
 CPU pinning does not isolate this VM, but this batch-performance signal
-warranted further profiling. Those runs and binary
-hashes are retained in lifecycle.json alongside the unpinned results.
+warranted further profiling. Detailed historical measurement records are available in Git history.
 
 Profiles of the same two binaries showed allocator/memory operations dominating
 user-space samples, without an isolated lifecycle hot spot. To normalize the
@@ -54,8 +53,8 @@ amount of work, a temporary fixed-count workload ran 10,000 batches of 256
 counts were 10.36 / 10.46 / 10.40 billion (within about 1%). User CPU times were
 1.92 / 1.48 / 1.70 s; system CPU times were 5.94 / 2.33 / 4.21 s. Total elapsed
 times were 7.89 / 3.82 / 5.92 s. This did not reproduce a slowdown; kernel-time
-variation dominated the timing differences. The complete workload source,
-perf stat output and binary hashes are retained in lifecycle.json.
+variation dominated the timing differences. The historical archive in Git history includes the workload source,
+perf stat output and binary hashes.
 
 These additional measurements do not justify discarding the Criterion signal
 or claiming a speedup. They do show that the slowdown was not consistent across
@@ -79,10 +78,8 @@ lifecycle transitions to chase those timing changes.
 | runtime/self_wake_128_turns | 6184.7 | 6373.5 | +3.1% |
 | runtime/timer_idle_1ms | 1999733.1 | 1999774.5 | +0.0% |
 
-lifecycle.json retains the before/after estimates, longer follow-up estimates,
-source hashes, compiler/kernel metadata and settings. Before raw samples remain
-under target/criterion/**/lifecycle-before. The full after run is retained in
-that JSON; **/new contains the latest samples (the follow-up for three cases).
+Raw samples were saved under target/criterion/**/lifecycle-before and **/new.
+Detailed estimates and metadata are available in Git history.
 
 ```sh
 cargo bench -p shep-smp2 --bench runtime -- --baseline lifecycle-before

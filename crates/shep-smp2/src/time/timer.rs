@@ -62,7 +62,7 @@ pub struct Timer {
 }
 
 /// Conversion between absolute instants and wheel-relative millisecond ticks.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) struct ClockTime {
     start_time: Instant,
 }
@@ -88,6 +88,7 @@ impl ClockTime {
 
 /// Timer state shared locally by the owner and its registered entries.
 pub(crate) struct Inner {
+    time_source: ClockTime,
     pub(crate) state: RefCell<InnerState>,
 }
 
@@ -114,13 +115,16 @@ impl Timer {
     /// arena grows as needed and retains its capacity for reuse.
     pub fn with_capacity(now: Instant, capacity: usize) -> Self {
         let inner = Inner {
+            time_source: ClockTime { start_time: now },
             state: RefCell::new(InnerState {
                 wheel: Wheel::new(),
                 entries: Slab::with_capacity(capacity),
             }),
         };
         Self {
-            handle: Handle::new(Rc::new(inner), ClockTime { start_time: now }),
+            handle: Handle {
+                inner: Rc::new(inner),
+            },
         }
     }
 
@@ -179,19 +183,13 @@ impl fmt::Debug for Inner {
 /// Local handle to a reactor-owned timer wheel.
 #[derive(Clone)]
 pub(crate) struct Handle {
-    time_source: ClockTime,
     inner: Rc<Inner>,
 }
 
 impl Handle {
-    /// Creates a new timer `Handle` from a shared `Inner` timer state.
-    fn new(inner: Rc<Inner>, time_source: ClockTime) -> Self {
-        Handle { time_source, inner }
-    }
-
     /// Returns the time source associated with this handle
     pub(crate) fn time_source(&self) -> &ClockTime {
-        &self.time_source
+        &self.inner.time_source
     }
 
     /// Access the driver's inner structure

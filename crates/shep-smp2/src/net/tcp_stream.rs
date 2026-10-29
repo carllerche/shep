@@ -1,4 +1,4 @@
-use crate::io::{Fd, Io, Operation};
+use crate::io::{Fd, Io, PollAdd};
 use crate::net::{Buffer, Config, ReadHalf, WriteHalf, socket::Socket};
 use std::{io, net::SocketAddr, os::fd::OwnedFd};
 
@@ -18,12 +18,12 @@ impl TcpStream {
             Ok(()) => {}
             Err(error) if error.raw_os_error() == Some(libc::EINPROGRESS) => {
                 socket
-                    .run(Operation::PollAdd {
+                    .run(PollAdd {
                         file: socket.file.clone(),
                         events: libc::POLLOUT as u32,
                     })
-                    .await
                     .map_err(|r| r.error)?
+                    .await
                     .result?;
                 shep_sys::socket_error(&*socket.file)?;
             }
@@ -54,10 +54,10 @@ impl TcpStream {
         )
     }
     pub async fn read(&mut self, buffer: Buffer) -> (io::Result<usize>, Buffer) {
-        self.socket.transfer(buffer, false).await
+        self.socket.transfer::<crate::io::Recv>(buffer).await
     }
     pub async fn write(&mut self, buffer: Buffer) -> (io::Result<usize>, Buffer) {
-        self.socket.transfer(buffer, true).await
+        self.socket.transfer::<crate::io::Send>(buffer).await
     }
     /// Send all owned bytes without copying and return the buffer. Errors may follow partial
     /// sends; do not retry the whole message without an application protocol.

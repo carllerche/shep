@@ -4,7 +4,7 @@ Measured 2026-10-23 against b5b9a22, with the same rustc 1.97.1 release profile
 and CPU 0 affinity on this AMD EPYC 9554P KVM VM. The new implementation is the
 initial slab migration before the [subsequent optimizations](OPPORTUNITIES.md).
 Runtime code was not changed during this attribution analysis.
-The measurements and ranges are saved in [attribution.json](attribution.json).
+Detailed historical measurement records are available in Git history.
 
 The steady-state cost comes from additional instructions, owner-state borrowing,
 checked lookups, and longer chains of dependent loads. Lost readiness inlining

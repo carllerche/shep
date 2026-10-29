@@ -42,7 +42,7 @@ fn stalled_publication_is_bounded_and_returns_unpublished_inputs() {
         assert!(io.has_pending());
         io.shared.submit_faults.borrow_mut().clear();
         driver.drain().unwrap();
-        first.try_complete(&io).unwrap().result.unwrap();
+        first.try_complete().unwrap().result.unwrap();
         assert_eq!(file.as_file().metadata().unwrap().len(), 0);
     }
 }
@@ -79,23 +79,13 @@ fn partial_submissions_and_errors_preserve_every_published_request() {
         driver.drain().unwrap();
         for handle in [&mut first, &mut second] {
             assert_eq!(
-                handle
-                    .try_complete(&io)
-                    .unwrap()
-                    .result
-                    .unwrap()
-                    .into_count(),
+                handle.try_complete().unwrap().result.unwrap().into_count(),
                 1
             );
         }
         if let Some(third) = &mut third {
             assert_eq!(
-                third
-                    .try_complete(&io)
-                    .unwrap()
-                    .result
-                    .unwrap()
-                    .into_count(),
+                third.try_complete().unwrap().result.unwrap().into_count(),
                 1
             );
             assert_eq!(std::fs::read(original.path()).unwrap(), b"ABC");
@@ -125,7 +115,7 @@ fn rejected_close_retains_its_descriptor_until_the_rejection_is_dropped() {
     drop(rejected);
     assert!(std::fs::read_link(format!("/proc/self/fd/{raw}")).is_err());
     driver.drain().unwrap();
-    first.try_complete(&io).unwrap().result.unwrap();
+    first.try_complete().unwrap().result.unwrap();
 }
 
 #[test]
@@ -148,7 +138,7 @@ fn pressure_callbacks_finish_before_the_new_operation_is_published() {
             // Refill the SQ: the outer publisher must recheck space afterward.
             for _ in 0..4 {
                 let mut handle = self.io.push(Operation::Nop).unwrap();
-                handle.release(&self.io);
+                handle.release();
             }
             self.called.set(true);
         }
@@ -173,13 +163,13 @@ fn pressure_callbacks_finish_before_the_new_operation_is_published() {
     assert!(called.get());
     assert_eq!(drops.get(), 0, "new waiter is still awaiting completion");
     assert!(
-        newest.try_complete(&io).is_none(),
+        newest.try_complete().is_none(),
         "no reaping after publication"
     );
     driver.drain().unwrap();
     assert_eq!(drops.get(), 1);
     for handle in [&mut first, &mut filler, &mut newest] {
-        handle.try_complete(&io).unwrap().result.unwrap();
+        handle.try_complete().unwrap().result.unwrap();
     }
 }
 
@@ -200,7 +190,7 @@ fn pressure_delivers_wakers_outside_borrows_and_reentrant_cancellation_is_safe()
     let mut driver = Driver::new(1).unwrap();
     let io = driver.io().clone();
     let mut first = io.push(Operation::Nop).unwrap();
-    let target = first.cancel_target(&io);
+    let target = first.cancel_target();
     let called = Rc::new(Cell::new(false));
     let output = called.clone();
     let callback_io = io.clone();
@@ -208,14 +198,14 @@ fn pressure_delivers_wakers_outside_borrows_and_reentrant_cancellation_is_safe()
         *slot.borrow_mut() = Some(Box::new(move || {
             // The completed target remains pinned while cancellation is published.
             let mut cancel = callback_io.push(Operation::Cancel(target)).unwrap();
-            cancel.release(&callback_io);
+            cancel.release();
             output.set(true);
         }))
     });
     let waker = Waker::from(std::sync::Arc::new(Reenter));
     assert!(
         first
-            .poll_complete(&io, &mut Context::from_waker(&waker))
+            .poll_complete(&mut Context::from_waker(&waker))
             .is_pending()
     );
     driver.submit_and_wait(None).unwrap();
@@ -224,7 +214,7 @@ fn pressure_delivers_wakers_outside_borrows_and_reentrant_cancellation_is_safe()
     assert!(called.get());
     driver.drain().unwrap();
     for handle in [&mut first, &mut filler, &mut last] {
-        handle.try_complete(&io).unwrap().result.unwrap();
+        handle.try_complete().unwrap().result.unwrap();
     }
 }
 
@@ -267,8 +257,8 @@ fn pressure_callback_closing_admission_rejects_the_unpublished_request() {
     assert_eq!(rejected.operation.buffer().unwrap().as_ptr(), ptr);
     assert_eq!(io.shared.state.borrow().arena.len(), 2);
     driver.drain().unwrap();
-    first.try_complete(&io).unwrap().result.unwrap();
-    filler.try_complete(&io).unwrap().result.unwrap();
+    first.try_complete().unwrap().result.unwrap();
+    filler.try_complete().unwrap().result.unwrap();
     assert_eq!(file.as_file().metadata().unwrap().len(), 0);
 }
 
@@ -315,7 +305,7 @@ fn tick_delivers_each_waiter_before_retiring_the_next_cqe() {
     assert_eq!(driver.tick(), 2);
     assert_eq!(*observations.borrow(), [1, 0]);
     for handle in &mut handles {
-        handle.try_complete(&io).unwrap().result.unwrap();
+        handle.try_complete().unwrap().result.unwrap();
     }
 }
 
@@ -351,7 +341,7 @@ fn nested_tick_consumes_remaining_cqes_without_duplicate_retirement() {
     assert_eq!(nested.get(), 1);
     assert_eq!(io.in_flight(), 0);
     for handle in &mut handles {
-        handle.try_complete(&io).unwrap().result.unwrap();
+        handle.try_complete().unwrap().result.unwrap();
     }
 }
 
@@ -381,7 +371,7 @@ fn tick_rechecks_ring_after_a_callback_destroys_the_driver() {
         io::ErrorKind::BrokenPipe
     );
     for handle in &mut handles {
-        handle.try_complete(&io).unwrap().result.unwrap();
+        handle.try_complete().unwrap().result.unwrap();
     }
 }
 
@@ -412,12 +402,12 @@ fn tick_budget_excludes_work_published_by_its_callback() {
     .unwrap();
     complete_nops(&io, 1);
     assert_eq!(driver.tick(), 1);
-    first.try_complete(&io).unwrap().result.unwrap();
+    first.try_complete().unwrap().result.unwrap();
     assert_eq!(io.in_flight(), 1);
     let mut next = next.borrow_mut().take().unwrap();
-    assert!(next.try_complete(&io).is_none());
+    assert!(next.try_complete().is_none());
     assert_eq!(driver.tick(), 1);
-    next.try_complete(&io).unwrap().result.unwrap();
+    next.try_complete().unwrap().result.unwrap();
 }
 
 // Exercise callbacks through the supported waiter API, not completion guards.
@@ -444,7 +434,7 @@ fn on_complete<G: 'static>(io: &Io, operation: Operation, callback: G) -> Result
     });
     let wake = Waker::from(std::sync::Arc::new(Notify(index)));
     assert!(
-        op.poll_complete(io, &mut Context::from_waker(&wake))
+        op.poll_complete(&mut Context::from_waker(&wake))
             .is_pending()
     );
     Ok(op)
@@ -480,7 +470,7 @@ fn dropping_replaced_waker_can_reap_the_operation_before_poll_returns() {
     });
     let waker = Waker::from(std::sync::Arc::new(ReenterOnDrop));
     assert!(
-        op.poll_complete(&io, &mut Context::from_waker(&waker))
+        op.poll_complete(&mut Context::from_waker(&waker))
             .is_pending()
     );
     drop(waker); // the arena now holds the final reference
@@ -488,7 +478,7 @@ fn dropping_replaced_waker_can_reap_the_operation_before_poll_returns() {
     // Replacement drops the old waker outside the borrow; its Drop reaps this
     // operation. The post-callback recheck must observe that completion.
     assert!(
-        op.poll_complete(&io, &mut Context::from_waker(Waker::noop()))
+        op.poll_complete(&mut Context::from_waker(Waker::noop()))
             .is_ready()
     );
     assert_eq!(io.in_flight(), 0);

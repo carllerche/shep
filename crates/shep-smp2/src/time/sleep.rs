@@ -4,13 +4,14 @@
 
 use std::{
     future::Future,
+    marker::PhantomPinned,
     pin::Pin,
     task::{self, Poll},
 };
 
 use pin_project_lite::pin_project;
 
-use crate::time::{Duration, Instant, entry::TimerEntry, error::Error, timer::Handle};
+use crate::time::{Duration, Instant, entry::TimerEntry, timer::Handle};
 
 // Preserve the existing overflow fallback: roughly 30 years from now.
 fn far_future() -> Instant {
@@ -185,20 +186,19 @@ pin_project! {
     #[derive(Debug)]
     #[must_use = "futures do nothing unless you `.await` or poll them"]
     pub struct Sleep {
-        deadline: Instant,
-
-        // The link between the `Sleep` instance and the timer that drives it.
+        state: SleepState,
+        // Preserve the public pinning contract; the internal slab owner can move.
         #[pin]
-        entry: TimerEntry,
+        _pin: PhantomPinned,
     }
 }
 
 impl Sleep {
     pub(crate) fn new_timeout(deadline: Instant) -> Sleep {
-        let handle = Handle::current();
-        let entry = TimerEntry::new(&handle);
-
-        Sleep { deadline, entry }
+        Sleep {
+            state: SleepState::new(deadline),
+            _pin: PhantomPinned,
+        }
     }
 
     pub(crate) fn far_future() -> Sleep {
@@ -207,7 +207,7 @@ impl Sleep {
 
     /// Returns the instant at which the future will complete.
     pub fn deadline(&self) -> Instant {
-        self.deadline
+        self.state.deadline()
     }
 
     /// Returns `true` if `Sleep` has elapsed.
@@ -215,7 +215,7 @@ impl Sleep {
     /// A `Sleep` instance is elapsed when the requested duration has elapsed.
     #[inline]
     pub fn is_elapsed(&self) -> bool {
-        self.entry.is_elapsed()
+        self.state.entry.is_elapsed()
     }
 
     /// Resets the `Sleep` instance to a new deadline.
@@ -249,31 +249,44 @@ impl Sleep {
     ///
     /// [`Pin::as_mut`]: fn@std::pin::Pin::as_mut
     pub fn reset(self: Pin<&mut Self>, deadline: Instant) {
-        let me = self.project();
-        me.entry.reset(deadline);
-        *me.deadline = deadline;
-    }
-
-    fn poll_elapsed(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Result<(), Error>> {
-        let me = self.project();
-        me.entry.poll_elapsed(*me.deadline, cx)
+        self.project().state.reset(deadline);
     }
 }
 
 impl Future for Sleep {
     type Output = ();
 
-    fn poll(mut self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Self::Output> {
-        // `poll_elapsed` can return an error in two cases:
-        //
-        // - AtCapacity: this is a pathological case where far too many sleep instances have been
-        //   scheduled.
-        // - Shutdown: No timer has been setup, which is a mis-use error.
-        //
-        // Both cases are extremely rare, and pretty accurately fit into
-        // "logic errors", so we just panic in this case. A user couldn't
-        // really do much better if we passed the error onwards.
-        match std::task::ready!(self.as_mut().poll_elapsed(cx)) {
+    fn poll(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<()> {
+        self.project().state.poll(cx)
+    }
+}
+
+/// Address-independent sleep state shared by the pinned public future and intervals.
+#[derive(Debug)]
+pub(super) struct SleepState {
+    deadline: Instant,
+    entry: TimerEntry,
+}
+
+impl SleepState {
+    pub(super) fn new(deadline: Instant) -> Self {
+        Self {
+            deadline,
+            entry: TimerEntry::new(Handle::current()),
+        }
+    }
+
+    pub(super) fn deadline(&self) -> Instant {
+        self.deadline
+    }
+
+    pub(super) fn reset(&mut self, deadline: Instant) {
+        self.entry.reset(deadline);
+        self.deadline = deadline;
+    }
+
+    pub(super) fn poll(&mut self, cx: &mut task::Context<'_>) -> Poll<()> {
+        match std::task::ready!(self.entry.poll_elapsed(self.deadline, cx)) {
             Ok(()) => Poll::Ready(()),
             Err(e) => panic!("timer error: {e}"),
         }

@@ -47,7 +47,8 @@ pub use buffer::Buffer;
 pub use driver::{Driver, WaitOutcome};
 pub use fd::Fd;
 pub use operation::{
-    CancelTarget, Close, Completion, Fallocate, Fsync, Ftruncate, Op, Operation, OperationData,
-    ReadAt, SocketAddress, Value, WriteAt,
+    Accept, CancelTarget, Close, Completion, Connect, Fallocate, Fsync, Ftruncate, Op, OpenAt,
+    Operation, OperationData, PollAdd, ReadAt, Recv, Send, SendRange, Shutdown, Socket,
+    SocketAddress, Value, WriteAt,
 };
 pub use producer::{Io, Rejected};

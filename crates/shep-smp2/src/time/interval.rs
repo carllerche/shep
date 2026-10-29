@@ -2,13 +2,9 @@
 // Copyright (c) 2021 ihciah, dyxushuai and other Monoio Contributors.
 // Portions Copyright (c) 2021 Tokio Contributors. Licensed under MIT.
 
-use std::{
-    future::Future,
-    pin::Pin,
-    task::{Context, Poll},
-};
+use std::task::{Context, Poll};
 
-use crate::time::{Duration, Instant, Sleep, sleep_until};
+use crate::time::{Duration, Instant, sleep::SleepState};
 use std::future::poll_fn;
 
 /// Creates new [`Interval`] that yields with interval of `period`.
@@ -113,7 +109,7 @@ pub fn interval_at(start: Instant, period: Duration) -> Interval {
     assert!(period > Duration::new(0, 0), "`period` must be non-zero.");
 
     Interval {
-        delay: Box::pin(sleep_until(start)),
+        delay: SleepState::new(start),
         period,
         missed_tick_behavior: Default::default(),
     }
@@ -353,7 +349,7 @@ impl Default for MissedTickBehavior {
 #[derive(Debug)]
 pub struct Interval {
     /// Future that completes the next time the `Interval` yields a value.
-    delay: Pin<Box<Sleep>>,
+    delay: SleepState,
 
     /// The duration between values yielded by `Interval`.
     period: Duration,
@@ -400,7 +396,7 @@ impl Interval {
     /// wakeup.
     pub fn poll_tick(&mut self, cx: &mut Context<'_>) -> Poll<Instant> {
         // Wait for the delay to be done
-        std::task::ready!(Pin::new(&mut self.delay).poll(cx));
+        std::task::ready!(self.delay.poll(cx));
 
         // Get the time when we were scheduled to tick
         let timeout = self.delay.deadline();
@@ -421,7 +417,7 @@ impl Interval {
             timeout + self.period
         };
 
-        self.delay.as_mut().reset(next);
+        self.delay.reset(next);
 
         // Return the time when we were scheduled to tick
         Poll::Ready(timeout)

@@ -14,7 +14,7 @@ use std::{
 fn finish(driver: &mut Driver, handle: &mut Op<Operation>) -> Completion {
     loop {
         driver.tick();
-        if let Some(done) = handle.try_complete(driver.io()) {
+        if let Some(done) = handle.try_complete() {
             return done;
         }
         driver.submit_and_wait(None).unwrap();
@@ -53,7 +53,7 @@ fn tick_delivers_each_notification_once() {
         let mut handle = driver.push(Operation::Nop).unwrap();
         assert!(
             handle
-                .poll_complete(driver.io(), &mut Context::from_waker(&waker))
+                .poll_complete(&mut Context::from_waker(&waker))
                 .is_pending()
         );
         let mut completed = 0;
@@ -63,7 +63,7 @@ fn tick_delivers_each_notification_once() {
         }
         assert_eq!(completed, 1);
         assert_eq!(driver.tick(), 0);
-        handle.try_complete(driver.io()).unwrap().result.unwrap();
+        handle.try_complete().unwrap().result.unwrap();
         assert_eq!(count.0.load(Relaxed), round + 1);
     }
 
@@ -79,11 +79,7 @@ fn push_reap_and_submit_are_separate_batch_phases() {
         .collect();
     assert!(driver.has_pending());
     assert_eq!(driver.tick(), 0);
-    assert!(
-        handles
-            .iter_mut()
-            .all(|h| h.try_complete(driver.io()).is_none())
-    );
+    assert!(handles.iter_mut().all(|h| h.try_complete().is_none()));
     assert_eq!(driver.submit().unwrap(), 8);
     assert!(!driver.has_pending());
     for handle in &mut handles {
@@ -223,7 +219,7 @@ fn cancellation_turns_over_full_sq_and_retains_target_identity() {
         })
         .unwrap();
     let mut cancel = driver
-        .push(Operation::Cancel(target.cancel_target(driver.io())))
+        .push(Operation::Cancel(target.cancel_target()))
         .unwrap();
     assert_eq!(driver.in_flight(), 2);
     let done = finish(&mut driver, &mut target);
@@ -235,7 +231,7 @@ fn cancellation_turns_over_full_sq_and_retains_target_identity() {
     // A retained token can outlive a consumed completion. It must never match
     // the later receive, even when the original operation has already finished.
     let mut first = driver.push(Operation::Nop).unwrap();
-    let token = first.cancel_target(driver.io());
+    let token = first.cancel_target();
     finish(&mut driver, &mut first).result.unwrap();
     let mut later = driver
         .push(Operation::Recv {
@@ -245,9 +241,9 @@ fn cancellation_turns_over_full_sq_and_retains_target_identity() {
         .unwrap();
     let mut stale_cancel = driver.push(Operation::Cancel(token)).unwrap();
     assert!(finish(&mut driver, &mut stale_cancel).result.is_err());
-    assert!(later.try_complete(driver.io()).is_none());
+    assert!(later.try_complete().is_none());
     let mut cancel = driver
-        .push(Operation::Cancel(later.cancel_target(driver.io())))
+        .push(Operation::Cancel(later.cancel_target()))
         .unwrap();
     assert!(finish(&mut driver, &mut later).result.is_err());
     finish(&mut driver, &mut cancel).result.unwrap();
@@ -260,7 +256,7 @@ fn unsubmitted_cancellation_token_releases_pin_and_other_ring_rejects_it() {
     let other = Driver::new(1).unwrap();
     let mut op = driver.push(Operation::Nop).unwrap();
     let rejected = other
-        .push(Operation::Cancel(op.cancel_target(driver.io())))
+        .push(Operation::Cancel(op.cancel_target()))
         .unwrap_err();
     assert_eq!(rejected.error.kind(), std::io::ErrorKind::InvalidInput);
     drop(rejected);
@@ -280,16 +276,15 @@ fn ignored_operations_keep_descriptors_until_cqe_and_results_survive_driver() {
             offset: 0,
         })
         .unwrap()
-        .release(driver.io());
+        .release();
     assert!(weak.upgrade().is_some());
     driver.drain().unwrap();
     assert!(weak.upgrade().is_none());
     let mut driver = Driver::new(1).unwrap();
     let mut op = driver.push(Operation::Nop).unwrap();
     driver.drain().unwrap();
-    let io = driver.io().clone();
     drop(driver);
-    assert!(op.try_complete(&io).unwrap().result.is_ok());
+    assert!(op.try_complete().unwrap().result.is_ok());
 }
 
 #[test]
@@ -412,17 +407,17 @@ fn panicking_waker_does_not_strand_other_results() {
     let bad = Waker::from(Arc::new(Bad));
     assert!(
         first
-            .poll_complete(driver.io(), &mut Context::from_waker(&bad))
+            .poll_complete(&mut Context::from_waker(&bad))
             .is_pending()
     );
     assert!(
         second
-            .poll_complete(driver.io(), &mut Context::from_waker(Waker::noop()))
+            .poll_complete(&mut Context::from_waker(Waker::noop()))
             .is_pending()
     );
     driver.drain().unwrap();
-    assert!(first.try_complete(driver.io()).unwrap().result.is_ok());
-    assert!(second.try_complete(driver.io()).unwrap().result.is_ok());
+    assert!(first.try_complete().unwrap().result.is_ok());
+    assert!(second.try_complete().unwrap().result.is_ok());
 }
 
 #[test]
@@ -448,7 +443,7 @@ fn reentrant_wake_consumes_another_result_and_pushes_into_reused_slot() {
     let io = driver.io().clone();
     CALLBACK.with(|slot| {
         *slot.borrow_mut() = Some(Box::new(move || {
-            b.try_complete(&io)
+            b.try_complete()
                 .expect("B retired before callback")
                 .result
                 .unwrap();
@@ -457,7 +452,7 @@ fn reentrant_wake_consumes_another_result_and_pushes_into_reused_slot() {
     });
     let waker = Waker::from(Arc::new(Reenter));
     assert!(
-        a.poll_complete(driver.io(), &mut Context::from_waker(&waker))
+        a.poll_complete(&mut Context::from_waker(&waker))
             .is_pending()
     );
     // The callback consumes an earlier completion and reuses its freed slot.
@@ -467,7 +462,7 @@ fn reentrant_wake_consumes_another_result_and_pushes_into_reused_slot() {
         driver.tick();
     }
 
-    a.try_complete(driver.io()).unwrap().result.unwrap();
+    a.try_complete().unwrap().result.unwrap();
     finish(&mut driver, next.borrow_mut().as_mut().unwrap())
         .result
         .unwrap();
@@ -506,7 +501,7 @@ fn close_completion_never_closes_a_reused_descriptor() {
     // reaping, so a second close would affect a new, independent owner.
     let replacement = reuse_descriptor(fd);
     finish(&mut driver, &mut close).result.unwrap();
-    close.release(driver.io());
+    close.release();
     let status = replacement.metadata();
     if status.is_err() {
         // Report a double close without an IO-safety abort during unwinding.
@@ -601,7 +596,7 @@ fn retained_results_grow_slab_without_moving_kernel_buffers() {
         handles.push((handle, pointer));
     }
     for (mut handle, pointer) in handles {
-        let done = handle.try_complete(driver.io()).unwrap();
+        let done = handle.try_complete().unwrap();
         assert_eq!(done.result.unwrap().into_count(), 6);
         assert_eq!(done.operation.buffer().unwrap().as_ptr(), pointer);
     }
@@ -683,7 +678,7 @@ fn ignored_open_output_is_closed_when_its_cqe_is_reaped() {
             mode: 0,
         })
         .unwrap()
-        .release(driver.io());
+        .release();
     driver.submit_and_wait(None).unwrap();
     // The kernel-created descriptor exists before its ignored result is reaped.
     assert_eq!(descriptors_for(original.path()), 2);
@@ -708,19 +703,19 @@ fn close_rejects_cancellation_and_finishes_during_teardown() {
                 driver.submit().unwrap();
             }
             let rejected = driver
-                .push(Operation::Cancel(close.cancel_target(&io)))
+                .push(Operation::Cancel(close.cancel_target()))
                 .unwrap_err();
             assert_eq!(rejected.error.kind(), std::io::ErrorKind::Unsupported);
             assert_eq!(driver.in_flight(), 1);
             // Dropping the returned cancellation token must release its pin.
             drop(rejected);
             if abandon {
-                close.release(&io);
+                close.release();
             }
             drop(driver);
             assert_eq!(io.in_flight(), 0);
             if !abandon {
-                let done = close.try_complete(&io).expect("teardown reaped CLOSE");
+                let done = close.try_complete().expect("teardown reaped CLOSE");
                 assert_close_result(done.result);
             }
             // Teardown must run CLOSE even if it was queued or abandoned.
@@ -730,29 +725,22 @@ fn close_rejects_cancellation_and_finishes_during_teardown() {
 }
 
 #[test]
-fn owning_handle_rejects_wrong_io_before_accessing_a_matching_slot() {
-    use std::panic::{AssertUnwindSafe, catch_unwind};
+fn owning_handle_always_uses_its_origin_and_rejects_foreign_cancellation() {
     assert_eq!(size_of::<Op<Operation>>(), 88);
     let mut first = Driver::new(1).unwrap();
     let mut other = Driver::new(1).unwrap();
     let mut a = first.push(Operation::Nop).unwrap();
     let mut b = other.push(Operation::Nop).unwrap();
-    // Both rings allocated their first slot; a clone of the same Io is valid.
-    let io = first.io().clone();
-    assert!(a.try_complete(&io).is_none());
-    assert!(catch_unwind(AssertUnwindSafe(|| a.try_complete(other.io()))).is_err());
-    assert!(
-        catch_unwind(AssertUnwindSafe(
-            || a.poll_complete(other.io(), &mut Context::from_waker(Waker::noop()))
-        ))
-        .is_err()
-    );
-    assert!(catch_unwind(AssertUnwindSafe(|| a.cancel_target(other.io()))).is_err());
-    assert!(catch_unwind(AssertUnwindSafe(|| a.release(other.io()))).is_err());
-    assert_eq!(first.in_flight(), 1);
-    assert_eq!(other.in_flight(), 1);
-    finish(&mut first, &mut a).result.unwrap();
+    // Both rings allocated their first slot. Only the owner can choose its arena.
+    assert!(a.try_complete().is_none());
+    let rejected = other.io().submit(a.cancel_target()).unwrap_err();
+    assert_eq!(rejected.error.kind(), std::io::ErrorKind::InvalidInput);
+    drop(rejected);
     finish(&mut other, &mut b).result.unwrap();
+    assert!(a.try_complete().is_none());
+    assert_eq!(first.in_flight(), 1);
+    assert_eq!(other.in_flight(), 0);
+    finish(&mut first, &mut a).result.unwrap();
     first.drain().unwrap();
     other.drain().unwrap();
 }
@@ -769,16 +757,15 @@ fn release_is_idempotent_and_keeps_kernel_resources_until_reaping() {
             offset: 0,
         })
         .unwrap();
-    handle.release(driver.io());
-    handle.release(driver.io());
+    handle.release();
+    handle.release();
     assert!(weak.upgrade().is_some());
     driver.drain().unwrap();
     assert!(weak.upgrade().is_none());
 }
 
 #[test]
-fn owners_retain_completed_inputs_after_driver_drop_and_reject_foreign_io() {
-    use std::panic::{AssertUnwindSafe, catch_unwind};
+fn owners_retain_completed_inputs_after_driver_drop_without_an_external_io() {
     let mut driver = Driver::new(1).unwrap();
     let file = std::rc::Rc::new(Fd::new(tempfile::tempfile().unwrap()).unwrap());
     let weak = std::rc::Rc::downgrade(&file);
@@ -790,7 +777,7 @@ fn owners_retain_completed_inputs_after_driver_drop_and_reject_foreign_io() {
         })
         .unwrap();
     let _cancel = driver
-        .push(Operation::Cancel(handle.cancel_target(driver.io())))
+        .push(Operation::Cancel(handle.cancel_target()))
         .unwrap();
     driver.drain().unwrap();
     // The owner retains its inputs and shared completion state after ring teardown.
@@ -798,7 +785,13 @@ fn owners_retain_completed_inputs_after_driver_drop_and_reject_foreign_io() {
     assert!(weak.upgrade().is_some());
     let mut driver = Driver::new(1).unwrap();
     let mut current = driver.push(Operation::Nop).unwrap();
-    assert!(catch_unwind(AssertUnwindSafe(|| handle.try_complete(driver.io()))).is_err());
+    let completion = handle
+        .try_complete()
+        .expect("originating driver retired the read");
+    assert!(weak.upgrade().is_some());
+    assert!(current.try_complete().is_none());
+    drop(completion);
+    assert!(weak.upgrade().is_none());
     finish(&mut driver, &mut current).result.unwrap();
     driver.drain().unwrap();
     drop(handle);
@@ -846,15 +839,15 @@ fn drop_cancels_queued_and_submitted_work_at_full_capacity() {
             // Leave a public cancellation outstanding too. Teardown must still
             // cancel the other receive and watch, without data from the peer.
             let mut cancellation = driver
-                .push(Operation::Cancel(receive.cancel_target(&io)))
+                .push(Operation::Cancel(receive.cancel_target()))
                 .unwrap();
-            let pin = ignored.cancel_target(&io);
-            ignored.release(&io);
+            let pin = ignored.cancel_target();
+            ignored.release();
             let count = Arc::new(Count(AtomicUsize::new(0)));
             let waker = Waker::from(count.clone());
             let mut cx = Context::from_waker(&waker);
-            assert!(receive.poll_complete(&io, &mut cx).is_pending());
-            assert!(watch.poll_complete(&io, &mut cx).is_pending());
+            assert!(receive.poll_complete(&mut cx).is_pending());
+            assert!(watch.poll_complete(&mut cx).is_pending());
             if submitted {
                 driver.submit().unwrap();
             }
@@ -867,14 +860,14 @@ fn drop_cancels_queued_and_submitted_work_at_full_capacity() {
                 std::io::ErrorKind::BrokenPipe
             );
             for mut handle in [receive, watch] {
-                let result = handle.try_complete(&io).expect("drop reaped original CQE");
+                let result = handle.try_complete().expect("drop reaped original CQE");
                 assert_eq!(
                     result.result.unwrap_err().raw_os_error(),
                     Some(libc::ECANCELED)
                 );
             }
             let result = cancellation
-                .try_complete(&io)
+                .try_complete()
                 .expect("public cancel retired")
                 .result;
             assert!(
@@ -913,12 +906,12 @@ fn drop_submits_queued_file_io_and_reaps_close_without_retaining_resources() {
             Fd::new(close_file.reopen().unwrap()).unwrap(),
         ))
         .unwrap()
-        .release(&io);
+        .release();
     assert_eq!(descriptors_for(close_file.path()), 2);
     drop(driver);
     assert_eq!(io.in_flight(), 0);
     assert_eq!(descriptors_for(close_file.path()), 1);
-    let completion = write.try_complete(&io).expect("queued write retired");
+    let completion = write.try_complete().expect("queued write retired");
     // Cancellation may lose to ordinary completion.
     match completion.result {
         Ok(Value::Count(n)) => assert_eq!(n, 6),
@@ -950,7 +943,7 @@ fn drop_notifies_waiters_after_all_results_retire_and_ring_is_closed() {
         *slot.borrow_mut() = Some(Box::new(move || {
             assert_eq!(callback_io.in_flight(), 0);
             assert!(!callback_io.has_pending());
-            assert!(second.try_complete(&callback_io).is_some());
+            assert!(second.try_complete().is_some());
             assert_eq!(
                 callback_io.push(Operation::Nop).unwrap_err().error.kind(),
                 std::io::ErrorKind::BrokenPipe
@@ -961,12 +954,12 @@ fn drop_notifies_waiters_after_all_results_retire_and_ring_is_closed() {
     let waker = Waker::from(Arc::new(Reenter));
     assert!(
         first
-            .poll_complete(&io, &mut Context::from_waker(&waker))
+            .poll_complete(&mut Context::from_waker(&waker))
             .is_pending()
     );
     drop(driver);
     assert!(observed.load(std::sync::atomic::Ordering::Relaxed));
-    assert!(first.try_complete(&io).is_some());
+    assert!(first.try_complete().is_some());
 }
 
 #[test]
@@ -1028,11 +1021,11 @@ fn outstanding_reads_grow_beyond_sq_capacity_and_cancel_across_turnovers() {
     assert_eq!(io.in_flight(), 64, "SQ capacity does not cap blocked reads");
     let mut cancels: Vec<_> = reads
         .iter()
-        .map(|read| io.push(Operation::Cancel(read.cancel_target(&io))).unwrap())
+        .map(|read| io.push(Operation::Cancel(read.cancel_target())).unwrap())
         .collect();
     driver.drain().unwrap();
     for (read, pointer) in reads.iter_mut().zip(pointers) {
-        let done = read.try_complete(&io).unwrap();
+        let done = read.try_complete().unwrap();
         assert_eq!(
             done.result.unwrap_err().raw_os_error(),
             Some(libc::ECANCELED)
@@ -1040,7 +1033,7 @@ fn outstanding_reads_grow_beyond_sq_capacity_and_cancel_across_turnovers() {
         assert_eq!(done.operation.buffer().unwrap().as_ptr(), pointer);
     }
     for cancel in &mut cancels {
-        cancel.try_complete(&io).unwrap().result.unwrap();
+        cancel.try_complete().unwrap().result.unwrap();
     }
     assert_eq!(io.in_flight(), 0);
 }
@@ -1053,7 +1046,7 @@ fn repeated_sq_turnover_retains_all_unconsumed_completions() {
         .collect();
     driver.drain().unwrap();
     for handle in &mut handles {
-        handle.try_complete(driver.io()).unwrap().result.unwrap();
+        handle.try_complete().unwrap().result.unwrap();
     }
     assert_eq!(driver.in_flight(), 0);
 }
@@ -1074,8 +1067,8 @@ fn drop_retires_more_blocked_reads_than_ring_capacity_with_retained_pins() {
             .unwrap()
         })
         .collect();
-    let pin = handles[0].cancel_target(&io);
-    handles[0].release(&io);
+    let pin = handles[0].cancel_target();
+    handles[0].release();
     drop(socket);
     assert_eq!(io.in_flight(), 32);
     drop(driver);
@@ -1083,7 +1076,7 @@ fn drop_retires_more_blocked_reads_than_ring_capacity_with_retained_pins() {
     for handle in &mut handles[1..] {
         assert_eq!(
             handle
-                .try_complete(&io)
+                .try_complete()
                 .unwrap()
                 .result
                 .unwrap_err()
@@ -1112,7 +1105,7 @@ fn completed_abandoned_open_closes_result_while_identity_remains_pinned() {
             mode: 0,
         })
         .unwrap();
-    let pin = op.cancel_target(&io);
+    let pin = op.cancel_target();
     while io.in_flight() != 0 {
         driver.submit_and_wait(None).unwrap();
         driver.tick();

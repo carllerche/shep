@@ -6,6 +6,6 @@ pub struct ReadHalf<'a> {
 }
 impl ReadHalf<'_> {
     pub async fn read(&mut self, buffer: Buffer) -> (io::Result<usize>, Buffer) {
-        self.socket.transfer(buffer, false).await
+        self.socket.transfer::<crate::io::Recv>(buffer).await
     }
 }

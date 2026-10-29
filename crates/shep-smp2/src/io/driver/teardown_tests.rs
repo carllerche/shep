@@ -33,7 +33,7 @@ fn teardown_retries_transient_submission_errors_before_retiring_inputs() {
     assert!(io.shared.state.borrow().ring.is_none());
     assert_eq!(
         receive
-            .try_complete(&io)
+            .try_complete()
             .unwrap()
             .result
             .unwrap_err()

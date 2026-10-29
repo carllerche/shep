@@ -2,29 +2,24 @@ use crate::fs::Buffer;
 use crate::io::{Fallocate, Fd, Fsync, Ftruncate, Io, ReadAt, Value, WriteAt};
 use std::{io, rc::Rc};
 
-struct FileInner {
-    descriptor: Rc<Fd>,
-    alignment: usize,
-}
 /// File clones share descriptor ownership. Higher layers coordinate admission,
 /// concurrent work, and shutdown; each operation owns its kernel resources.
 #[derive(Clone)]
 pub struct File {
     io: Io,
-    inner: Rc<FileInner>,
+    descriptor: Rc<Fd>,
+    alignment: usize,
 }
 impl File {
     pub(super) fn new(io: Io, file: Rc<Fd>, alignment: usize) -> Self {
         Self {
             io,
-            inner: Rc::new(FileInner {
-                descriptor: file,
-                alignment,
-            }),
+            descriptor: file,
+            alignment,
         }
     }
     pub fn alignment(&self) -> usize {
-        self.inner.alignment
+        self.alignment
     }
     fn validate_buffer(&self, buffer: &Buffer, offset: u64) -> io::Result<()> {
         let a = self.alignment();
@@ -41,7 +36,7 @@ impl File {
             return (Err(error), buffer);
         }
         let operation = WriteAt {
-            file: self.inner.descriptor.clone(),
+            file: self.descriptor.clone(),
             buffer,
             offset,
         };
@@ -60,7 +55,7 @@ impl File {
             return (Err(error), buffer);
         }
         let operation = ReadAt {
-            file: self.inner.descriptor.clone(),
+            file: self.descriptor.clone(),
             buffer,
             offset,
         };
@@ -77,7 +72,7 @@ impl File {
     pub async fn sync_data(&self) -> io::Result<()> {
         self.io
             .submit(Fsync {
-                file: self.inner.descriptor.clone(),
+                file: self.descriptor.clone(),
                 data_only: true,
             })
             .map_err(|r| r.error)?
@@ -88,7 +83,7 @@ impl File {
     pub async fn sync_all(&self) -> io::Result<()> {
         self.io
             .submit(Fsync {
-                file: self.inner.descriptor.clone(),
+                file: self.descriptor.clone(),
                 data_only: false,
             })
             .map_err(|r| r.error)?
@@ -100,7 +95,7 @@ impl File {
     pub async fn allocate(&self, offset: u64, len: u64) -> io::Result<()> {
         self.io
             .submit(Fallocate {
-                file: self.inner.descriptor.clone(),
+                file: self.descriptor.clone(),
                 offset,
                 len,
                 mode: libc::FALLOC_FL_KEEP_SIZE,
@@ -113,7 +108,7 @@ impl File {
     pub async fn set_len(&self, len: u64) -> io::Result<()> {
         self.io
             .submit(Ftruncate {
-                file: self.inner.descriptor.clone(),
+                file: self.descriptor.clone(),
                 len,
             })
             .map_err(|r| r.error)?
@@ -122,7 +117,7 @@ impl File {
             .map(|_| ())
     }
     pub async fn len(&self) -> io::Result<u64> {
-        let file = self.inner.descriptor.as_file().try_clone()?;
+        let file = self.descriptor.as_file().try_clone()?;
         self.io
             .shared
             .worker

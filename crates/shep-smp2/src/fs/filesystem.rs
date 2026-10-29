@@ -1,5 +1,5 @@
 use crate::fs::{File, OpenOptions};
-use crate::io::{Fd, Operation, Value};
+use crate::io::{Fd, OpenAt, Value};
 use std::{ffi::CString, io, os::unix::ffi::OsStrExt, path::PathBuf, rc::Rc};
 
 impl File {
@@ -16,7 +16,7 @@ impl File {
         let name = CString::new(path.as_os_str().as_bytes())
             .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
         let handle = io
-            .push(Operation::OpenAt {
+            .submit(OpenAt {
                 directory: None,
                 path: name,
                 flags,

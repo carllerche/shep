@@ -28,14 +28,14 @@ slab instruction timings. There is no eventfd watch or executor in these cases.
 
 These are initial baselines for the new low-level API. The end-to-end before/
 after comparison is in [the runtime suite](../../shep-smp2/benches/DRIVER.md).
-Compiler, kernel, source hashes and estimates are retained in driver.json;
-Criterion raw samples remain under target/criterion. VM timing variation limits
+Detailed historical estimates and metadata are available in Git history;
+Criterion writes raw samples under target/criterion. VM timing variation limits
 small performance conclusions; dedicated-machine runs are still required.
 
 Typed operation owners now retain their Io and concrete data. The arena contains
 completion metadata and only receives boxed inputs on unfinished abandonment.
 Write batches use concrete WriteAt owners; older archives used enum operations.
-[OWNERLESS.md](OWNERLESS.md) and ownerless.json describe the historical eight-byte
+[OWNERLESS.md](OWNERLESS.md) describes the historical eight-byte
 ID-only API and its comparisons, not the current ownership contract.
 
 ## Typed ownership measurements

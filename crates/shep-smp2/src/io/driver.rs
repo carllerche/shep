@@ -1,19 +1,21 @@
 //! The unsafe SQ publication, ring-driving, and descriptor-adoption boundary.
 #![allow(unsafe_code)]
 use crate::io::{
-    Fd, Io, Op, Operation, Rejected, Value,
+    Fd, Io, Op, Operation, OperationData, Rejected, Value,
     arena::{Arena, Kind, OperationId, Retired},
 };
 use io_uring::{IoUring, opcode, types};
 use std::{
     cell::RefCell,
     io,
-    net::Shutdown,
-    os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd},
+    os::fd::{FromRawFd, OwnedFd},
     rc::Rc,
     task::Waker,
     time::Instant,
 };
+
+mod operation;
+pub(crate) use operation::Submission;
 
 // Zero cannot be an OperationId. Used only for one teardown cancellation at a time.
 const SHUTDOWN_CANCEL: u64 = 0;
@@ -133,24 +135,16 @@ impl SubmitFault {
 impl Shared {
     /// Make room before publishing, as in Monoio's submit_with_data path.
     /// Unlike Monoio's retry loop, progress attempts here are bounded.
-    pub(crate) fn push(
-        &self,
-        mut operation: Operation,
-    ) -> Result<(OperationId, Operation), Rejected> {
+    pub(crate) fn push<T: OperationData>(&self, operation: &mut T) -> io::Result<OperationId> {
         for attempt in 0..=2 {
             match self.try_publish(operation) {
-                Ok(handle) => return Ok(handle),
-                Err(rejected)
-                    if rejected.error.kind() == io::ErrorKind::WouldBlock && attempt < 2 =>
-                {
-                    operation = rejected.operation;
-                    if let Err(error) = self.make_space() {
-                        return Err(Rejected { operation, error });
-                    }
+                Ok(id) => return Ok(id),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock && attempt < 2 => {
+                    self.make_space()?;
                     // Callbacks may have filled the SQ, closed admission, or
                     // retired a cancellation target. Reacquire and recheck.
                 }
-                Err(rejected) => return Err(rejected),
+                Err(error) => return Err(error),
             }
         }
         unreachable!()
@@ -158,70 +152,33 @@ impl Shared {
 
     /// No callbacks, submission, or reaping after successful publication. This
     /// ensures the returned owner is established before any completion callback.
-    fn try_publish(&self, mut operation: Operation) -> Result<(OperationId, Operation), Rejected> {
-        let mut state = match self.state.try_borrow_mut() {
-            Ok(state) => state,
-            Err(_) => {
-                return Err(Rejected {
-                    operation,
-                    error: io::ErrorKind::WouldBlock.into(),
-                });
-            }
-        };
+    fn try_publish<T: OperationData>(&self, operation: &mut T) -> io::Result<OperationId> {
+        let mut state = self
+            .state
+            .try_borrow_mut()
+            .map_err(|_| io::ErrorKind::WouldBlock)?;
         let IoState { ring, arena, .. } = &mut *state;
-        let Some(ring) = ring.as_mut() else {
-            return Err(Rejected {
-                operation,
-                error: io::ErrorKind::BrokenPipe.into(),
-            });
-        };
-        if let Err(error) = validate(&operation, self, arena)
-            .and_then(|()| arena.check_admission(operation.is_cancel()))
-        {
-            return Err(Rejected { operation, error });
-        }
+        let ring = ring.as_mut().ok_or(io::ErrorKind::BrokenPipe)?;
+        let prepared = operation.prepare(self, arena)?;
+        arena.check_admission(prepared.kind == Kind::Cancel)?;
         if ring.submission().is_full() {
-            return Err(Rejected {
-                operation,
-                error: io::ErrorKind::WouldBlock.into(),
-            });
+            return Err(io::ErrorKind::WouldBlock.into());
         }
-        let kind = kind(&operation);
-        let retain_data = !matches!(
-            operation,
-            Operation::Nop | Operation::Close(_) | Operation::Socket { .. } | Operation::Cancel(_)
-        );
-        let id = match arena.insert(kind, retain_data) {
-            Ok(id) => id,
-            Err(error) => return Err(Rejected { operation, error }),
-        };
-        let entry = entry(&mut operation).user_data(id.raw());
+        let id = arena.insert(prepared.kind, prepared.retain_data)?;
+        let entry = prepared.entry.user_data(id.raw());
         // SAFETY: Only stable backing allocations are referenced. The returned
         // owner retains inputs, transferring them to the arena if abandoned.
         // No callbacks or fallible work occur after successful publication.
         if unsafe { ring.submission().push(&entry) }.is_err() {
             arena.reject(id);
-            return Err(Rejected {
-                operation,
-                error: io::ErrorKind::WouldBlock.into(),
-            });
+            return Err(io::ErrorKind::WouldBlock.into());
         }
-        let retired_io = match &mut operation {
-            Operation::Close(close) => {
-                let _ = close.file.take().unwrap().into_raw_fd();
-                None
-            }
-            Operation::Cancel(target) => {
-                arena.record(id).dependency = Some(target.id());
-                target.disarm()
-            }
-            _ => None,
-        };
+        let retired_io = operation.published(arena, id);
         drop(state);
         // The caller's Io keeps Shared alive, so releasing this redundant clone
         // cannot run user destruction or reap between publication and return.
         drop(retired_io);
-        Ok((id, operation))
+        Ok(id)
     }
 
     /// Make progress before publication, with no callbacks under state borrows.
@@ -619,172 +576,6 @@ fn transient(e: &io::Error) -> bool {
     )
 }
 
-/// Reject offsets, lengths, spent CLOSEs, and foreign/disarmed
-/// cancellation tokens before admission; success does not change lifecycle state.
-fn validate(operation: &Operation, shared: &Shared, arena: &mut Arena) -> io::Result<()> {
-    let invalid = match operation {
-        Operation::ReadAt { offset, .. } | Operation::WriteAt { offset, .. } => {
-            *offset > i64::MAX as u64
-        }
-        Operation::Fallocate { offset, len, .. } => {
-            *offset > i64::MAX as u64
-                || *len > i64::MAX as u64
-                || offset
-                    .checked_add(*len)
-                    .is_none_or(|end| end > i64::MAX as u64)
-        }
-        Operation::Ftruncate { len, .. } => *len > i64::MAX as u64,
-        Operation::SendRange { buffer, range, .. } => buffer.get(range.clone()).is_none(),
-        Operation::Close(close) => close.file.is_none(),
-        Operation::Cancel(target) => !target.is_active_for(shared.id),
-        _ => false,
-    };
-    if invalid
-        || operation
-            .buffer()
-            .is_some_and(|b| b.len() > i32::MAX as usize)
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "invalid owned operation arguments",
-        ));
-    }
-    if let Operation::Cancel(target) = operation
-        && matches!(arena.record(target.id()).kind, Kind::Close)
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "accepted CLOSE operations cannot be canceled",
-        ));
-    }
-    Ok(())
-}
-/// Build an SQE from stable owned inputs. Does not publish or advance lifecycle;
-/// the caller must retain those inputs through the eventual terminal CQE.
-fn entry(operation: &mut Operation) -> io_uring::squeue::Entry {
-    match operation {
-        Operation::Nop => opcode::Nop::new().build(),
-        Operation::ReadAt {
-            file,
-            buffer,
-            offset,
-        } => opcode::Read::new(
-            types::Fd(file.as_raw_fd()),
-            buffer.as_mut_ptr(),
-            buffer.len() as u32,
-        )
-        .offset(*offset)
-        .build(),
-        Operation::WriteAt {
-            file,
-            buffer,
-            offset,
-        } => opcode::Write::new(
-            types::Fd(file.as_raw_fd()),
-            buffer.as_ptr(),
-            buffer.len() as u32,
-        )
-        .offset(*offset)
-        // Override append per request, including changes after SQ publication.
-        // Unsupported kernels must fail the write; never retry without this flag.
-        .rw_flags(libc::RWF_NOAPPEND)
-        .build(),
-        Operation::Fsync { file, data_only } => opcode::Fsync::new(types::Fd(file.as_raw_fd()))
-            .flags(if *data_only {
-                types::FsyncFlags::DATASYNC
-            } else {
-                types::FsyncFlags::empty()
-            })
-            .build(),
-        Operation::Fallocate {
-            file,
-            offset,
-            len,
-            mode,
-        } => opcode::Fallocate::new(types::Fd(file.as_raw_fd()), *len)
-            .offset(*offset)
-            .mode(*mode)
-            .build(),
-        Operation::Ftruncate { file, len } => {
-            opcode::Ftruncate::new(types::Fd(file.as_raw_fd()), *len).build()
-        }
-        Operation::OpenAt {
-            directory,
-            path,
-            flags,
-            mode,
-        } => opcode::OpenAt::new(
-            types::Fd(directory.as_ref().map_or(libc::AT_FDCWD, |f| f.as_raw_fd())),
-            path.as_ptr(),
-        )
-        .flags(*flags | libc::O_CLOEXEC)
-        .mode(*mode)
-        .build(),
-        Operation::Close(close) => {
-            opcode::Close::new(types::Fd(close.file.as_ref().unwrap().as_raw_fd()))
-                .build()
-                // A socket's final release can wait for SO_LINGER. Keep that
-                // work off the thread submitting the ring as well as Drop.
-                .flags(io_uring::squeue::Flags::ASYNC)
-        }
-        Operation::Socket {
-            domain,
-            socket_type,
-            protocol,
-        } => opcode::Socket::new(*domain, *socket_type | libc::SOCK_CLOEXEC, *protocol).build(),
-        Operation::Accept { socket } => opcode::Accept::new(
-            types::Fd(socket.as_raw_fd()),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        )
-        .flags(libc::SOCK_CLOEXEC)
-        .build(),
-        Operation::Connect { socket, address } => {
-            let (addr, len) = address.raw();
-            opcode::Connect::new(types::Fd(socket.as_raw_fd()), addr, len).build()
-        }
-        Operation::Send { socket, buffer } => opcode::Send::new(
-            types::Fd(socket.as_raw_fd()),
-            buffer.as_ptr(),
-            buffer.len() as u32,
-        )
-        .flags(libc::MSG_NOSIGNAL)
-        .build(),
-        Operation::SendRange {
-            socket,
-            buffer,
-            range,
-        } => {
-            let bytes = &buffer[range.clone()];
-            opcode::Send::new(
-                types::Fd(socket.as_raw_fd()),
-                bytes.as_ptr(),
-                bytes.len() as u32,
-            )
-            .flags(libc::MSG_NOSIGNAL)
-            .build()
-        }
-        Operation::Recv { socket, buffer } => opcode::Recv::new(
-            types::Fd(socket.as_raw_fd()),
-            buffer.as_mut_ptr(),
-            buffer.len() as u32,
-        )
-        .build(),
-        Operation::Shutdown { socket, how } => opcode::Shutdown::new(
-            types::Fd(socket.as_raw_fd()),
-            match how {
-                Shutdown::Read => libc::SHUT_RD,
-                Shutdown::Write => libc::SHUT_WR,
-                Shutdown::Both => libc::SHUT_RDWR,
-            },
-        )
-        .build(),
-        Operation::PollAdd { file, events } => {
-            opcode::PollAdd::new(types::Fd(file.as_raw_fd()), *events).build()
-        }
-        Operation::Cancel(target) => opcode::AsyncCancel::new(target.id().raw()).build(),
-    }
-}
 /// Translate a terminal CQE into a typed result, adopting successful fresh fds
 /// even when the submitter abandoned interest. Does not update the arena itself.
 fn value(kind: Kind, result: i32) -> io::Result<Value> {
@@ -801,22 +592,6 @@ fn value(kind: Kind, result: i32) -> io::Result<Value> {
         Kind::Poll => Value::Poll(result as u32),
         _ => Value::Done,
     })
-}
-fn kind(operation: &Operation) -> Kind {
-    match operation {
-        Operation::OpenAt { .. } | Operation::Socket { .. } | Operation::Accept { .. } => {
-            Kind::File
-        }
-        Operation::ReadAt { .. }
-        | Operation::WriteAt { .. }
-        | Operation::Send { .. }
-        | Operation::SendRange { .. }
-        | Operation::Recv { .. } => Kind::Count,
-        Operation::PollAdd { .. } => Kind::Poll,
-        Operation::Close(_) => Kind::Close,
-        Operation::Cancel(_) => Kind::Cancel,
-        _ => Kind::Done,
-    }
 }
 
 #[cfg(test)]

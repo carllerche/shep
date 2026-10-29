@@ -181,7 +181,7 @@ fn invalid_open_and_exclusive_creation_reject_but_sq_pressure_makes_progress() {
             .unwrap();
             assert!(other.exists());
             drop(file);
-            handle.release(&io);
+            handle.release();
         })
         .unwrap();
 }

@@ -41,6 +41,11 @@
 //! fn sync<T: Sync>() {}
 //! sync::<shep_smp2::time::Sleep>();
 //! ```
+//!
+//! ```compile_fail
+//! fn unpin<T: Unpin>() {}
+//! unpin::<shep_smp2::time::Sleep>();
+//! ```
 // Adapted from Monoio commit 8675e9406ea7943c441d969e38c3f5fc198ef6d1.
 // Copyright (c) 2021 ihciah, dyxushuai and other Monoio Contributors.
 // Portions Copyright (c) 2021 Tokio Contributors. Licensed under MIT.

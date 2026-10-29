@@ -33,7 +33,7 @@ fn main() {
                     handles.extend((0..count).map(|_| driver.push(Operation::Nop).unwrap()));
                     retire(&mut driver);
                     for mut handle in handles.drain(..) {
-                        black_box(handle.try_complete(driver.io()).unwrap().result.unwrap());
+                        black_box(handle.try_complete().unwrap().result.unwrap());
                     }
                 });
             },
@@ -67,7 +67,7 @@ fn main() {
                 }
                 retire(&mut driver);
                 for mut handle in handles.drain(..) {
-                    let completion = handle.try_complete(driver.io()).unwrap();
+                    let completion = handle.try_complete().unwrap();
                     assert_eq!(completion.result.unwrap().into_count(), 4096);
                     buffers.push(black_box(completion.operation.buffer));
                 }
@@ -80,7 +80,7 @@ fn main() {
     criterion.bench_function("driver/ignored_nop_batch_256", |bench| {
         bench.iter(|| {
             for _ in 0..256 {
-                driver.push(Operation::Nop).unwrap().release(driver.io());
+                driver.push(Operation::Nop).unwrap().release();
             }
             retire(&mut driver);
         })
@@ -89,10 +89,10 @@ fn main() {
     retire(&mut driver);
     criterion.bench_function("driver/cancel_identity_pin_release", |bench| {
         bench.iter(|| {
-            drop(black_box(completed.cancel_target(driver.io())));
+            drop(black_box(completed.cancel_target()));
         })
     });
-    completed.try_complete(driver.io()).unwrap().result.unwrap();
+    completed.try_complete().unwrap().result.unwrap();
     driver.drain().unwrap();
     // Each iteration issues real cancellation SQEs against pending watches.
     // Retain the same descriptor and vectors so abandonment boxing is included
@@ -116,7 +116,7 @@ fn main() {
                                 events: libc::POLLIN as u32,
                             })
                             .unwrap();
-                        let target = owner.cancel_target(driver.io());
+                        let target = owner.cancel_target();
                         drop(driver.push(Operation::Cancel(target)).unwrap());
                         if index < 256 * percent / 100 {
                             drop(owner);
@@ -128,7 +128,7 @@ fn main() {
                     for mut owner in owners.drain(..) {
                         assert_eq!(
                             owner
-                                .try_complete(driver.io())
+                                .try_complete()
                                 .unwrap()
                                 .result
                                 .unwrap_err()

@@ -80,7 +80,7 @@ fn normal_file_operations_allocate_nothing_and_only_unfinished_abandonment_boxes
     let mut op = op;
     let (_, allocations) = measure(|| retire(&mut driver));
     assert_eq!(allocations, 0);
-    let (completion, allocations) = measure(|| op.try_complete(&io).unwrap());
+    let (completion, allocations) = measure(|| op.try_complete().unwrap());
     assert_eq!(allocations, 0);
     assert_eq!(completion.operation.buffer.as_ptr(), pointer);
     assert_eq!(completion.result.unwrap().into_count(), 15);
@@ -95,8 +95,8 @@ fn normal_file_operations_allocate_nothing_and_only_unfinished_abandonment_boxes
     });
     assert_eq!(allocations, 0);
     retire(&mut driver);
-    let pin = op.cancel_target(&io);
-    let (completion, allocations) = measure(|| op.try_complete(&io).unwrap());
+    let pin = op.cancel_target();
+    let (completion, allocations) = measure(|| op.try_complete().unwrap());
     assert_eq!(allocations, 0);
     drop(pin);
     let buffer = completion.operation.buffer;
@@ -119,7 +119,7 @@ fn normal_file_operations_allocate_nothing_and_only_unfinished_abandonment_boxes
             offset: 0,
         })
         .unwrap();
-    let pin = op.cancel_target(&io);
+    let pin = op.cancel_target();
     retire(&mut driver);
     let (_, allocations) = measure(|| drop(op));
     assert_eq!(
@@ -155,7 +155,7 @@ fn explicit_cancellation_and_abandoning_its_owner_do_not_allocate() {
             events: libc::POLLIN as u32,
         })
         .unwrap();
-    let (pin, allocations) = measure(|| target.cancel_target(&io));
+    let (pin, allocations) = measure(|| target.cancel_target());
     assert_eq!(allocations, 0);
     let (cancel, allocations) = measure(|| io.push(Operation::Cancel(pin)).unwrap());
     assert_eq!(allocations, 0);
@@ -167,11 +167,39 @@ fn explicit_cancellation_and_abandoning_its_owner_do_not_allocate() {
     retire(&mut driver);
     assert_eq!(
         target
-            .try_complete(&io)
+            .try_complete()
             .unwrap()
             .result
             .unwrap_err()
             .raw_os_error(),
         Some(libc::ECANCELED)
     );
+}
+
+#[test]
+fn inline_intervals_construct_register_and_move_without_allocating() {
+    use shep_smp2::{
+        Runtime,
+        time::{Duration, Instant, interval_at},
+    };
+    use std::task::{Context, Waker};
+    let runtime = Runtime::new(Default::default()).unwrap();
+    let _enter = runtime.enter();
+    let first = Instant::now() + Duration::from_secs(86400);
+    let (mut interval, allocations) = measure(|| interval_at(first, Duration::from_secs(1)));
+    assert_eq!(allocations, 0);
+    let (_, allocations) = measure(|| {
+        assert!(
+            interval
+                .poll_tick(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+    });
+    assert_eq!(allocations, 0, "registration reuses reserved timer storage");
+    let (mut moved, allocations) = measure(|| std::hint::black_box(interval));
+    assert_eq!(allocations, 0);
+    runtime.timer().advance(first + Duration::from_millis(1));
+    let (tick, allocations) = measure(|| moved.poll_tick(&mut Context::from_waker(Waker::noop())));
+    assert_eq!(tick, std::task::Poll::Ready(first));
+    assert_eq!(allocations, 0);
 }

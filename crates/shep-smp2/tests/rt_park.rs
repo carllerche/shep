@@ -120,13 +120,11 @@ fn shutdown_retires_an_existing_cancel_before_canceling_its_watch() {
             buffer: Buffer::new(8, 1).unwrap(),
         })
         .unwrap();
-    let mut cancellation = io
-        .push(Operation::Cancel(receive.cancel_target(&io)))
-        .unwrap();
+    let mut cancellation = io.push(Operation::Cancel(receive.cancel_target())).unwrap();
     parking.shutdown().unwrap();
     parking.shutdown().unwrap();
-    assert!(receive.try_complete(&io).unwrap().result.is_err());
-    assert!(cancellation.try_complete(&io).unwrap().result.is_ok());
+    assert!(receive.try_complete().unwrap().result.is_err());
+    assert!(cancellation.try_complete().unwrap().result.is_ok());
     assert_eq!(io.in_flight(), 0);
 }
 

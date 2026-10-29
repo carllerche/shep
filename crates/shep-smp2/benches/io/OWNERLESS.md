@@ -14,7 +14,7 @@ cancellation record from retaining its own shared slab.
 Both versions were measured on CPU 2 using the same compiler/kernel and
 workspace dependency lock, 40 samples, 200 ms warmup, and 1 s measurement. The
 before source was saved before editing and rebuilt in an isolated workspace.
-Source hashes and full estimates are retained in ownerless.json.
+Source hashes and full historical estimates are available in Git history.
 
 | Driver case | Before mean (ns) | After mean (ns) | Change |
 |---|---:|---:|---:|

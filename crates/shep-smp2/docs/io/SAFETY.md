@@ -18,8 +18,10 @@ submitter/completion states. These implementation modules are crate-private.
 ## Publication and memory ownership
 
 `Io::submit(T)` takes sealed concrete operation data; `Io::push(Operation)` is
-its enum convenience API. Publication temporarily dispatches through Operation,
-then infallibly recovers T without allocating or invoking user code. The returned
+its enum convenience API. A private submission trait keeps concrete inputs typed
+through validation, SQE construction and publication. The enum borrows its variant
+fields to invoke the same opcode builders; there is no owned enum conversion.
+Builders and publication effects are sealed to built-in types. The returned
 Op<T> owns inputs and an Io clone. The arena stores only lifecycle/result metadata,
 completion kind, cancellation dependencies and identity counts during normal use.
 
@@ -60,10 +62,11 @@ atomic counter; its Io clones share that identity.
 Allocation stops permanently at exhaustion; IDs never wrap or recycle. The
 OperationId packs that owner into the high 24 bits and the slab index into the
 low 40 bits. NonZeroU64 makes the optional identity eight bytes; the owner also stores Io and data. Slab
-index overflow rejects admission before publication. All handle methods that
-access the slab validate the supplied Io before indexing, including release and
-cancel_target; a mismatch panics without consuming the original claim. CQE
-identities are checked too. Zero is reserved for the driver's single internal
+index overflow rejects admission before publication. Handle methods access only
+the Io retained by their owner; completion, release and cancel_target accept no
+external Io. Submitting a cancellation still validates the target's driver before
+indexing, and rejects a foreign target without consuming its pin. CQE identities
+are checked too. Zero is reserved for the driver's single internal
 teardown cancellation; it never indexes the slab. The index remains protected by the lifecycle and
 cancellation pins; owner bits are not per-slot generations.
 
@@ -75,10 +78,14 @@ and use Ignored(None). Their metadata still tracks terminal completion.
 | State | Owner action | Terminal CQE action |
 |---|---|---|
 | Submitted | Poll installs Waiting; drop transfers needed data to Ignored | Store Completed |
-| Waiting | Replace waker, or abandon inputs and extract waker | Extract waker and store Completed |
+| Waiting | Keep a matching waker, replace a different one, or abandon inputs and extract waker | Extract waker and store Completed |
 | Ignored | Owner has released its claim | Extract inputs and owned result for destruction |
 | Completed | Consume or destroy result and owner inputs | Already retired |
 | VacantPinned | No resources, only identity pins | Original CQE already retired |
+
+The lifecycle is also the source of kernel-retirement status: Completed and
+VacantPinned have retired, while Submitted, Waiting and Ignored are outstanding.
+There is no separately maintained completion boolean.
 
 Completed abandonment never boxes inputs, including when pins remain. Retirement
 extracts ignored inputs/results immediately even with pins; only VacantPinned
@@ -118,6 +125,10 @@ updated their records when the first callback runs.
 
 Effects contain at most one waker, one abandoned input box, and one discarded
 owned result. Empty records removed by final unpin contain no user resources.
+Ready results and unchanged waiters return from a single polling inspection
+without cloning a waker. Initial/replacement wakers are cloned outside the borrow;
+registration reacquires state and tolerates completion during Clone. Replacement
+Drop also runs outside the borrow, followed by a completion/failure recheck.
 Waker clones, replacement drops, input/result destruction and wakes occur outside
 state borrows. Wakes isolate panics. Teardown defers waiter wakes until all kernel
 access has ended and the ring has been destroyed.

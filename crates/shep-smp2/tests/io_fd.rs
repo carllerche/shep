@@ -69,7 +69,7 @@ fn rejected_async_close_uses_synchronous_fallback() {
     };
     assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::BrokenPipe);
     assert_closed(raw);
-    nop.release(&io);
+    nop.release();
     driver.drain().unwrap();
 }
 
@@ -123,7 +123,7 @@ fn anonymous_non_ring_descriptors_can_be_imported_and_closed() {
         let mut close = driver.push(Operation::close(fd)).unwrap();
         driver.drain().unwrap();
         assert!(matches!(
-            close.try_complete(driver.io()).unwrap().result,
+            close.try_complete().unwrap().result,
             Ok(Value::Done)
         ));
         drop(driver);
@@ -161,13 +161,13 @@ fn kernel_created_descriptors_can_be_closed_without_reimporting() {
         .unwrap();
     driver.submit_and_wait(None).unwrap();
     driver.tick();
-    let Value::File(fd) = socket.try_complete(driver.io()).unwrap().result.unwrap() else {
+    let Value::File(fd) = socket.try_complete().unwrap().result.unwrap() else {
         panic!("socket did not return an Fd")
     };
     let raw = fd.as_raw_fd();
     let mut close = driver.push(Operation::close(fd)).unwrap();
     driver.drain().unwrap();
-    close.try_complete(driver.io()).unwrap().result.unwrap();
+    close.try_complete().unwrap().result.unwrap();
     drop(driver);
     assert_closed(raw);
 }

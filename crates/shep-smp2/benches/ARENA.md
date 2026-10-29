@@ -8,9 +8,7 @@ Rc/RefCell for entry storage is shared once at reactor scope.
 The slab-context run measured the preceding mailbox implementation. The same
 11 cases and settings were rerun as arena-token. These are unpaired shared-VM
 measurements, not a statistically established speedup/regression. In particular
-file batching and foreign handoff vary with scheduling. arena.json retains
-estimates, confidence intervals and source hashes; the earlier data remains
-unchanged. No extra validation jobs ran during this benchmark run.
+file batching and foreign handoff vary with scheduling. No extra validation jobs ran during this benchmark run.
 
 | Case | Mailbox median (ns) | Arena median (ns) | Change |
 |---|---:|---:|---:|

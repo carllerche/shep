@@ -8,7 +8,7 @@ but do not measure inter-core notification latency. Default Criterion settings:
 40 samples, 200 ms warmup, 1 s measurement. Startup/shutdown excluded.
 
 The final CPU-2 full-run mean times below retain every case, including apparent regressions.
-Earlier candidate runs and focused follow-ups are recorded in driver-split.json.
+Earlier candidate runs and focused follow-ups are available in Git history.
 These end-to-end I/O and cross-thread timings vary substantially between runs;
 they do not establish performance equivalence or a reliable regression percentage.
 

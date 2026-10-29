@@ -64,7 +64,6 @@ pub(crate) struct Record {
     kernel_refs: usize,
     pub(crate) dependency: Option<OperationId>,
     pub(crate) kind: Kind,
-    own_done: bool,
     pub(crate) retain_data: bool,
 }
 
@@ -74,6 +73,13 @@ pub(crate) struct Retired {
     pub(crate) wake: Option<Waker>,
     pub(crate) data: Option<Box<dyn std::any::Any>>,
     pub(crate) result: Option<io::Result<Value>>,
+}
+
+/// Polling needs no waker callback for a ready result or an unchanged waiter.
+pub(crate) enum PollState {
+    Completed(io::Result<Value>),
+    Waiting,
+    Register,
 }
 
 pub(crate) struct Arena {
@@ -109,7 +115,6 @@ impl Arena {
             kernel_refs: 1,
             dependency: None,
             kind,
-            own_done: false,
             retain_data,
         });
         self.active += 1;
@@ -149,8 +154,7 @@ impl Arena {
     }
     pub(crate) fn complete(&mut self, id: OperationId, result: io::Result<Value>) -> Retired {
         let record = self.record(id);
-        assert!(!record.own_done, "duplicate terminal CQE");
-        record.own_done = true;
+        assert!(!record.lifecycle.is_complete(), "duplicate terminal CQE");
         let previous = std::mem::replace(&mut record.lifecycle, Lifecycle::VacantPinned);
         let effects = match previous {
             Lifecycle::Submitted => {
@@ -188,6 +192,25 @@ impl Arena {
         self.remove_empty(id);
         Some(result)
     }
+    pub(crate) fn poll(&mut self, id: OperationId, waker: &Waker) -> PollState {
+        let failed = self.failed;
+        let record = self.record(id);
+        if matches!(record.lifecycle, Lifecycle::Completed(_)) {
+            let Lifecycle::Completed(result) =
+                std::mem::replace(&mut record.lifecycle, Lifecycle::VacantPinned)
+            else {
+                unreachable!()
+            };
+            self.remove_empty(id);
+            return PollState::Completed(result);
+        }
+        assert!(!failed, "io_uring driver failed with unresolved resources");
+        match &record.lifecycle {
+            Lifecycle::Waiting(old) if old.will_wake(waker) => PollState::Waiting,
+            Lifecycle::Submitted | Lifecycle::Waiting(_) => PollState::Register,
+            _ => unreachable!("submitter released operation"),
+        }
+    }
     pub(crate) fn wait(&mut self, id: OperationId, waker: Waker) -> Option<Waker> {
         match &mut self.record(id).lifecycle {
             state @ Lifecycle::Submitted => {
@@ -203,7 +226,7 @@ impl Arena {
     /// Completed inputs stay with the owner for destruction outside this borrow.
     pub(crate) fn abandon<T: 'static>(&mut self, id: OperationId, data: &mut Option<T>) -> Retired {
         let record = self.record(id);
-        let next = if record.own_done {
+        let next = if record.lifecycle.is_complete() {
             Lifecycle::VacantPinned
         } else {
             Lifecycle::Ignored(if record.retain_data {
@@ -261,7 +284,7 @@ impl Arena {
             let index = *cursor;
             *cursor += 1;
             if let Some(record) = self.entries.get(index)
-                && !record.own_done
+                && !record.lifecycle.is_complete()
                 && !matches!(record.kind, Kind::Cancel | Kind::Close)
             {
                 return Some(OperationId::new(self.driver_id, index).unwrap());

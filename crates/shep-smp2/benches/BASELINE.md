@@ -21,6 +21,5 @@ exploratory measurements, not portable latency/throughput guarantees.
 | runtime/timer_idle_1ms | 2.00 ms |
 
 Batch cases report whole-batch duration; write/read cases include both
-operations. Timing boundaries are described in README.md. Mean/median
-estimates and confidence intervals are archived in baseline.json; raw samples
-remain under target/criterion/**/native-foundation.
+operations. Timing boundaries are described in README.md. Raw samples were saved under
+target/criterion/**/native-foundation.

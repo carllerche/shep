@@ -40,13 +40,10 @@ impl Io {
     }
     /// Publish built-in concrete inputs, returning them unchanged on rejection.
     /// Normal submission and completion do not allocate an operation box.
-    pub fn submit<T: OperationData>(&self, operation: T) -> Result<Op<T>, Rejected<T>> {
-        match self.shared.push(operation.into_operation()) {
-            Ok((id, operation)) => Ok(Op::new(self.clone(), id, T::from_operation(operation))),
-            Err(Rejected { error, operation }) => Err(Rejected {
-                error,
-                operation: T::from_operation(operation),
-            }),
+    pub fn submit<T: OperationData>(&self, mut operation: T) -> Result<Op<T>, Rejected<T>> {
+        match self.shared.push(&mut operation) {
+            Ok(id) => Ok(Op::new(self.clone(), id, operation)),
+            Err(error) => Err(Rejected { error, operation }),
         }
     }
     /// Count accepted SQEs whose terminal CQEs have not been reaped; pins and

@@ -35,46 +35,50 @@ and measurement times on a dedicated machine before interpreting small changes.
   wake completion; excludes thread startup. It is not isolated kernel wake latency.
 
 Startup, shutdown and metadata opens are outside measurement. Criterion raw
-samples remain in target/criterion; BASELINE.md and baseline.json retain the
-initial environment and estimates. The tests separately force wake timing
+samples remain in target/criterion; BASELINE.md describes the initial
+environment and estimates. The tests separately force wake timing
 around the final readiness check and verify that waits report Ready rather
 than merely timing out.
 
 The original native-foundation and subsequent slab-context versions allocated a
 per-operation reply mailbox. The current arena-token version stores that state
 in the reactor's slab and does not allocate a separate reply box.
-See ARENA.md and arena.json for that comparison; earlier archives remain intact.
+See ARENA.md for that comparison.
 The SQE carries the slab index. Arena
 storage is reserved at startup and grows only when retained completed results
 require more entries, rather than allocating a mailbox for every operation.
 
 The current scoped-wake run has 13 cases. Matching owner-thread task wakes use
 scoped TLS throughout runtime driving, while foreign notifications use the
-RUNNING/PARKING/NOTIFIED/CLOSED handshake. WAKE.md and wake.json retain this
-measurement; historical baseline/slab/arena archives are left unchanged.
+RUNNING/PARKING/NOTIFIED/CLOSED handshake. WAKE.md describes this
+measurement.
 
-The I/O core is now a private module within shep-smp-io2. Earlier benchmark
-source hashes retain their historical shep-smp-io2-core paths; those archives
-are measurement records, not current workspace dependencies. Some archives
-also record src/core/mod.rs, which has since moved to src/core.rs.
+The I/O core is now a private module within shep-smp-io2. Earlier measurement records use historical shep-smp-io2-core paths and
+src/core/mod.rs, which has since moved to src/core.rs.
 
 The current implementation uses the Submitted/Waiting/Ignored/Completed shared
 lifecycle. The last party (driver or future) to finish removes the entry. SQEs
 are published directly on admission; the reactor batches submission syscalls.
 There are no deferred reclamation lists or software submission queues.
-LIFECYCLE.md and lifecycle.json retain the comparison with the prior version.
-RECLAIM.md and reclaim.json describe the preceding implementation at measurement
-time; the older arena/wake archives likewise remain historical records.
+LIFECYCLE.md describes the comparison with the prior version.
+RECLAIM.md describes the preceding implementation at measurement time.
 
 The current driver split moves positional file adapters into shep-smp-fs2 and
 parking into shep-smp2. shep-smp-io2 exposes owned operations and separate
 push/submit/reap phases. Saturation returns the rejected operation immediately;
 there is no admission-waiter map. Cancellation targets pin their slab identities
-through the cancellation CQE. DRIVER.md and driver-split.json retain the
+through the cancellation CQE. DRIVER.md describes the
 before/after runtime comparison. Eight additional driver-only cases live in
 [io2/benches](io/README.md).
 
-Operation handles now take &Io when polling/releasing and no longer own an Io
-clone. The current packed identity has 24 owner bits and 40 slab-index bits.
-The [driver comparison](io/OWNERLESS.md) records this
-change; previous source hashes and API descriptions remain historical records.
+The [ownerless driver comparison](io/OWNERLESS.md) records the historical API
+whose handles took &Io when polling/releasing. Current typed owners retain their
+originating Io and access it directly, with no redundant method argument. Packed
+identities retain 24 owner bits and 40 slab-index bits. Earlier API descriptions remain historical records.
+
+[Structural layout changes](STRUCTURE.md) records the current file/timer ownership,
+inline intervals, concrete TCP operations, and operation polling measurements.
+
+Benchmark JSON archives have been removed from the repository. Previously
+committed archives remain available in Git history. Benchmark source and
+Markdown reports are retained.

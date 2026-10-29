@@ -1,4 +1,4 @@
-use crate::io::Operation;
+use crate::io::{SendRange, Shutdown};
 use crate::net::{Buffer, socket::Socket};
 use std::io;
 
@@ -7,7 +7,7 @@ pub struct WriteHalf<'a> {
 }
 impl WriteHalf<'_> {
     pub async fn write(&mut self, buffer: Buffer) -> (io::Result<usize>, Buffer) {
-        self.socket.transfer(buffer, true).await
+        self.socket.transfer::<crate::io::Send>(buffer).await
     }
     /// Send the entire owned buffer without copying, returning it on success or error.
     /// Each send is bounded by Config::max_buffer_size. Errors may follow partial
@@ -28,24 +28,18 @@ impl WriteHalf<'_> {
         let mut offset = 0;
         while offset < buffer.len() {
             let len = (buffer.len() - offset).min(self.socket.config.max_buffer_size);
-            let operation = Operation::SendRange {
+            let operation = SendRange {
                 socket: self.socket.file.clone(),
                 buffer,
                 range: offset..offset + len,
             };
-            let result;
-            match self.socket.run(operation).await {
-                Ok(completion) => {
-                    result = completion.result.map(crate::io::Value::into_count);
-                    buffer = completion.operation.into_buffer().unwrap();
-                }
-                Err(rejected) => {
-                    return (
-                        Err(rejected.error),
-                        rejected.operation.into_buffer().unwrap(),
-                    );
-                }
-            }
+            let pending = match self.socket.run(operation) {
+                Ok(pending) => pending,
+                Err(rejected) => return (Err(rejected.error), rejected.operation.buffer),
+            };
+            let completion = pending.await;
+            let result = completion.result.map(crate::io::Value::into_count);
+            buffer = completion.operation.buffer;
             match result {
                 Ok(0) => {
                     return (
@@ -74,12 +68,12 @@ impl WriteHalf<'_> {
             return Ok(());
         }
         self.socket
-            .run(Operation::Shutdown {
+            .run(Shutdown {
                 socket: self.socket.file.clone(),
                 how: std::net::Shutdown::Write,
             })
-            .await
             .map_err(|r| r.error)?
+            .await
             .result?;
         self.socket.write_closed.set(true);
         Ok(())

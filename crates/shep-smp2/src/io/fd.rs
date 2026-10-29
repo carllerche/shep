@@ -58,7 +58,7 @@ impl Fd {
     /// completes the CLOSE, including during shutdown. Flush errors are returned
     /// without retrying a descriptor number that may already have been reused.
     pub async fn close(self, io: &crate::io::Io) -> io::Result<()> {
-        io.push(crate::io::Operation::close(self))
+        io.submit(crate::io::Close::new(self))
             .map_err(|rejected| rejected.error)?
             .await
             .result
@@ -134,8 +134,8 @@ impl Drop for Fd {
             file: Some(file),
             _local: PhantomData,
         };
-        if let Ok(mut close) = io.push(super::Operation::close(fd)) {
-            close.release(&io);
+        if let Ok(mut close) = io.submit(super::Close::new(fd)) {
+            close.release();
         }
     }
 }
@@ -207,7 +207,7 @@ mod tests {
             })
             .unwrap();
         drop(fd);
-        operation.release(driver.io());
+        operation.release();
         let mut runtime = Runtime::new(Default::default()).unwrap();
         let io = runtime.io();
         let baseline = io.in_flight();

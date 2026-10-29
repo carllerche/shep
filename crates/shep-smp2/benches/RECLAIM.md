@@ -45,11 +45,9 @@ measurements do not establish either a portable speedup or absence of regression
 | runtime/self_wake_128_turns | 6138.6 | 6184.7 | +0.8% |
 | runtime/timer_idle_1ms | 1999764.8 | 1999733.1 | -0.0% |
 
-reclaim.json retains mean/median confidence intervals for the baseline,
-prototype, longer prototype follow-up, and final run, plus final Criterion change
-estimates and source hashes. The baseline compiler/kernel metadata is shared
-with the final run. Raw baseline samples remain in
-target/criterion/**/reactor-reclaim-before; final samples remain in **/new.
+Detailed estimates and source hashes are available in Git history. The baseline
+compiler/kernel metadata is shared with the final run. Raw samples were saved
+under target/criterion/**/reactor-reclaim-before and **/new.
 
 Reproduce the comparison with:
 

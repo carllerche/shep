@@ -57,8 +57,8 @@ python3 crates/shep-smp2/benches/task/compare.py before after
 former for its statistical comparison against an existing dataset; use the
 latter to retain separately named estimates. The comparison script reports
 median ratios, not a significance test. [RESULTS.md](RESULTS.md) records this
-change's measurements and rejected alternatives; `results.json` retains their
-mean/median estimates and confidence intervals without checking in build output.
+change's measurements and rejected alternatives. Detailed historical estimates
+and confidence intervals are available in Git history.
 
 The suite has 27 cases. It does not measure executor queue selection, timer or
 I/O performance. Run executor/timer integration tests separately to check those

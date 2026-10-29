@@ -5,12 +5,11 @@ checked access, callback reentrancy, and the existing first-waker policy.
 Measurements use the same fixed-work harness, compiler, CPU affinity, and gated
 perf procedure as [ATTRIBUTION.md](ATTRIBUTION.md), with five alternating trials
 per comparison.
-The initial isolated-prototype trials are saved in
-[opportunity-probes.json](opportunity-probes.json).
+Detailed historical records of the isolated-prototype trials are available in
+Git history.
 
 The final working-tree binary was compared against a saved, unoptimized arena
-binary in five alternating trials. Raw counters and normalized figures are in
-[applied-probes.json](applied-probes.json). Setup/destruction remain excluded;
+binary in five alternating trials. Normalized figures are summarized below. Setup/destruction remain excluded;
 the traversals themselves are included in instructions and cycles.
 
 | Applied changes together | Instructions/op, before → after | User cycles/op, before → after |
@@ -62,8 +61,8 @@ cancellation, reuse, growth, and wheel-boundary tests also pass. The library
 still forbids unsafe code.
 
 All 56 Criterion cases also completed successfully, saved as
-`slab-owned-optimized`. Their estimates and confidence intervals are preserved
-in [optimized-criterion.json](optimized-criterion.json). The shared VM's elapsed
+`slab-owned-optimized`. Their detailed historical estimates and confidence intervals are available
+in Git history. The shared VM's elapsed
 times drift across runs, including unchanged operations; these historical
 baseline comparisons do not establish an end-to-end speedup. The paired native
 counters above provide the evidence for the targeted reductions.

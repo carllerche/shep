@@ -109,8 +109,8 @@ selected owners so DHAT's end-of-process live heap represented one phase (empty,
 live, expired, or freed consumers). The example has been removed; recover it
 from git history to rerun the measurement.
 
-`size_of::<Sleep>()` is now 48 bytes, while each reserved slot uses 56 bytes on
-this x86_64 build. The full arena can reduce total live bytes, but reservations
+The historical snapshots used 48-byte Sleep values. Sharing the epoch now makes
+`size_of::<Sleep>()` 32 bytes; each reserved slot still uses 56 bytes on x86_64. The full arena can reduce total live bytes, but reservations
 and the high-water capacity remain allocated after consumers disappear. See
 [the measured table](ARENA.md) before interpreting future size as total savings.
 

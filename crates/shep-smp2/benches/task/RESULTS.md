@@ -21,9 +21,8 @@ access. `state.rs` and `waker.rs` now forbid unsafe code. See ../../docs/task/SA
   confirmation run used 1 s warmup / 3 s measurement for the eight steady-state
   cases and registered_join/4096. Before/after sources were restored with a
   finally guard between rebuilds; no Git checkout/reset or commit was used.
-- `results.json` preserves mean/median estimates with 95% confidence intervals
-  for all runs, plus compiler/host metadata and the benchmark source hash.
-  Raw Criterion samples remain in target/criterion.
+- Detailed historical estimates, metadata and source hashes are available in
+  Git history. Raw Criterion samples were saved in target/criterion.
 
 Shared-VM effects are visible, especially allocation-heavy cases and the channel
 handoff. Some checks/compilation ran during the first exploratory runs. The

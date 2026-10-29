@@ -309,3 +309,29 @@ fn standard_clock_instants_support_reactor_deadline_arithmetic() {
     timer.advance(epoch + duration);
     assert!(poll(delay.as_mut()).is_ready());
 }
+
+#[test]
+fn moving_registered_intervals_preserves_their_distinct_timer_epochs() {
+    let epoch = Instant::now();
+    let first_owner = ManualTimer::new(epoch);
+    let second_owner = ManualTimer::new(epoch - Duration::from_secs(3600));
+    let first = epoch + Duration::from_secs(86400);
+    let second = first + Duration::from_secs(1);
+    let period = Duration::from_secs(10);
+    let mut a = first_owner.with(|| interval_at(first, period));
+    let mut b = second_owner.with(|| interval_at(second, period));
+    let mut cx = Context::from_waker(Waker::noop());
+    assert!(a.poll_tick(&mut cx).is_pending());
+    assert!(b.poll_tick(&mut cx).is_pending());
+    std::mem::swap(&mut a, &mut b);
+    let mut moved = vec![a, b];
+    first_owner.advance(first);
+    assert!(moved[0].poll_tick(&mut cx).is_pending());
+    assert_eq!(moved[1].poll_tick(&mut cx), Poll::Ready(first));
+    second_owner.advance(second);
+    assert_eq!(moved[0].poll_tick(&mut cx), Poll::Ready(second));
+    drop(first_owner);
+    drop(second_owner);
+    // Both intervals have rearmed; their movable owners retain the wheel and epoch.
+    drop(moved);
+}

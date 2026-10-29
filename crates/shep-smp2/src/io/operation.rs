@@ -1,11 +1,15 @@
 //! Explicit owned requests; no caller supplies raw SQEs or kernel pointers.
 #![forbid(unsafe_code)]
 
-use crate::io::{Buffer, Fd, Io, arena::OperationId, driver::DriverId};
+use crate::io::{
+    Buffer, Fd, Io,
+    arena::{OperationId, PollState},
+    driver::DriverId,
+};
 use std::{
     ffi::CString,
     io,
-    net::{Shutdown, SocketAddr},
+    net::{Shutdown as ShutdownHow, SocketAddr},
     rc::Rc,
     task::{Context, Poll},
 };
@@ -128,7 +132,7 @@ pub enum Operation {
         /// Descriptor retained through shutdown completion.
         socket: Rc<Fd>,
         /// Receive, send, or both directions to shut down.
-        how: Shutdown,
+        how: ShutdownHow,
     },
     /// Wait once for descriptor readiness; the CQE terminates this watch.
     PollAdd {
@@ -147,11 +151,7 @@ impl Operation {
     /// Fd establishes descriptor eligibility at construction; push does not
     /// perform descriptor validation syscalls.
     pub fn close(file: Fd) -> Self {
-        // Keep the validated descriptor in a plain File so an unpublished or
-        // rejected CLOSE falls back synchronously without reentering Fd::drop.
-        Self::Close(Close {
-            file: Some(file.into()),
-        })
+        Self::Close(Close::new(file))
     }
     /// Borrow this owned request's input/output buffer, if its opcode has one.
     pub fn buffer(&self) -> Option<&Buffer> {
@@ -176,9 +176,6 @@ impl Operation {
             _ => None,
         }
     }
-    pub(crate) fn is_cancel(&self) -> bool {
-        matches!(self, Self::Cancel(_))
-    }
 }
 
 /// A unique descriptor transferred to CLOSE only after successful SQ publication.
@@ -187,6 +184,16 @@ impl Operation {
 pub struct Close {
     /// Some before SQ publication; None once descriptor ownership is transferred.
     pub(crate) file: Option<std::fs::File>,
+}
+
+impl Close {
+    /// Retain a unique descriptor until publication transfers it to the kernel.
+    pub fn new(file: Fd) -> Self {
+        // A plain File lets rejection close synchronously without reentering Fd::drop.
+        Self {
+            file: Some(file.into()),
+        }
+    }
 }
 
 /// Stable, owned socket-address storage for CONNECT.
@@ -297,44 +304,44 @@ impl<T: OperationData> Op<T> {
             data: Some(data),
         }
     }
-    /// Consume a reaped result without driving the ring. The Io must be the origin.
-    pub fn try_complete(&mut self, io: &Io) -> Option<Completion<T>> {
+    /// Consume a reaped result from the originating driver without driving its ring.
+    pub fn try_complete(&mut self) -> Option<Completion<T>> {
         let id = self.id.expect("operation already consumed");
-        id.check(io.shared.id);
-        let result = io.shared.state.borrow_mut().arena.take(id)?;
+        let result = self.io.shared.state.borrow_mut().arena.take(id)?;
+        Some(self.finish(result))
+    }
+    fn finish(&mut self, result: io::Result<Value>) -> Completion<T> {
         self.id = None;
-        Some(Completion {
+        Completion {
             result,
             operation: self.data.take().unwrap(),
-        })
+        }
     }
     /// Register a waiter; all custom waker callbacks occur outside state borrows.
-    pub fn poll_complete(&mut self, io: &Io, cx: &mut Context<'_>) -> Poll<Completion<T>> {
+    pub fn poll_complete(&mut self, cx: &mut Context<'_>) -> Poll<Completion<T>> {
+        let id = self.id.expect("operation already consumed");
+        let state = self.io.shared.state.borrow_mut().arena.poll(id, cx.waker());
+        match state {
+            PollState::Completed(result) => return Poll::Ready(self.finish(result)),
+            PollState::Waiting => return Poll::Pending,
+            PollState::Register => {}
+        }
+        // Clone and replacement Drop can reenter the driver, retire this request,
+        // grow the slab or fail admission. Never retain a record borrow over them.
         let waker = cx.waker().clone();
-        if let Some(result) = self.try_complete(io) {
+        let old = self.io.shared.state.borrow_mut().arena.wait(id, waker);
+        drop(old);
+        if let Some(result) = self.try_complete() {
             return Poll::Ready(result);
         }
         assert!(
-            !io.is_failed(),
+            !self.io.is_failed(),
             "io_uring driver failed with unresolved resources"
         );
-        let old = io
-            .shared
-            .state
-            .borrow_mut()
-            .arena
-            .wait(self.id.unwrap(), waker);
-        drop(old);
-        match self.try_complete(io) {
-            Some(result) => Poll::Ready(result),
-            None => Poll::Pending,
-        }
+        Poll::Pending
     }
     /// Explicit abandonment; equivalent to Drop. Does not cancel the request.
-    pub fn release(&mut self, io: &Io) {
-        if let Some(id) = self.id {
-            id.check(io.shared.id);
-        }
+    pub fn release(&mut self) {
         self.abandon();
     }
     fn abandon(&mut self) {
@@ -353,12 +360,11 @@ impl<T: OperationData> Op<T> {
         }
     }
     /// Pin the identity through cancellation retirement or unsubmitted token drop.
-    pub fn cancel_target(&self, io: &Io) -> CancelTarget {
+    pub fn cancel_target(&self) -> CancelTarget {
         let id = self.id.expect("operation already consumed");
-        id.check(io.shared.id);
-        io.shared.state.borrow_mut().arena.pin(id);
+        self.io.shared.state.borrow_mut().arena.pin(id);
         CancelTarget {
-            io: Some(io.clone()),
+            io: Some(self.io.clone()),
             id,
         }
     }
@@ -366,9 +372,7 @@ impl<T: OperationData> Op<T> {
 impl<T: OperationData> std::future::Future for Op<T> {
     type Output = Completion<T>;
     fn poll(self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.get_mut();
-        let io = this.io.clone();
-        this.poll_complete(&io, cx)
+        self.get_mut().poll_complete(cx)
     }
 }
 impl<T: OperationData> Drop for Op<T> {
@@ -377,48 +381,41 @@ impl<T: OperationData> Drop for Op<T> {
     }
 }
 
-// Conversion is sealed: only built-in stable owned inputs can cross publication.
-// No user callback, allocation, or fallible work occurs in these conversions.
-mod sealed {
-    use super::Operation;
-    pub trait Data {
-        fn into_operation(self) -> Operation;
-        fn from_operation(operation: Operation) -> Self;
-    }
-}
-/// Supported concrete owned operation data. Implementations are sealed.
-pub trait OperationData: sealed::Data + std::fmt::Debug + Unpin + 'static {}
+/// Supported concrete owned operation data. The private submission interface
+/// seals implementations to built-in inputs with stable backing storage.
+/// ```compile_fail
+/// #[derive(Debug)]
+/// struct Custom;
+/// impl shep_smp2::io::OperationData for Custom {}
+/// ```
+#[allow(private_bounds)]
+pub trait OperationData: super::driver::Submission + std::fmt::Debug + Unpin + 'static {}
 impl OperationData for Operation {}
-impl sealed::Data for Operation {
-    fn into_operation(self) -> Operation {
-        self
-    }
-    fn from_operation(operation: Operation) -> Self {
-        operation
-    }
-}
-macro_rules! file_operations {
+impl OperationData for Close {}
+impl OperationData for CancelTarget {}
+
+macro_rules! operations {
     ($($name:ident { $($field:ident: $ty:ty),* $(,)? })*) => {$(
         #[derive(Debug)]
         pub struct $name { $(pub $field: $ty),* }
         impl OperationData for $name {}
-        impl sealed::Data for $name {
-            fn into_operation(self) -> Operation {
-                Operation::$name { $($field: self.$field),* }
-            }
-            fn from_operation(operation: Operation) -> Self {
-                let Operation::$name { $($field),* } = operation else { unreachable!("operation type changed") };
-                Self { $($field),* }
-            }
-        }
     )*};
 }
-file_operations! {
+operations! {
     ReadAt { file: Rc<Fd>, buffer: Buffer, offset: u64 }
     WriteAt { file: Rc<Fd>, buffer: Buffer, offset: u64 }
     Fsync { file: Rc<Fd>, data_only: bool }
     Fallocate { file: Rc<Fd>, offset: u64, len: u64, mode: i32 }
     Ftruncate { file: Rc<Fd>, len: u64 }
+    OpenAt { directory: Option<Rc<Fd>>, path: CString, flags: i32, mode: u32 }
+    Socket { domain: i32, socket_type: i32, protocol: i32 }
+    Accept { socket: Rc<Fd> }
+    Connect { socket: Rc<Fd>, address: SocketAddress }
+    Send { socket: Rc<Fd>, buffer: Buffer }
+    SendRange { socket: Rc<Fd>, buffer: Buffer, range: std::ops::Range<usize> }
+    Recv { socket: Rc<Fd>, buffer: Buffer }
+    Shutdown { socket: Rc<Fd>, how: ShutdownHow }
+    PollAdd { file: Rc<Fd>, events: u32 }
 }
 
 /// A cancellation target is an owned identity reference, not a reusable integer.

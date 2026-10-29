@@ -40,6 +40,6 @@ foreign cases separately exercise running suppression and parking handoff.
 | park/foreign_running_burst_1024 | 16760.6 |
 | park/owner_notification | 138.9 |
 
-Timing boundaries are in README.md. wake.json retains mean/median confidence
-intervals, compiler/kernel metadata and source hashes. Raw samples remain under
+Timing boundaries are in README.md. Detailed historical estimates and metadata
+are available in Git history. Raw samples were saved under
 target/criterion/**/scoped-wake.

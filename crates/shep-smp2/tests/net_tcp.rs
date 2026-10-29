@@ -113,7 +113,7 @@ fn bounds_return_original_buffer_without_closing_socket() {
         assert_eq!(pointer, buffer.as_ptr());
     }
     drain(&mut driver);
-    noop.try_complete(&io).unwrap().result.unwrap();
+    noop.try_complete().unwrap().result.unwrap();
     assert!(
         pin!(stream.flush())
             .poll(&mut Context::from_waker(Waker::noop()))
@@ -397,7 +397,7 @@ fn write_all_returns_owned_buffer_on_rejection_and_handles_empty_buffers() {
     assert_eq!(buffer.as_ptr(), ptr);
     assert_eq!(&*buffer, b"more than the send limit");
     drop(write);
-    occupied.release(driver.io());
+    occupied.release();
     drain(&mut driver);
 }
 
@@ -449,7 +449,7 @@ fn imported_lingering_socket_publishes_detached_close_under_sq_pressure() {
     // Release the unread peer so the worker can finish promptly.
     drop(peer);
     drop(blocked_peer);
-    blocked_read.release(&io);
+    blocked_read.release();
     runtime.shutdown().unwrap();
     drop(enter);
     assert!(std::fs::read_link(format!("/proc/self/fd/{raw}")).is_err());

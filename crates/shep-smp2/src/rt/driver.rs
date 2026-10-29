@@ -32,7 +32,7 @@ impl Driver {
     }
     fn arm(&mut self) -> io::Result<()> {
         if let Some(watch) = &mut self.watch {
-            if let Some(completion) = watch.try_complete(self.driver.io()) {
+            if let Some(completion) = watch.try_complete() {
                 self.watch = None;
                 completion.result?;
             } else {
@@ -118,7 +118,7 @@ impl Driver {
         // Cancellation is allowed after ordinary admission closes, and turns
         // over the SQ as needed. Its token pins the watch identity.
         let cancellation = if let Some(watch) = &self.watch {
-            let mut operation = Operation::Cancel(watch.cancel_target(self.driver.io()));
+            let mut operation = Operation::Cancel(watch.cancel_target());
             loop {
                 match self.driver.push(operation) {
                     Ok(handle) => break Some(handle),
@@ -145,10 +145,10 @@ impl Driver {
         };
         self.driver.drain()?;
         if let Some(mut cancellation) = cancellation {
-            cancellation.release(self.driver.io());
+            cancellation.release();
         }
         if let Some(watch) = &mut self.watch {
-            watch.release(self.driver.io());
+            watch.release();
         }
         self.watch = None;
         self.event = None;
@@ -229,11 +229,11 @@ mod tests {
             }
             drop(reactor.prepare_park().unwrap());
             assert!(
-                reactor.watch.as_mut().unwrap().try_complete(&io).is_none(),
+                reactor.watch.as_mut().unwrap().try_complete().is_none(),
                 "parking must replace the completed watch with an armed one"
             );
-            first.release(&io);
-            second.release(&io);
+            first.release();
+            second.release();
             reactor.shutdown().unwrap();
         }
     }

@@ -8,10 +8,7 @@
 //! after releasing that borrow so callbacks can operate on other timers.
 
 use std::{
-    cell::Cell,
-    marker::PhantomPinned,
     num::NonZeroUsize,
-    pin::Pin,
     task::{Context, Poll, Waker},
 };
 
@@ -132,37 +129,30 @@ impl Entry {
     }
 }
 
-/// Consumer-side ownership of a slot. Preserve Sleep's !Unpin API while making
-/// its address irrelevant to the wheel. The key Cell permits safe pinned access.
+/// Movable consumer-side ownership of a slot. The wheel retains only its key.
 #[derive(Debug)]
 pub(crate) struct TimerEntry {
     driver: Handle,
-    key: Cell<Option<EntryId>>,
-    _pin: PhantomPinned,
+    key: Option<EntryId>,
 }
 
 impl TimerEntry {
-    pub(crate) fn new(handle: &Handle) -> Self {
-        Self {
-            driver: handle.clone(),
-            key: Cell::new(None),
-            _pin: PhantomPinned,
-        }
+    pub(crate) fn new(driver: Handle) -> Self {
+        Self { driver, key: None }
     }
 
     #[inline]
     pub(crate) fn is_elapsed(&self) -> bool {
         self.key
-            .get()
             .is_some_and(|key| self.driver.get().state.borrow().entries[key.index()].is_elapsed())
     }
 
-    pub(crate) fn reset(self: Pin<&mut Self>, new_time: Instant) {
+    pub(crate) fn reset(&mut self, new_time: Instant) {
         let tick = self.driver.time_source().deadline_to_tick(new_time);
         let waker = {
             let mut state = self.driver.get().state.borrow_mut();
             let InnerState { wheel, entries } = &mut *state;
-            let key = if let Some(key) = self.key.get() {
+            let key = if let Some(key) = self.key {
                 if entries[key.index()].extend_expiration(tick) {
                     return;
                 }
@@ -175,7 +165,7 @@ impl TimerEntry {
                 let mut entry = Entry::new();
                 entry.set_expiration(tick);
                 let key = EntryId::new(entries.insert(entry));
-                self.key.set(Some(key));
+                self.key = Some(key);
                 key
             };
             match wheel.insert(entries, key) {
@@ -189,11 +179,11 @@ impl TimerEntry {
     }
 
     pub(crate) fn poll_elapsed(
-        self: Pin<&mut Self>,
+        &mut self,
         deadline: Instant,
         cx: &mut Context<'_>,
     ) -> Poll<TimerResult> {
-        if let Some(key) = self.key.get() {
+        if let Some(key) = self.key {
             let state = self.driver.get().state.borrow();
             let entry = &state.entries[key.index()];
             // Retain upstream's first-waker behavior, including ready polls.
@@ -207,15 +197,11 @@ impl TimerEntry {
 
     // Keep registration and callback setup out of the repeated-poll stack frame.
     #[inline(never)]
-    fn poll_elapsed_slow(
-        mut self: Pin<&mut Self>,
-        deadline: Instant,
-        cx: &mut Context<'_>,
-    ) -> Poll<TimerResult> {
-        if self.key.get().is_none() {
-            self.as_mut().reset(deadline);
+    fn poll_elapsed_slow(&mut self, deadline: Instant, cx: &mut Context<'_>) -> Poll<TimerResult> {
+        if self.key.is_none() {
+            self.reset(deadline);
         }
-        let key = self.key.get().unwrap();
+        let key = self.key.unwrap();
         // Clone may invoke arbitrary code. This Sleep retains its slot, but
         // the callback can expire it or grow the slab by registering siblings.
         let mut cloned = Some(cx.waker().clone());

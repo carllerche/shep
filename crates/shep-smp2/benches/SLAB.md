@@ -7,8 +7,7 @@ Completion/rejection/error progress returns the associated context directly.
 Comparison with the initial native-foundation baseline, using the same 11
 cases and timing settings. These sequential shared-VM runs are exploratory;
 small changes and timer/handoff variation are not evidence of a speedup or
-regression. The new samples are saved as slab-context; estimates and source
-hashes are in slab.json. Original baseline.json remains unchanged.
+regression. The new samples were saved as slab-context.
 
 | Case | Before median (ns) | Slab median (ns) | Change |
 |---|---:|---:|---:|
@@ -25,8 +24,7 @@ hashes are in slab.json. Original baseline.json remains unchanged.
 | runtime/timer_idle_1ms | 1999829.0 | 2000105.7 | +0.0% |
 
 A longer confirmation run (1 s warmup, 3 s measurement) also showed
-substantial VM variance. Its medians are below; the confidence intervals in
-slab.json should be considered before attributing changes to reply storage.
+substantial VM variance. Its medians are below.
 No speedup or regression is established from these unpaired runs.
 
 | Case | Confirmation median (ns) |
