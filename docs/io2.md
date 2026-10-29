@@ -98,6 +98,11 @@ returns Unsupported, and teardown waits without canceling it. The kernel owns
 its descriptor after publication. Even ECANCELED can be a flush error after
 removal, so no close error causes the driver to reclaim or retry that fd.
 
+Callers should stop producers and ensure all application operations have reached
+terminal completion before runtime shutdown or driver destruction. Dropping a
+future only abandons its result. This lifecycle responsibility is enforced safely:
+unresolved work must never cause inputs to be freed while the kernel can access them.
+
 Driver::drain stops ordinary admission and waits for accepted operations;
 non-completing receives/watches must first be explicitly canceled. Driver drop
 instead closes all admission, submits queued work, cancels outstanding requests,
@@ -186,7 +191,7 @@ sleep before rechecking pending work. It does not copy their unsafe driver
 cell or systemwide memory-barrier mechanisms.
 
 ```sh
-cargo nextest run -p shep-smp2
+cargo nextest run -p shep-smp2 --run-ignored all
 cargo nextest run -p shep-smp2 --features allocation-tests --test io_allocations
 cargo weft test -p shep-smp2
 cargo weft test -p shep-smp2 --test rt_park --weft-runs 1000
@@ -194,6 +199,11 @@ cargo test -p shep-smp2 --doc
 cargo clippy -p shep-smp2 --all-targets -- -D warnings
 MIRIFLAGS='-Zmiri-disable-isolation -Zmiri-tree-borrows' cargo +nightly-2026-10-22 miri test -p shep-smp2 --lib io::
 ```
+
+The ignored teardown-abort test requires native subprocesses and is included by
+`--run-ignored all` above. It verifies SIGABRT on fatal teardown errors and panics
+before retirement. Weft skips this process-level check; cancellation and terminal
+retirement remain covered in simulation.
 
 Pure lifecycle and buffer tests run under Miri; actual io_uring/eventfd tests
 run against a native kernel or weft’s Linux simulation. Compile-fail docs enforce local-only driver/runtime
@@ -232,9 +242,12 @@ The Monoio ownership proposal is implemented with these decisions:
   Application shutdown coordination belongs above smp.
 - Keep safe RefCell borrowing, per-CQE effects outside borrows, cancellation pins,
   bounded publication pressure, and owned inputs on rejection.
-- Keep defensive cancel-and-drain driver destruction as the memory-safety fallback.
-  No new abort-on-unresolved-drop contract is introduced. Runtime shutdown remains
-  an explicit higher-level coordinator; it cancels its watch before drain.
+- Require callers to coordinate completion before shutdown. Keep best-effort
+  cancellation and terminal retirement in driver destruction as the memory-safety
+  fallback; abort the process if teardown fails to establish safe retirement.
+  Unresolved work alone does not trigger immediate abort. Runtime shutdown remains
+  an explicit higher-level coordinator; it cancels its watch before drain. Closing
+  the ring alone is not proof that kernel access to inputs has ended.
 - Use sealed conversions through the existing Operation dispatcher at publication;
   no custom raw-SQE or unsafe buffer interface is added.
 

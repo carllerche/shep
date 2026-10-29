@@ -180,6 +180,18 @@ impl Runtime {
 
     /// Stop task admission, cancel consumers, then retire all kernel resources.
     ///
+    /// Callers should stop application producers and await their operations before
+    /// shutdown. Explicitly cancel indefinite operations and await their terminal
+    /// completions; dropping their futures alone is not sufficient. The runtime
+    /// cancels its own parking watch. Shutdown does not flush application buffers,
+    /// commit transactions, or imply filesystem durability.
+    ///
+    /// If shutdown returns an error, outstanding inputs remain owned. Driver
+    /// destruction attempts cancellation and waits for terminal completions as a
+    /// memory-safety fallback; a fatal teardown error or panic before retirement
+    /// aborts the entire process. Callers must not rely on this fallback to finish
+    /// application work successfully.
+    ///
     /// # Panics
     ///
     /// Panics while another runtime is entered on this thread.

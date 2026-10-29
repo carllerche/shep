@@ -9,6 +9,14 @@
 //! - [`fs`]: positional owned-buffer file operations over [`io`].
 //! - [`net`]: owned-buffer TCP over [`io`].
 //!
+//! Callers should stop producing work and await all application operations before
+//! [`Runtime::shutdown`] or runtime destruction. Cancel indefinite operations and
+//! await their terminal completion first; dropping a future is not completion.
+//! The I/O driver's destructor makes a best-effort cancellation attempt for any
+//! remaining work and waits for terminal completions. If safe retirement fails,
+//! it aborts the process instead of freeing inputs the kernel may still access.
+//! This fallback does not guarantee successful writes, flushes, or transactions.
+//!
 //! ```compile_fail
 //! fn send<T: Send>() {}
 //! send::<shep_smp2::Runtime>();

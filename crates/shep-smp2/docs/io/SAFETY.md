@@ -192,13 +192,25 @@ indexing only.
 
 ## Shutdown and failure
 
+Soundness takes priority over successful cleanup. Callers should stop producers
+and ensure all application operations have reached terminal completion before
+runtime shutdown or driver destruction. Indefinite operations must be explicitly
+canceled and their original terminal CQEs reaped. Dropping an owner, submitting
+cancellation, or receiving only the cancellation CQE is not sufficient. Completed
+results and identity-only cancellation pins may remain alive afterward; the slab
+does not need to be empty. This is a caller lifecycle responsibility, not an unsafe
+precondition: failing to coordinate shutdown must never permit premature freeing
+of kernel-accessed inputs.
+
 Driver::drain closes ordinary admission and explicitly submits/reaps accepted
 operations. Higher layers must cancel non-completing receives/watches first;
 drain intentionally waits for terminal CQEs. It does not imply fsync, resource
 close, or application flush semantics. Runtime parking cancels its own eventfd
 watch through ordinary Cancel before draining.
 
-Driver drop fails all admission, including public cancellations, and submits
+Driver drop provides best-effort cancellation followed by terminal retirement as
+a memory-safety fallback, not a guarantee of successful application work. It
+fails all admission, including public cancellations, and submits
 queued SQEs before issuing targeted cancellations. It scans slab storage once
 without allocating an identity vector, skipping completed, cancellation, and Close
 records. Internal cancellations use their own SQEs after queued work is
@@ -216,8 +228,17 @@ an owner leaks its data and Io reference.
 Destruction may block indefinitely if an operation cannot finish or be canceled.
 A fatal enter/cancel error or panic before retirement aborts the process; it
 must not unwind and free kernel-owned inputs. Transient enter errors are retried.
+Cancellation failure means an unexpected cancellation error; ENOENT and EALREADY
+still require observing the original terminal completion. An operation's own
+error completion establishes retirement and is not itself a teardown failure.
+Neither closing the ring nor relying on asynchronous kernel ring cleanup is a
+substitute for terminal retirement before freeing operation inputs.
 Native tests inject zero progress, transient/fatal enter failures and partial
 submissions using real SQ head movement; accepted requests remain drainable.
+Native subprocess tests verify that fatal teardown errors and pre-retirement
+panics terminate with SIGABRT. Run them with
+`cargo nextest run -p shep-smp2 --run-ignored all`; the subprocess test is ignored
+by default because Weft does not model child processes.
 
 The runtime's RUNNING/PARKING/NOTIFIED/CLOSED atomic handshake, owner-thread
 notification suppression, and scoped executor TLS live above this boundary.

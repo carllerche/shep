@@ -17,6 +17,14 @@
 //! Typed [`Op`] owners retain inputs and can be awaited directly. Drop abandons
 //! a result, boxing inputs only while the kernel still needs them.
 //! Cancel operations also retain their target identity until their CQE retires.
+//!
+//! Before destroying the driver, callers should stop submission and retire every
+//! accepted operation, explicitly canceling indefinite operations as needed.
+//! [`Driver::drain`] waits for terminal completions. Destruction makes a
+//! best-effort cancel-and-drain attempt for remaining work and aborts the process
+//! on failure to establish safe retirement. A cancellation request or closing
+//! the ring alone does not establish that kernel access to inputs has ended.
+//! Completed results and identity-only cancellation pins may outlive the driver.
 //! ```compile_fail
 //! fn send<T: Send>() {}
 //! send::<shep_smp2::io::Io>();

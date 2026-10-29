@@ -341,10 +341,18 @@ impl IoState {
 
 /// Single-owner ring driver with bounded SQ storage and growing operation tracking.
 /// Publication submits/reaps under SQ pressure; explicit batch driving is also available.
-/// Destruction closes admission, cancels outstanding requests, and blocks until
-/// all terminal completions are reaped. Completed results remain available via
-/// retained Io clones. A fatal teardown error aborts the process rather than
-/// releasing resources that the kernel may still access.
+///
+/// Callers should stop producers and retire every accepted operation before
+/// destruction. Cancel indefinite operations and await their terminal completion;
+/// dropping an operation owner only abandons its result. Completed results and
+/// identity-only cancellation pins may outlive this driver.
+///
+/// As a memory-safety fallback, destruction closes admission, attempts cancellation,
+/// and waits until all original terminal completions are reaped. A fatal teardown
+/// error or panic before retirement aborts the entire process rather than releasing
+/// resources the kernel may still access. This is not an application flush or a
+/// promise that accepted operations succeed. There is no teardown deadline;
+/// waiting for terminal completions or metadata-worker jobs may block indefinitely.
 pub struct Driver {
     /// Driver-owned reference to the ring/slab; clones can outlive the driver
     /// to consume completed records, but cannot submit once the ring is closed.
@@ -502,7 +510,7 @@ impl Driver {
             if wait {
                 ring.submit_and_wait(1)
             } else {
-                ring.submit()
+                self.io.shared.submit_ring(ring)
             }
         };
         self.io
@@ -835,3 +843,6 @@ mod tests {
 
 #[cfg(all(test, not(miri)))]
 mod pressure_tests;
+
+#[cfg(all(test, not(miri)))]
+mod teardown_tests;
