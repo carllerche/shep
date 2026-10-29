@@ -23,8 +23,10 @@ use std::{
 ///
 /// Use [`Self::close`] to explicitly await an io_uring CLOSE. Dropping the last
 /// owner otherwise publishes a detached CLOSE through the currently entered
-/// runtime. Outside a runtime, or if its driver is busy/closed/full, close is
-/// synchronous. Drop ignores close errors and stores no runtime reference.
+/// runtime. A full SQ first triggers bounded submission/reaping to make room.
+/// Close falls back to synchronous release when runtime context is unavailable,
+/// the driver is gone/closed/failed or borrowed, publication fails, or bounded
+/// progress cannot free SQ space. Drop ignores errors and stores no runtime reference.
 ///
 /// The descriptor must be live, uniquely owned, and must not refer to an
 /// io_uring instance. Duplicates with distinct descriptor numbers are allowed.
@@ -200,7 +202,7 @@ mod tests {
     use super::*;
     use crate::{
         Runtime,
-        io::{Driver, Operation, Progress},
+        io::{Driver, Operation},
     };
 
     #[test]
@@ -224,7 +226,7 @@ mod tests {
         let enter = runtime.enter();
         loop {
             driver.submit_and_wait(None).unwrap();
-            if driver.reap_into(&mut Progress::default()) != 0 {
+            if driver.tick() != 0 {
                 break;
             }
         }
@@ -261,7 +263,7 @@ mod tests {
         let baseline = io.in_flight();
         let fd = Fd::new(tempfile::tempfile().unwrap()).unwrap();
         let raw = fd.as_raw_fd();
-        let borrow = io.shared.arena.borrow_mut();
+        let borrow = io.shared.state.borrow_mut();
         drop(fd);
         assert!(std::fs::read_link(format!("/proc/self/fd/{raw}")).is_err());
         drop(borrow);

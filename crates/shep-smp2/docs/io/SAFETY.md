@@ -25,21 +25,31 @@ file descriptors. Buffer storage is initialized, so short reads and errors
 never expose uninitialized memory. Lengths fit the kernel's signed result size;
 positional offsets reject the current-position sentinel and signed overflow.
 
-Push performs no submit, reap, wait, or callback. If validation, admission or
-SQ push fails, the unsubmitted operation is returned with its owned inputs.
-After successful publication, an enter error does not justify freeing inputs.
-The ring uses no SQPOLL. Submit and reap are separate explicit phases.
+Push normally only publishes. A full SQ triggers at most two nonblocking
+submit/reap attempts, retrying publication after each. Transient errors and zero
+progress cannot spin indefinitely: an unpublished request returns WouldBlock
+with its owned inputs. Fatal submission errors close admission and notify waiters,
+but neither partial submissions nor errors roll back already-published requests.
+The kernel SQ head determines free space; an enter result is not a list of
+requests safe to free or republish. No software pending queue is added.
+The ring uses no SQPOLL. Explicit submit/reap/wait phases remain available.
+Pressure callbacks and destructors run only after ring and arena borrows end.
+Like Monoio's submit_with_data ordering, pressure is handled before creating and
+publishing the new operation. After callbacks, publication reacquires borrows and
+rechecks admission and SQ space. No callbacks run after successful publication,
+so push_with_guard can attach its guard immediately after push returns. Ring,
+arena and shutdown-cancellation state share one RefCell. Normal completion
+delivery uses stack-owned effects for one CQE, with no notification vectors.
 
 `Io::push_with_guard` additionally retains adapter-owned resources independently
 of the submitter claim. Rejected publication drops the guard immediately. The
-terminal CQE moves an accepted guard out of the slab into `Progress`; `wake`
-releases it outside all driver borrows, before notifying operation waiters.
-Dropping that Progress also releases its guards. Cancellation identity pins and
+terminal CQE moves an accepted guard out of the slab; `tick` releases it outside
+all driver borrows, before notifying that operation’s waiter. Cancellation identity pins and
 unconsumed results do not retain these guards after terminal completion. During
 driver destruction guard release is deferred with the other notifications until
 kernel retirement and ring destruction. Guards must not panic in Drop; wake
-isolates a panicking guard so subsequent notifications can still run. The fs2
-adapter uses guards to keep file/domain activity counted after waiter abandonment.
+isolates a panicking guard so subsequent notifications can still run. The fs
+adapter uses guards to keep file activity counted after waiter abandonment.
 
 The supported operations are Nop, positional ReadAt/WriteAt, Fsync, Fallocate,
 Ftruncate, OpenAt, Close, Socket, Accept, Connect, Send, Recv, Shutdown, PollAdd,
@@ -93,27 +103,32 @@ match. No generations or publicly reusable integer tokens are needed. Rejected
 cancellations return the token, preserving ownership. A retired token cannot
 be resubmitted.
 
-Only operations awaiting CQEs count against kernel capacity. Retained completed
-results and cancellation pins can keep additional slab entries occupied.
-One cancellation SQE has reserved capacity so cancellation can make progress at
-the ordinary limit. A second concurrent cancellation is rejected immediately.
-The physical SQ and default CQ accommodate this single-shot outstanding bound.
-During teardown, after pending SQEs have been submitted and admission has
-failed, one additional internal cancellation may be outstanding. The default
-CQ also accommodates that extra completion.
+`Config::submission_queue_capacity` bounds the physical SQ (rounded up to a
+power of two, valid range 1..=32768). The operation slab grows for outstanding
+requests, completed results and cancellation pins; `in_flight` is a count, not
+an admission limit. Cancellation uses the same SQ-turnover path and has no
+separate outstanding cap. After ordinary admission closes, cancellation remains
+allowed until terminal failure/teardown. The ring requires IORING_FEAT_NODROP:
+CQ overflow retains completions in the kernel rather than losing identities or
+owned resources. Reaping frees CQ space and a later enter flushes overflow.
 There are no admission waiters or software submission backlogs.
 
-The driver retires an entire CQ snapshot and extracts owned wakers before
-calling callbacks. Driver::reap_into appends notifications to reusable caller-owned
-Progress storage and returns a per-call completion count. Progress contains
-wakers, never old slab IDs. Reentrant wakes
-can consume other completed results and submit new operations safely. Replaced
-wakers, abandoned operations, and discarded completion results are destroyed
-after ring and arena RefCell borrows end. A panicking wake is contained so other
-notifications are still delivered. Applications must call Progress::wake to
-notify registered waiters; wake drains notifications while retaining allocation.
-Removed records are collected in driver-owned scratch storage and cleared only
-after ring and arena borrows end.
+Driver::tick consumes and retires one CQE under a state borrow, then releases
+that borrow before destroying removed records, releasing its completion guard,
+and invoking its waker. It repeats for at most the CQ length observed on entry.
+The CQ iterator is dropped before callbacks, publishing its consumed head so a
+nested tick cannot observe the same CQE twice. No raw CQEs or slab IDs remain
+queued in a local snapshot across callbacks. Each iteration rechecks the ring:
+a callback can drive more completions, reuse retired slots, or destroy the owner.
+The return count excludes CQEs retired by nested calls. Later CQEs need not have
+updated their records when the first callback runs.
+
+Effects contain at most one waker, one guard, and two discarded records (the
+completed operation and a cancellation target released by its final pin).
+Replaced wakers, abandoned inputs and discarded results are destroyed outside
+state borrows. Panicking guards and wakes are isolated so subsequent completion
+notifications still run. Teardown alone accumulates guard/waker notifications
+until all kernel access has ended and the ring has been destroyed.
 
 ## Unsafe boundaries
 
@@ -154,10 +169,12 @@ its destructor cleanup.
 
 Outside an entered runtime, during TLS teardown, or while the context is
 mutably borrowed, destruction falls back to synchronous File close. The same
-fallback applies when the current driver is gone, closed, full, or borrowed.
+fallback applies when the current driver is gone, closed, failed, or borrowed,
+publication errors, or bounded SQ progress cannot free a slot. Ordinary SQ
+fullness first submits/reaps existing work and retries detached CLOSE publication.
 Close stores the validated descriptor as a plain File, so rejecting or dropping
 an unpublished Close cannot recursively resubmit through Fd::drop. Publication
-uses fallible ring/arena borrows for reentrant final-owner destruction.
+uses a fallible state borrow for reentrant final-owner destruction.
 Accepted detached closes release their submitter claim immediately and retain
 kernel ownership until completion. CLOSE SQEs use IOSQE_ASYNC to keep potentially
 blocking release work (including socket linger) off the submitting thread.
@@ -192,8 +209,8 @@ watch through ordinary Cancel before draining.
 Driver drop fails all admission, including public cancellations, and submits
 queued SQEs before issuing targeted cancellations. It scans slab storage once
 without allocating an identity vector, skipping completed, cancellation, and Close
-records. Internal cancellations use their own SQEs even if the public reserve
-is occupied. Each cancellation CQE is reaped before issuing the next; ENOENT
+records. Internal cancellations use their own SQEs after queued work is
+submitted, independently of the number of outstanding public requests. Each cancellation CQE is reaped before issuing the next; ENOENT
 and EALREADY are allowed because original completion can race cancellation.
 After issuing cancellations, drop blocks until every original terminal CQE has
 been reaped, including accepted public cancellation requests. Cancel completion
@@ -206,7 +223,8 @@ identity pins afterward. There is no intentional unresolved-payload leak.
 Destruction may block indefinitely if an operation cannot finish or be canceled.
 A fatal enter/cancel error or panic before retirement aborts the process; it
 must not unwind and free kernel-owned inputs. Transient enter errors are retried.
-Fatal enter failures are not currently fault-injected in native tests.
+Native tests inject zero progress, transient/fatal enter failures and partial
+submissions using real SQ head movement; accepted requests remain drainable.
 
 The runtime's RUNNING/PARKING/NOTIFIED/CLOSED atomic handshake, owner-thread
 notification suppression, and scoped executor TLS live above this boundary.
@@ -216,9 +234,10 @@ descriptor through its CQE; cancellation pins that watch's slab identity.
 
 ## Verification limits
 
-Native tests cover split push/submit/reap phases, batching, immediate rejection,
+Native tests cover split push/submit/reap phases, repeated SQ turnover, bounded rejection,
 owned buffers and descriptors, typed fd outputs, positional file operations,
-socket operations, cancellation at capacity, stale cancellation identity,
+socket operations, outstanding reads beyond SQ capacity, cancellation under SQ
+pressure, stale cancellation identity, lingering-socket drop under SQ pressure,
 reentrant and panicking wakers, result retention, and parking races.
 Pure lifecycle and buffer tests run under Miri; Miri cannot validate kernel
 accesses. Kernel ABI and io-uring's SQ/CQ implementation remain trusted.

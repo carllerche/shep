@@ -7,7 +7,6 @@ use std::{
     io::Read,
     pin::pin,
     task::{Context, Poll, Waker},
-    time::{Duration, Instant},
 };
 
 fn poll<F: Future>(f: std::pin::Pin<&mut F>) -> Poll<F::Output> {
@@ -15,7 +14,7 @@ fn poll<F: Future>(f: std::pin::Pin<&mut F>) -> Poll<F::Output> {
 }
 
 #[test]
-fn futures_are_lazy_and_saturation_returns_owned_buffer_immediately() {
+fn futures_are_lazy_and_closed_admission_returns_owned_buffer() {
     let mut reactor = Driver::new(1).unwrap();
     let io = reactor.io().clone();
     let temp = tempfile::tempfile().unwrap();
@@ -25,12 +24,13 @@ fn futures_are_lazy_and_saturation_returns_owned_buffer_immediately() {
     assert_eq!(io.in_flight(), 0);
     assert!(poll(first.as_mut()).is_pending());
     assert_eq!(io.in_flight(), 1);
+    io.close();
     {
         let mut second = pin!(file.write_at(Buffer::from_slice(b"second", 1).unwrap(), 8));
         let Poll::Ready((result, buffer)) = poll(second.as_mut()) else {
-            panic!("fail fast at capacity");
+            panic!("closed admission");
         };
-        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::BrokenPipe);
         assert_eq!(&*buffer, b"second");
         assert_eq!(io.in_flight(), 1);
     }
@@ -70,7 +70,6 @@ fn dropping_a_handle_before_submission_keeps_accepted_work_until_drain() {
 
 #[test]
 fn submitted_waiter_can_be_dropped_and_remaining_operations_complete() {
-    let mut progress = crate::io::Progress::default();
     let mut reactor = Driver::new(2).unwrap();
     let io = reactor.io().clone();
     let file = import(io.clone(), tempfile::tempfile().unwrap());
@@ -78,22 +77,18 @@ fn submitted_waiter_can_be_dropped_and_remaining_operations_complete() {
         let mut write = pin!(file.write_at(Buffer::from_slice(b"submitted", 1).unwrap(), 0));
         assert!(poll(write.as_mut()).is_pending());
         reactor.submit().unwrap();
-        reactor.reap_into(&mut progress);
-        progress.wake();
+        reactor.tick();
     }
     let mut sync = pin!(file.sync_all());
     assert!(poll(sync.as_mut()).is_pending());
-    let end = Instant::now() + Duration::from_secs(2);
     loop {
         reactor.submit().unwrap();
-        reactor.reap_into(&mut progress);
-        progress.wake();
+        reactor.tick();
         if let Poll::Ready(result) = poll(sync.as_mut()) {
             result.unwrap();
             break;
         }
-        assert!(Instant::now() < end);
-        reactor.submit_and_wait(Some(end)).unwrap();
+        reactor.submit_and_wait(None).unwrap();
     }
     reactor.drain().unwrap();
 }

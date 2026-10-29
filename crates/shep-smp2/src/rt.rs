@@ -23,7 +23,7 @@ pub use driver::{Driver, Park, WakeHandle};
 pub use handle::Handle;
 
 use crate::task::JoinHandle;
-use crate::time::{Instant, Timer};
+use crate::time::Timer;
 use shared::Shared;
 use std::{
     future::Future,
@@ -34,11 +34,15 @@ use std::{
 
 #[derive(Clone, Copy, Debug)]
 pub struct Config {
-    pub max_in_flight: usize,
+    /// SQ entries (1..=32768), rounded up to a power of two. Defaults to 256.
+    /// Outstanding operations and retained completions grow independently.
+    pub submission_queue_capacity: usize,
 }
 impl Default for Config {
     fn default() -> Self {
-        Self { max_in_flight: 256 }
+        Self {
+            submission_queue_capacity: 256,
+        }
     }
 }
 
@@ -64,7 +68,7 @@ impl Runtime {
         timer: Option<Timer>,
         wake: impl FnOnce(Waker) -> Waker,
     ) -> io::Result<Self> {
-        let (mut driver, _) = Driver::new(config.max_in_flight)?;
+        let (mut driver, io) = Driver::new(config.submission_queue_capacity)?;
         if let Some(timer) = timer {
             driver.timer = timer;
         }
@@ -73,7 +77,7 @@ impl Runtime {
             send,
             wake(driver.wake_handle().waker()),
         ));
-        let shared = Shared::new(remote, driver.handle());
+        let shared = Shared::new(remote, io, driver.timer.handle());
         Ok(Self {
             handle: Handle::new(shared),
             scheduler: scheduler::Scheduler::new(receive),
@@ -160,31 +164,17 @@ impl Runtime {
         let shared = self.handle.shared();
         let mut root = shared.spawn(future);
         loop {
-            self.driver.poll()?;
-            self.driver.timer.advance(Instant::now());
+            self.driver.tick()?;
             self.scheduler.run_ready(&self.handle);
-            self.driver.poll()?;
-            self.driver.timer.advance(Instant::now());
+            self.driver.tick()?;
             if root.is_finished() {
                 return match Pin::new(&mut root).poll(&mut Context::from_waker(Waker::noop())) {
                     Poll::Ready(result) => result.map_err(io::Error::other),
                     Poll::Pending => unreachable!("finished root has an output"),
                 };
             }
-            if self.scheduler.has_ready(shared) || shared.driver.io.has_pending() {
-                continue;
-            }
-            self.driver.timer.advance(Instant::now());
-            let deadline = self.driver.timer.next_wake();
-            let park = self.driver.prepare_park()?;
-            // This check MUST follow publishing PARKING in prepare_park.
-            // The notification RMW either synchronizes prior inbox publication,
-            // or claims an eventfd write if it observes this parking attempt.
-            if self.scheduler.has_ready(shared) || shared.driver.io.has_pending() {
-                drop(park);
-                continue;
-            }
-            park.wait(deadline)?;
+            self.driver
+                .park_if_idle(|| self.scheduler.has_ready(shared))?;
         }
     }
 
@@ -243,17 +233,39 @@ mod tests {
     #[test]
     fn local_io_timer_and_channel_completions_never_invoke_the_driver_waker() {
         let wakes = Arc::new(AtomicUsize::new(0));
-        let mut runtime = Runtime::build(Config { max_in_flight: 8 }, None, |inner| {
-            Waker::from(Arc::new(CountDriver {
-                wakes: wakes.clone(),
-                inner,
-            }))
-        })
+        let mut runtime = Runtime::build(
+            Config {
+                submission_queue_capacity: 8,
+            },
+            None,
+            |inner| {
+                Waker::from(Arc::new(CountDriver {
+                    wakes: wakes.clone(),
+                    inner,
+                }))
+            },
+        )
         .unwrap();
         let file = runtime
             .block_on(File::from_std(tempfile::tempfile().unwrap()))
             .unwrap()
             .unwrap();
+        // Import uses the foreign metadata worker. Its result can be observed
+        // before it finishes notifying, so fence that job before measuring
+        // notifications caused solely by local I/O, timers and channels.
+        let (send, recv) = std::sync::mpsc::channel();
+        drop(
+            runtime
+                .io()
+                .shared
+                .worker
+                .run(move || {
+                    send.send(()).unwrap();
+                    Ok(())
+                })
+                .unwrap(),
+        );
+        recv.recv().unwrap();
         wakes.store(0, Ordering::Relaxed);
         runtime
             .block_on(async move {

@@ -21,18 +21,25 @@ their separate unsafe implementation and upstream attribution.
 
 ## Driver phases and operations
 
-Io::push(Operation) immediately admits an owned request and publishes its SQE,
-returning an OperationHandle. It performs no submit syscall, wait or reap.
-Full admission/SQ capacity returns Rejected { error: WouldBlock, operation };
-validation and closed admission also return the original inputs. There is no
-admission-waiter map or second queue behind a full queue.
+Io::push(Operation) owns a request and publishes its SQE. On a full SQ it makes
+at most two nonblocking submit/reap attempts before retrying publication. Stalled
+progress returns Rejected { error: WouldBlock, operation }; validation, closure,
+and submission errors also preserve unpublished inputs. Already-published requests
+remain owned across partial submissions and enter errors. No software pending
+queue is added. Completion callbacks run outside driver borrows.
 
-Driver::submit explicitly submits the current batch. Driver::reap_into processes
-available CQEs, returns the number processed, and appends waiter notifications
-to a caller-owned Progress. The caller calls Progress::wake after the batch's
-lifecycle transitions. Progress retains its allocation across wake calls, and
-the driver reuses storage for discarded records. Driver::submit_and_wait
-is an explicit combined submission/wait primitive for an idle runtime.
+Config::submission_queue_capacity bounds the physical SQ, rounded up to a power
+of two (1..=32768). Tracking grows independently for outstanding operations and
+retained results. The ring requires lossless CQ overflow (IORING_FEAT_NODROP).
+
+Driver::submit explicitly submits the current batch. Driver::tick retires one
+available CQE at a time, releases the shared state borrow, and destroys retired
+resources and notifies its waiter before processing the next CQE. There is no
+caller-owned notification batch. A tick processes at most the CQ length observed
+on entry; reentrant calls can consume remaining CQEs safely. Ring, arena, and
+shutdown bookkeeping share one state borrow. Teardown alone defers notifications
+until all kernel access has ended. Driver::submit_and_wait is an explicit combined
+submission/wait primitive for an idle runtime.
 
 Operation explicitly enumerates supported requests: Nop, ReadAt, WriteAt,
 Fsync, Fallocate, Ftruncate, OpenAt, Close, Socket, Accept, Connect, Send, Recv,
@@ -45,7 +52,7 @@ arbitrary raw SQEs and SQE flags are not exposed.
 The private driver module owns the ring, shared storage, and DriverId allocator.
 The io module exposes the safe producer and admission errors. Operation owns
 requests, handles, cancellation tokens, and typed completion values. Arena owns
-the slab, its records, admission counters, and packed OperationId keys.
+the slab, its records, outstanding counts, and packed OperationId keys.
 Lifecycle defines the per-operation Submitted/Waiting/Ignored/Completed states;
 the arena combines their transitions with kernel-reference counts to decide
 slot retirement.
@@ -68,13 +75,13 @@ retirement releases that reference.
 The shared Submitted/Waiting/Ignored/Completed lifecycle follows Monoio's model:
 slots remain occupied until both the submitter and kernel release their claims.
 Releasing a handle marks its request Ignored without freeing kernel-owned data.
-Completed results do not consume kernel admission capacity and remain available
+Completed results remain available
 after driver destruction when the caller retains its Io. Retained completed results may grow the slab.
 
 A CancelTarget pins a live identity until its token is dropped unsubmitted or
 its cancellation CQE arrives. The original operation may complete and its
 values may be consumed first; its slot still cannot be reused for another
-request. One cancellation can be admitted beyond the ordinary in-flight limit.
+request. Cancellation uses the same SQ turnover path without an outstanding cap.
 Cancellation is explicit and does not promise that the target had no effect.
 Accepted Close operations run to completion: canceling an unconsumed Close
 returns Unsupported, and teardown waits without canceling it. The kernel owns
@@ -93,25 +100,23 @@ operation wake waiters; unresolved results panic if polled before retirement.
 
 ## Higher layers
 
-File::from_std binds an already-open std::fs::File to Io. The fs2 adapter
-provides eager submit_read_at/submit_write_at handles and async read_at/write_at
-helpers returning (Result<usize>, Buffer). Async helpers are lazy until polled;
-saturation then returns immediately. Short I/O and partial effects are exposed.
-There are no shared file cursors. sync_data/sync_all await their own completion;
-callers must establish prerequisite write completion before syncing. The lower
-layer's Close takes a uniquely owned descriptor; a high-level resource close
-protocol must first account for its outstanding operations.
+File::open and async File::from_std use the current thread-local runtime.
+Namespace functions live in fs. Positional read_at/write_at return
+(Result<usize>, Buffer); futures are lazy until polled. Short I/O and partial
+effects are exposed, and there are no shared file cursors. sync_data/sync_all
+await their own completion; callers establish prerequisite write completion.
+File::shutdown stops admission across clones and awaits accepted work without
+syncing or closing the descriptor. The lower layer's Close takes a uniquely
+owned descriptor. Detached CLOSEs use the same SQ progress path before fallback.
 
 The driver owns no write backlog, resource-readiness waiter collection,
-durability frontier or background error policy. File writers can retain eager
-handles to track concurrent completion, contiguous progress and durability above
-it. The [net adapter](../crates/shep-smp2/docs/net/README.md) provides TCP
+durability frontier or background error policy. Higher layers track concurrent completion and durability. The [net adapter](../crates/shep-smp2/docs/net/README.md) provides TCP
 serialization through exclusive read/write halves, bounded transfers, flush,
 half-close, and cleanup on dropped futures. It has no background write queue:
 every write awaits completion. Dropping an admitted socket future shuts down
 the resource and requests cancellation; cancellation is terminal for that
 listener or connection. Socket shutdown also retires outstanding work when
-the cancellation reserve is full. A resource registry can likewise be added
+cancellation publication cannot make progress. A resource registry can likewise be added
 without moving operation waiters out of the operation slab.
 
 Current Send/Recv are ordinary single-shot owned-buffer operations. Provided
@@ -121,12 +126,13 @@ building blocks for the eventual buffer-pool TCP API, not implemented by this
 refactor.
 
 Runtime::block_on runs a local root task and services I/O/timers around bounded
-executor turns. Background tasks survive root completion until finished or
-shutdown. Its parking adapter keeps one eventfd PollAdd armed, reserves that
-ordinary operation in addition to Config::max_in_flight, and rearms before
-calling completion wakers. The driver's cancellation reserve permits shutdown
-to retire that watch even at full data capacity. Io::in_flight includes this
-runtime-owned watch. Runtime shutdown cancels task consumers and drains accepted
+executor turns. Reactor tick coordinates submission, completion delivery, watch
+rearming and timer advancement; park_if_idle owns the readiness checks and
+parking handshake. Background tasks survive root completion until finished or
+shutdown. Its parking adapter keeps one eventfd PollAdd armed and checks it
+before parking, including when publication has reaped its CQE. The watch shares
+the configured SQ; no extra outstanding-operation reservation is needed.
+Io::in_flight includes this runtime-owned watch. Runtime shutdown cancels task consumers and drains accepted
 kernel work; users of raw indefinite operations must cancel those operations
 before shutdown. No resource-level forced close policy is inferred.
 
@@ -144,6 +150,9 @@ PARKING -> NOTIFIED writes; later wakes coalesce. The final inbox check and
 retained readable kernel token cover both sides of entering the wait. A delayed
 write from an earlier parking attempt is harmless and drained on a later turn.
 
+The runtime context holds I/O and timer handles directly, without a separate
+driver-handle wrapper. TLS supplies capabilities for new operations; existing
+operations retain their originating driver through their resource adapters.
 The runtime enters executor scoped TLS around its entire driving loop. Matching
 owner wakes enqueue directly into the local ready queue. A mismatch uses the
 target inbox without invoking its driver waker. WakeHandle independently checks
@@ -167,19 +176,34 @@ cell or systemwide memory-barrier mechanisms.
 
 ```sh
 cargo nextest run -p shep-smp2
+cargo weft test -p shep-smp2
+cargo weft test -p shep-smp2 --test rt_park --weft-runs 1000
 cargo test -p shep-smp2 --doc
 cargo clippy -p shep-smp2 --all-targets -- -D warnings
 MIRIFLAGS='-Zmiri-disable-isolation -Zmiri-tree-borrows' cargo +nightly-2026-10-22 miri test -p shep-smp2 --lib io::
 ```
 
 Pure lifecycle and buffer tests run under Miri; actual io_uring/eventfd tests
-require a native kernel. Compile-fail docs enforce local-only driver/runtime
+run against a native kernel or weft’s Linux simulation. Compile-fail docs enforce local-only driver/runtime
 ownership. The [13-case runtime benchmarks](../crates/shep-smp2/benches/README.md)
 cover scheduling, timers, foreign handoff, file batches and parking.
 [Eight driver-only cases](../crates/shep-smp2/benches/io/README.md) isolate
 batching, owned-buffer reuse, ignored completions and identity pins. Historical
 archives retain their original source paths and hashes, including the former
 io2-core crate and former core module. They are measurement records.
+
+Correctness tests synchronize on observable events: first pending polls,
+completion retirement, worker-job fences, and producer/consumer acknowledgements.
+They do not impose elapsed-time upper bounds on I/O or use sleeps to assume that
+another task has started. Native nextest process timeouts and weft execution-step
+bounds detect hangs independently of the application's clock.
+
+Weft's default clock jumps stay enabled. Explicit timer tests check deadline
+semantics; wake/deadline races allow either event to win and verify that work is
+still observed after parking is prepared and readiness is rechecked. The lingering
+socket pressure test checks detached-close publication and descriptor retirement,
+not a wall-clock latency threshold. Submission latency is a performance property;
+these ownership assertions alone do not measure whether kernel submission blocks.
 
 Remaining steps before production migration include buffer-pool networking,
 filesystem resource close/flush APIs, filesystem metadata policy, thread-per-core

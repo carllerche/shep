@@ -14,17 +14,13 @@ fn wake_between_final_check_and_kernel_wait_is_retained() {
     let mut reactor = Driver::new(1).unwrap().0;
     let wake = reactor.wake_handle();
     for _ in 0..100 {
-        reactor.poll().unwrap();
+        reactor.tick().unwrap();
         let park = reactor.prepare_park().unwrap();
         // Force publication after prepare/final-check but before entering wait.
         thread::scope(|s| s.spawn(|| assert!(wake.unpark().unwrap())).join().unwrap());
-        assert_eq!(
-            park.wait(Some(Instant::now() + Duration::from_secs(1)))
-                .unwrap(),
-            WaitOutcome::Ready
-        );
-        // PollAdd must have completed; a following expired wait never blocks.
-        reactor.poll().unwrap();
+        assert_eq!(park.wait(None).unwrap(), WaitOutcome::Ready);
+        // Service the watch before the next prepare/wake round.
+        reactor.tick().unwrap();
     }
 }
 
@@ -53,7 +49,7 @@ fn remote_wake_interrupts_idle_wait_and_watch_rearms() {
     let mut reactor = Driver::new(1).unwrap().0;
     let wake = reactor.wake_handle();
     for _ in 0..20 {
-        reactor.poll().unwrap();
+        reactor.tick().unwrap();
         let park = reactor.prepare_park().unwrap();
         let gate = Arc::new(Barrier::new(2));
         thread::scope(|scope| {
@@ -64,11 +60,7 @@ fn remote_wake_interrupts_idle_wait_and_watch_rearms() {
                 wake.unpark().unwrap();
             });
             gate.wait();
-            assert_eq!(
-                park.wait(Some(Instant::now() + Duration::from_secs(1)))
-                    .unwrap(),
-                WaitOutcome::Ready
-            );
+            assert_eq!(park.wait(None).unwrap(), WaitOutcome::Ready);
         });
     }
 }
@@ -136,4 +128,56 @@ fn shutdown_retires_an_existing_cancel_before_canceling_its_watch() {
     assert!(receive.try_complete(&io).unwrap().result.is_err());
     assert!(cancellation.try_complete(&io).unwrap().result.is_ok());
     assert_eq!(io.in_flight(), 0);
+}
+
+#[test]
+fn work_is_observed_when_a_foreign_wake_races_with_timeout() {
+    let mut reactor = Driver::new(1).unwrap().0;
+    let wake = reactor.wake_handle();
+    let ready = Arc::new(AtomicBool::new(false));
+    let gate = Arc::new(Barrier::new(2));
+    let park = reactor.prepare_park().unwrap();
+    let producer_ready = ready.clone();
+    let producer_gate = gate.clone();
+    let producer = thread::spawn(move || {
+        producer_gate.wait();
+        producer_ready.store(true, Ordering::Release);
+        wake.unpark().unwrap();
+    });
+    gate.wait();
+    // Either the notification or the deadline may win. In particular, weft
+    // can expire this wait before the runnable producer publishes its work.
+    park.wait(Some(Instant::now() + Duration::from_millis(1)))
+        .unwrap();
+    loop {
+        reactor.tick().unwrap();
+        let park = reactor.prepare_park().unwrap();
+        // The real runtime also rechecks runnable work after preparing to park.
+        if ready.load(Ordering::Acquire) {
+            drop(park);
+            break;
+        }
+        park.wait(None).unwrap();
+    }
+    producer.join().unwrap();
+    reactor.shutdown().unwrap();
+}
+
+#[test]
+fn foreign_wake_after_timeout_is_retained_for_the_next_park() {
+    let (mut reactor, _) = Driver::new(1).unwrap();
+    let wake = reactor.wake_handle();
+    let expired = Instant::now();
+    assert_eq!(
+        reactor.prepare_park().unwrap().wait(Some(expired)).unwrap(),
+        WaitOutcome::TimedOut
+    );
+    thread::spawn(move || wake.unpark().unwrap())
+        .join()
+        .unwrap();
+    assert_eq!(
+        reactor.prepare_park().unwrap().wait(None).unwrap(),
+        WaitOutcome::Ready
+    );
+    reactor.shutdown().unwrap();
 }

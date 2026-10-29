@@ -1,6 +1,6 @@
 #![cfg(not(miri))]
 
-use shep_smp2::io::{Driver, Fd, Operation, Progress, Value};
+use shep_smp2::io::{Driver, Fd, Operation, Value};
 use std::{fs::File, os::fd::AsRawFd};
 
 fn poll<F: std::future::Future>(future: std::pin::Pin<&mut F>) -> std::task::Poll<F::Output> {
@@ -19,7 +19,7 @@ fn explicit_async_close_waits_for_the_ring() {
     assert_eq!(driver.in_flight(), 1);
     loop {
         driver.submit_and_wait(None).unwrap();
-        driver.reap_into(&mut Progress::default());
+        driver.tick();
         if let std::task::Poll::Ready(result) = poll(close.as_mut()) {
             result.unwrap();
             break;
@@ -60,13 +60,14 @@ fn rejected_async_close_uses_synchronous_fallback() {
     let mut driver = Driver::new(1).unwrap();
     let io = driver.io().clone();
     let mut nop = driver.push(Operation::Nop).unwrap();
+    io.close();
     let fd = Fd::new(File::open("/dev/null").unwrap()).unwrap();
     let raw = fd.as_raw_fd();
     let mut close = Box::pin(fd.close(&io));
     let std::task::Poll::Ready(result) = poll(close.as_mut()) else {
-        panic!("full admission must reject immediately")
+        panic!("closed admission must reject immediately")
     };
-    assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+    assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::BrokenPipe);
     assert_closed(raw);
     nop.release(&io);
     driver.drain().unwrap();
@@ -159,7 +160,7 @@ fn kernel_created_descriptors_can_be_closed_without_reimporting() {
         })
         .unwrap();
     driver.submit_and_wait(None).unwrap();
-    driver.reap_into(&mut Progress::default());
+    driver.tick();
     let Value::File(fd) = socket.try_complete(driver.io()).unwrap().result.unwrap() else {
         panic!("socket did not return an Fd")
     };

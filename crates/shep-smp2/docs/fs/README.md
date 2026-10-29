@@ -56,8 +56,10 @@ later alignment-query error or cancellation; those effects are not rolled back.
 Read/write, open, allocation, truncation, and file sync use the I/O driver.
 Length/alignment queries, directory creation/listing, rename, unlink and directory
 sync use one lazily started worker per driver. Its queue has 64 slots in addition
-to the executing job. Worker or driver saturation returns `WouldBlock`; there is
-no hidden admission backlog or weighted scheduling.
+to the executing job. Worker saturation returns `WouldBlock`. The driver's bounded
+submission queue turns over through submission/reaping when full; stalled progress
+returns `WouldBlock`. Outstanding operation tracking grows independently of the SQ.
+There is no software submission backlog or weighted scheduling.
 
 ## Ordering and lifetime
 

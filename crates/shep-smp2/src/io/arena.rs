@@ -61,7 +61,7 @@ pub(crate) struct Record {
     kernel_refs: usize,
     /// Whether the original terminal CQE has been reaped; pins may still remain.
     own_done: bool,
-    /// Whether this request uses the separate one-operation cancellation reserve.
+    /// Whether this request is a cancellation (excluded from teardown targets).
     cancel: bool,
 }
 /// Owns requests and enforces admission separately from completed-result retention.
@@ -74,49 +74,38 @@ pub(crate) struct Arena {
     entries: Slab<Record>,
     /// Accepted operations awaiting their original CQEs, including cancellation SQEs.
     active: usize,
-    /// Outstanding cancellation SQEs; at most one, excluded from ordinary capacity.
-    cancel_active: usize,
-    /// Maximum ordinary operations awaiting CQEs; completed results do not count.
-    capacity: usize,
-    /// Ordinary admission is closed; the cancellation reserve remains usable.
+    /// Ordinary admission is closed; cancellations remain allowed.
     closed: bool,
     /// Terminal driver failure; all admission, including cancellation, is rejected.
     failed: bool,
 }
 impl Arena {
-    /// Create an empty arena with ordinary capacity and one reserved cancellation slot.
+    /// Create an arena with an initial reservation; storage grows as needed.
     pub(crate) fn new(capacity: usize, driver_id: DriverId) -> Self {
         Self {
             driver_id,
-            entries: Slab::with_capacity(capacity + 1),
+            entries: Slab::with_capacity(capacity),
             active: 0,
-            cancel_active: 0,
-            capacity,
             closed: false,
             failed: false,
         }
     }
+    /// Check the admission gate without allocating a record or publishing work.
+    pub(crate) fn check_admission(&self, operation: &Operation) -> io::Result<()> {
+        if self.failed || (self.closed && !operation.is_cancel()) {
+            Err(io::ErrorKind::BrokenPipe.into())
+        } else {
+            Ok(())
+        }
+    }
     /// Create Submitted with one original-CQE reference and a submitter claim.
     /// BrokenPipe rejects closed ordinary admission or any admission after failure;
-    /// WouldBlock rejects exhausted capacity, cancellation reserve, or index space.
+    /// WouldBlock rejects exhausted packed identity space.
     /// On rejection, return inputs unchanged; no lifecycle entry is created.
     pub(crate) fn insert(&mut self, operation: Operation) -> Result<OperationId, Rejected> {
         let cancel = operation.is_cancel();
-        let error = if self.failed || (self.closed && !cancel) {
-            Some(io::ErrorKind::BrokenPipe)
-        } else if (cancel && self.cancel_active != 0)
-            || (!cancel && self.active - self.cancel_active == self.capacity)
-        {
-            // One reserved cancellation permits progress even at the regular limit.
-            Some(io::ErrorKind::WouldBlock)
-        } else {
-            None
-        };
-        if let Some(error) = error {
-            return Err(Rejected {
-                operation,
-                error: error.into(),
-            });
+        if let Err(error) = self.check_admission(&operation) {
+            return Err(Rejected { operation, error });
         }
         let entry = self.entries.vacant_entry();
         let Some(id) = OperationId::new(self.driver_id, entry.key()) else {
@@ -134,7 +123,6 @@ impl Arena {
             cancel,
         });
         self.active += 1;
-        self.cancel_active += usize::from(cancel);
         Ok(id)
     }
     /// Borrow a live record; panic if its slot is absent. Owner validation is external.
@@ -151,7 +139,6 @@ impl Arena {
         assert!(matches!(record.lifecycle, Lifecycle::Submitted));
         assert_eq!(record.kernel_refs, 1);
         self.active -= 1;
-        self.cancel_active -= usize::from(record.cancel);
         Rejected {
             operation: record.operation.unwrap(),
             error,
@@ -200,7 +187,6 @@ impl Arena {
             _ => unreachable!(),
         };
         record.lifecycle = next;
-        self.cancel_active -= usize::from(self.entries[id.index()].cancel);
         self.active -= 1;
         (wake, self.unpin(id))
     }
@@ -394,7 +380,7 @@ mod tests {
         assert_eq!(arena.len(), 0);
     }
     #[test]
-    fn completed_results_do_not_consume_kernel_capacity() {
+    fn completed_results_and_new_requests_have_independent_lifetimes() {
         let mut arena = Arena::new(1, DriverId::allocate().unwrap());
         let first = arena.insert(operation()).unwrap();
         arena.complete(first, Ok(Value::Count(0)));
@@ -410,10 +396,6 @@ mod tests {
     fn rejection_and_closure_preserve_unaccepted_values() {
         let mut arena = Arena::new(1, DriverId::allocate().unwrap());
         let first = arena.insert(operation()).unwrap();
-        assert_eq!(
-            arena.insert(operation()).unwrap_err().error.kind(),
-            io::ErrorKind::WouldBlock
-        );
         let rejected = arena.reject(first, io::ErrorKind::WouldBlock.into());
         assert_eq!(arena.in_flight(), 0);
         arena.close();

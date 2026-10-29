@@ -202,20 +202,19 @@ mod tests {
         assert_no_write(&event);
     }
     #[test]
-    fn a_delayed_foreign_notification_interrupts_a_kernel_wait() {
+    fn a_foreign_notification_racing_with_kernel_wait_is_retained() {
         let mut reactor = Driver::new(1).unwrap().0;
         let event = reactor.event.as_ref().unwrap().clone();
         let wake = reactor.wake_handle();
         let park = reactor.prepare_park().unwrap();
+        let gate = Arc::new(std::sync::Barrier::new(2));
+        let remote_gate = gate.clone();
         let writer = thread::spawn(move || {
-            thread::sleep(Duration::from_millis(5));
+            remote_gate.wait();
             wake.unpark().unwrap();
         });
-        assert_eq!(
-            park.wait(Some(Instant::now() + Duration::from_secs(1)))
-                .unwrap(),
-            WaitOutcome::Ready
-        );
+        gate.wait();
+        assert_eq!(park.wait(None).unwrap(), WaitOutcome::Ready);
         writer.join().unwrap();
         assert_eq!(counter(&event).unwrap(), 1);
     }

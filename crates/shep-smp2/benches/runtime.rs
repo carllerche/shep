@@ -117,7 +117,7 @@ fn main() {
             let park = reactor.prepare_park().unwrap();
             wake.unpark().unwrap();
             park.wait(None).unwrap();
-            reactor.poll().unwrap();
+            reactor.tick().unwrap();
         })
     });
     c.bench_function("park/foreign_running_burst_1024", |b| {
@@ -163,7 +163,7 @@ fn main() {
                 send.send(()).unwrap();
                 park.wait(None).unwrap();
                 done.recv().unwrap();
-                reactor.poll().unwrap();
+                reactor.tick().unwrap();
             });
             drop(send);
         });

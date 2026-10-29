@@ -299,7 +299,7 @@ impl OperationHandle {
     pub fn try_complete(&mut self, io: &Io) -> Option<Completion> {
         let id = self.id.expect("operation already consumed");
         id.check(io.shared.id);
-        let result = io.shared.arena.borrow_mut().take(id)?;
+        let result = io.shared.state.borrow_mut().arena.take(id)?;
         self.id = None;
         Some(result)
     }
@@ -318,7 +318,12 @@ impl OperationHandle {
             !io.is_failed(),
             "io_uring driver failed with unresolved resources"
         );
-        let old = io.shared.arena.borrow_mut().wait(self.id.unwrap(), waker);
+        let old = io
+            .shared
+            .state
+            .borrow_mut()
+            .arena
+            .wait(self.id.unwrap(), waker);
         drop(old);
         match self.try_complete(io) {
             Some(result) => Poll::Ready(result),
@@ -335,7 +340,7 @@ impl OperationHandle {
         if let Some(id) = self.id {
             id.check(io.shared.id);
             self.id = None;
-            let released = io.shared.arena.borrow_mut().abandon(id);
+            let released = io.shared.state.borrow_mut().arena.abandon(id);
             drop(released);
         }
     }
@@ -346,7 +351,7 @@ impl OperationHandle {
     pub fn cancel_target(&self, io: &Io) -> CancelTarget {
         let id = self.id.expect("operation already consumed");
         id.check(io.shared.id);
-        io.shared.arena.borrow_mut().pin(id);
+        io.shared.state.borrow_mut().arena.pin(id);
         CancelTarget {
             io: Some(io.clone()),
             id,
@@ -389,7 +394,7 @@ impl Drop for CancelTarget {
     /// only if that was its final kernel ref. A retired token is already disarmed.
     fn drop(&mut self) {
         if let Some(io) = self.io.take() {
-            let released = io.shared.arena.borrow_mut().unpin(self.id);
+            let released = io.shared.state.borrow_mut().arena.unpin(self.id);
             drop(released);
         }
     }

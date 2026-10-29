@@ -9,8 +9,10 @@
 //! CLOSE admission performs no descriptor validation syscall. Standard File and
 //! socket wrappers use checked conversions because they can contain arbitrary fds.
 //!
-//! [`Io::push`] owns and publishes an [`Operation`] without submitting it.
-//! [`Driver::submit`] submits a batch; [`Driver::reap_into`] only processes CQEs.
+//! [`Io::push`] owns and publishes an [`Operation`], submitting existing SQEs
+//! and reaping available completions when the bounded submission queue is full.
+//! Tracking grows independently of SQ capacity; no software pending queue is used.
+//! [`Driver::submit`] submits a batch; [`Driver::tick`] retires CQEs and delivers notifications.
 //! [`OperationHandle::poll_complete`] observes an operation's shared lifecycle.
 //! Handles contain only a packed ID. Pass the allocating Io to complete or
 //! explicitly release them; adapters release dropped futures with borrowed guards.
@@ -34,7 +36,7 @@ mod operation;
 mod producer;
 pub(crate) mod support;
 pub use buffer::Buffer;
-pub use driver::{Driver, Progress, WaitOutcome};
+pub use driver::{Driver, WaitOutcome};
 pub use fd::Fd;
 pub use operation::{
     CancelTarget, Close, Completion, Operation, OperationHandle, SocketAddress, Value,

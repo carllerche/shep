@@ -32,7 +32,9 @@ runtime.block_on(async move {
 - `Config::max_buffer_size` defaults to 64 KiB and bounds each transfer and
   send in `write_all` (the whole buffer may exceed the limit). Oversized buffers
   passed to `read` or `write` return `InvalidInput`.
-  Driver admission saturation returns `WouldBlock`, preserving the input buffer.
+  A full driver SQ triggers bounded submission/reaping; stalled progress returns
+  `WouldBlock`, preserving the unpublished input buffer. Outstanding requests are
+  not capped by SQ capacity.
   There is no admission waiter, background write queue, or buffer pool.
 - `split` borrows one exclusive reader and one exclusive writer. They can run
   concurrently; two operations on the same direction cannot overlap. Streams
@@ -44,14 +46,14 @@ runtime.block_on(async move {
   shuts down both directions and releases the descriptor. Applications requiring
   a peer response should half-close, read that response, and then close.
 - Futures are lazy. Dropping an admitted operation shuts down **the entire
-  connection or listener**, requests cancellation when capacity permits, and
+  connection or listener**, requests cancellation when publication can progress, and
   releases its completion claim. This may leave partial network effects.
   Canceling an accept requires rebinding a listener to accept again. Unpolled
   futures have no effects. Rejected operations leave the resource usable.
 
 Socket shutdown is synchronous and does not wait for network I/O. It ensures
 pending accepts, sends, receives and connection readiness waits can retire even
-when the single driver cancellation reserve is occupied. Operations retain their
+when cancellation publication cannot make progress. Operations retain their
 owned descriptors and buffers until the driver reaps them. Runtime shutdown
 drops task consumers before draining the driver, triggering this cleanup.
 Dropping a stream also shuts down its socket. The last descriptor owner then
@@ -59,8 +61,10 @@ publishes a detached io_uring CLOSE through the currently entered runtime,
 even if an outstanding operation retained the descriptor beyond the stream's
 lifetime. CLOSE runs on an io_uring worker
 so a positive SO_LINGER setting does not block normal drop or ring submission.
-The driver must continue to be driven to finish accepted closes. If the driver
-is gone, closed, full, or currently borrowed, or no runtime is entered,
+Ordinary SQ fullness first triggers bounded submission/reaping, including for
+detached closes. The driver must continue to be driven to finish accepted closes. If the driver
+is gone, closed, failed, or currently borrowed, no runtime context is available,
+or publication fails or bounded SQ progress is exhausted,
 destruction falls back to a synchronous close; that fallback can still wait for
 linger. The descriptor stores no runtime reference. Callers importing standard sockets must not retain
 aliases that perform I/O or change socket flags.
@@ -80,5 +84,5 @@ cargo nextest run -p shep-smp2 --test net_tcp
 
 Tests cover short sends, bounded chunking, half-close, EOF/reset, connection
 refusal, owned-buffer rejection, lazy futures, canceled connection waits,
-accept/read/write cleanup with saturated cancellation capacity, and runtime
+accept/read/write cleanup under SQ pressure, and runtime
 shutdown with live socket tasks.

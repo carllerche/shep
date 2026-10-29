@@ -49,7 +49,7 @@ impl Handle {
     }
 
     pub fn io(&self) -> Io {
-        self.shared.driver.io.clone()
+        self.shared.io.clone()
     }
 
     pub(crate) fn shared(&self) -> &Shared {

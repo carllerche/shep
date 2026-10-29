@@ -37,7 +37,10 @@ fn storage_file_contract_allocation_trimming_and_publication() {
         assert_eq!(&buffer[..6], b"record");
     }
     let dir = tempfile::tempdir().unwrap();
-    let mut runtime = Runtime::new(Config { max_in_flight: 8 }).unwrap();
+    let mut runtime = Runtime::new(Config {
+        submission_queue_capacity: 8,
+    })
+    .unwrap();
     runtime
         .block_on(async move {
             let nested = dir.path().join("data");
@@ -71,7 +74,10 @@ fn storage_file_contract_allocation_trimming_and_publication() {
 fn shutdown_tracks_abandoned_futures_and_retained_results() {
     use shep_smp2::fs::OpenOptions;
     let dir = tempfile::tempdir().unwrap();
-    let mut runtime = Runtime::new(Config { max_in_flight: 8 }).unwrap();
+    let mut runtime = Runtime::new(Config {
+        submission_queue_capacity: 8,
+    })
+    .unwrap();
     let io = runtime.io();
     runtime
         .block_on(async move {
@@ -113,7 +119,10 @@ fn shutdown_tracks_abandoned_futures_and_retained_results() {
 
 #[test]
 fn dropping_async_write_and_canceling_shutdown_does_not_reopen_gate() {
-    let mut runtime = Runtime::new(Config { max_in_flight: 4 }).unwrap();
+    let mut runtime = Runtime::new(Config {
+        submission_queue_capacity: 4,
+    })
+    .unwrap();
     runtime
         .block_on(async move {
             let file = File::from_std(tempfile::tempfile().unwrap()).await.unwrap();
@@ -138,7 +147,10 @@ fn direct_io_discovers_alignment_validates_inputs_and_imports() {
     use std::os::unix::fs::OpenOptionsExt;
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("direct");
-    let mut runtime = Runtime::new(Config { max_in_flight: 8 }).unwrap();
+    let mut runtime = Runtime::new(Config {
+        submission_queue_capacity: 8,
+    })
+    .unwrap();
     runtime
         .block_on(async move {
             let file = File::open(
@@ -185,12 +197,15 @@ fn direct_io_discovers_alignment_validates_inputs_and_imports() {
 }
 
 #[test]
-fn invalid_open_exclusive_creation_and_saturation_have_no_unaccepted_effects() {
+fn invalid_open_and_exclusive_creation_reject_but_sq_pressure_makes_progress() {
     use shep_smp2::fs::OpenOptions;
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("data");
     std::fs::write(&path, b"keep").unwrap();
-    let mut runtime = Runtime::new(Config { max_in_flight: 1 }).unwrap();
+    let mut runtime = Runtime::new(Config {
+        submission_queue_capacity: 1,
+    })
+    .unwrap();
     let io = runtime.io();
     runtime
         .block_on(async move {
@@ -228,18 +243,17 @@ fn invalid_open_exclusive_creation_and_saturation_have_no_unaccepted_effects() {
             assert_eq!(std::fs::read(&path).unwrap(), b"keep");
             let mut handle = io.push(shep_smp2::io::Operation::Nop).unwrap();
             let other = dir.path().join("not-created");
-            let mut open = Box::pin(File::open(
+            let file = File::open(
                 &other,
                 OpenOptions {
                     create_new: true,
                     ..Default::default()
                 },
-            ));
-            let Poll::Ready(Err(error)) = poll(open.as_mut()) else {
-                panic!("full admission must reject")
-            };
-            assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
-            assert!(!other.exists());
+            )
+            .await
+            .unwrap();
+            assert!(other.exists());
+            file.shutdown().await;
             handle.release(&io);
         })
         .unwrap();

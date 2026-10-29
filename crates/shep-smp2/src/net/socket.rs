@@ -29,7 +29,7 @@ impl Socket {
     pub(super) fn abort(&self) {
         self.closed.set(true);
         // Also terminates queued receives/sends and accepts submitted *after*
-        // this call. Cancellation alone is insufficient when its reserve is full.
+        // this call. Cancellation alone is insufficient when publication cannot progress.
         let _ = shep_sys::shutdown(&*self.file, std::net::Shutdown::Both);
     }
     pub(super) async fn run(

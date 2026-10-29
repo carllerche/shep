@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 #![cfg(not(miri))]
-use shep_smp2::io::{Buffer, Completion, Driver, Fd, Operation, OperationHandle, Progress, Value};
+use shep_smp2::io::{Buffer, Completion, Driver, Fd, Operation, OperationHandle, Value};
 use std::{
     ffi::CString,
     fs::{File, OpenOptions},
@@ -12,10 +12,8 @@ use std::{
 };
 
 fn finish(driver: &mut Driver, handle: &mut OperationHandle) -> Completion {
-    let mut progress = Progress::default();
     loop {
-        driver.reap_into(&mut progress);
-        progress.wake();
+        driver.tick();
         if let Some(done) = handle.try_complete(driver.io()) {
             return done;
         }
@@ -39,7 +37,7 @@ fn assert_close_result(result: std::io::Result<Value>) {
 }
 
 #[test]
-fn progress_accumulates_across_reaps_and_can_be_reused_after_waking() {
+fn tick_delivers_each_notification_once() {
     use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
     struct Count(AtomicUsize);
     impl std::task::Wake for Count {
@@ -48,7 +46,7 @@ fn progress_accumulates_across_reaps_and_can_be_reused_after_waking() {
         }
     }
     let mut driver = Driver::new(1).unwrap();
-    let mut progress = Progress::default();
+
     let count = Arc::new(Count(AtomicUsize::new(0)));
     let waker = Waker::from(count.clone());
     for round in 0..3 {
@@ -61,18 +59,14 @@ fn progress_accumulates_across_reaps_and_can_be_reused_after_waking() {
         let mut completed = 0;
         while driver.in_flight() != 0 {
             driver.submit_and_wait(None).unwrap();
-            completed += driver.reap_into(&mut progress);
+            completed += driver.tick();
         }
         assert_eq!(completed, 1);
-        assert_eq!(driver.reap_into(&mut progress), 0);
+        assert_eq!(driver.tick(), 0);
         handle.try_complete(driver.io()).unwrap().result.unwrap();
-        assert_eq!(count.0.load(Relaxed), if round == 2 { 2 } else { 0 });
-        if round >= 1 {
-            progress.wake();
-            assert_eq!(count.0.load(Relaxed), round + 1);
-        }
+        assert_eq!(count.0.load(Relaxed), round + 1);
     }
-    progress.wake();
+
     assert_eq!(count.0.load(Relaxed), 3);
     driver.drain().unwrap();
 }
@@ -84,7 +78,7 @@ fn push_reap_and_submit_are_separate_batch_phases() {
         .map(|_| driver.push(Operation::Nop).unwrap())
         .collect();
     assert!(driver.has_pending());
-    assert_eq!(driver.reap_into(&mut Progress::default()), 0);
+    assert_eq!(driver.tick(), 0);
     assert!(
         handles
             .iter_mut()
@@ -99,20 +93,21 @@ fn push_reap_and_submit_are_separate_batch_phases() {
 }
 
 #[test]
-fn full_admission_rejects_immediately_with_original_buffer() {
+fn full_sq_submits_existing_work_and_preserves_buffer() {
     let mut driver = Driver::new(1).unwrap();
     let mut first = driver.push(Operation::Nop).unwrap();
     let buffer = Buffer::from_slice(b"ownership", 64).unwrap();
     let address = buffer.as_ptr();
-    let rejected = driver
+    let mut second = driver
         .push(Operation::WriteAt {
             file: std::rc::Rc::new(Fd::new(tempfile::tempfile().unwrap()).unwrap()),
             buffer,
             offset: 0,
         })
-        .unwrap_err();
-    assert_eq!(rejected.error.kind(), std::io::ErrorKind::WouldBlock);
-    assert_eq!(rejected.operation.buffer().unwrap().as_ptr(), address);
+        .unwrap();
+    let completion = finish(&mut driver, &mut second);
+    assert_eq!(completion.result.unwrap().into_count(), 9);
+    assert_eq!(completion.operation.buffer().unwrap().as_ptr(), address);
     finish(&mut driver, &mut first).result.unwrap();
     driver.drain().unwrap();
 }
@@ -217,7 +212,7 @@ fn positional_owned_buffers_and_errors_preserve_allocation() {
 }
 
 #[test]
-fn cancellation_reserve_works_at_capacity_and_retains_target_identity() {
+fn cancellation_turns_over_full_sq_and_retains_target_identity() {
     let mut driver = Driver::new(1).unwrap();
     let (socket, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
     let socket = std::rc::Rc::new(Fd::new(File::from(OwnedFd::from(socket))).unwrap());
@@ -442,8 +437,12 @@ fn reentrant_wake_consumes_another_result_and_pushes_into_reused_slot() {
         }
     }
     let mut driver = Driver::new(2).unwrap();
-    let mut a = driver.push(Operation::Nop).unwrap();
     let mut b = driver.push(Operation::Nop).unwrap();
+    while driver.in_flight() != 0 {
+        driver.submit_and_wait(None).unwrap();
+        driver.tick();
+    }
+    let mut a = driver.push(Operation::Nop).unwrap();
     let next = Rc::new(RefCell::new(None));
     let output = next.clone();
     let io = driver.io().clone();
@@ -461,13 +460,13 @@ fn reentrant_wake_consumes_another_result_and_pushes_into_reused_slot() {
         a.poll_complete(driver.io(), &mut Context::from_waker(&waker))
             .is_pending()
     );
-    // Defer notification until the whole batch is retired, as a runtime may do.
-    let mut progress = Progress::default();
+    // The callback consumes an earlier completion and reuses its freed slot.
+
     while driver.in_flight() != 0 {
         driver.submit_and_wait(None).unwrap();
-        driver.reap_into(&mut progress);
+        driver.tick();
     }
-    progress.wake();
+
     a.try_complete(driver.io()).unwrap().result.unwrap();
     finish(&mut driver, next.borrow_mut().as_mut().unwrap())
         .result
@@ -584,7 +583,7 @@ fn retained_results_grow_slab_without_moving_kernel_buffers() {
     let mut driver = Driver::new(1).unwrap();
     let file = std::rc::Rc::new(Fd::new(tempfile::tempfile().unwrap()).unwrap());
     let mut handles = Vec::new();
-    let mut progress = Progress::default();
+
     for offset in 0..64 {
         let buffer = Buffer::from_slice(b"stable", 64).unwrap();
         let pointer = buffer.as_ptr();
@@ -597,8 +596,7 @@ fn retained_results_grow_slab_without_moving_kernel_buffers() {
             .unwrap();
         while driver.in_flight() != 0 {
             driver.submit_and_wait(None).unwrap();
-            driver.reap_into(&mut progress);
-            progress.wake();
+            driver.tick();
         }
         handles.push((handle, pointer));
     }
@@ -646,7 +644,7 @@ fn zero_length_and_eof_preserve_initialized_buffers_and_file_position() {
 #[test]
 fn invalid_capacity_and_position_are_rejected() {
     assert!(Driver::new(0).is_err());
-    assert!(Driver::new(32768).is_err());
+    assert!(Driver::new(32769).is_err());
     let driver = Driver::new(1).unwrap();
     let file = std::rc::Rc::new(Fd::new(tempfile::tempfile().unwrap()).unwrap());
     let buffer = Buffer::from_slice(b"untouched", 8).unwrap();
@@ -689,7 +687,7 @@ fn ignored_open_output_is_closed_when_its_cqe_is_reaped() {
     driver.submit_and_wait(None).unwrap();
     // The kernel-created descriptor exists before its ignored result is reaped.
     assert_eq!(descriptors_for(original.path()), 2);
-    assert_eq!(driver.reap_into(&mut Progress::default()), 1);
+    assert_eq!(driver.tick(), 1);
     assert_eq!(descriptors_for(original.path()), 1);
     driver.drain().unwrap();
 }
@@ -844,7 +842,7 @@ fn drop_cancels_queued_and_submitted_work_at_full_capacity() {
                 })
                 .unwrap();
             drop(socket);
-            // Occupy the public cancellation reserve too. Teardown must still
+            // Leave a public cancellation outstanding too. Teardown must still
             // cancel the other receive and watch, without data from the peer.
             let mut cancellation = driver
                 .push(Operation::Cancel(receive.cancel_target(&io)))
@@ -993,20 +991,28 @@ fn completion_guards_outlive_claims_and_release_outside_borrows() {
         drops: drops.clone(),
     };
     let mut handle = io.push_with_guard(Operation::Nop, guard()).unwrap();
-    assert!(io.push_with_guard(Operation::Nop, guard()).is_err());
+    assert!(
+        io.push_with_guard(
+            Operation::Ftruncate {
+                file: std::rc::Rc::new(Fd::new(tempfile::tempfile().unwrap()).unwrap()),
+                len: u64::MAX,
+            },
+            guard()
+        )
+        .is_err()
+    );
     assert_eq!(drops.get(), 1, "rejection releases guard immediately");
     handle.release(&io);
     assert_eq!(drops.get(), 1, "abandonment must retain guard");
-    let mut progress = shep_smp2::io::Progress::default();
+
     // A successful wait attempt is not proof of completion. Reap until the
-    // request retires, keeping guard release deferred until progress.wake().
+    // request retires and tick releases its guard.
     while io.in_flight() != 0 {
         driver.submit_and_wait(None).unwrap();
-        driver.reap_into(&mut progress);
+        driver.tick();
     }
     assert_eq!(io.in_flight(), 0);
-    assert_eq!(drops.get(), 1, "notifications remain deferred");
-    progress.wake();
+
     assert_eq!(drops.get(), 2);
     let mut pending = io.push_with_guard(Operation::Nop, guard()).unwrap();
     pending.release(&io);
@@ -1049,4 +1055,97 @@ fn send_range_validates_bounds_and_returns_original_buffer() {
     let mut bytes = [0; 7];
     receiver.read_exact(&mut bytes).unwrap();
     assert_eq!(&bytes, b"PAYLOAD");
+}
+
+#[test]
+fn outstanding_reads_grow_beyond_sq_capacity_and_cancel_across_turnovers() {
+    let mut driver = Driver::new(2).unwrap();
+    let io = driver.io().clone();
+    let (socket, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+    let socket = std::rc::Rc::new(Fd::new(socket).unwrap());
+    let mut reads = Vec::new();
+    let mut pointers = Vec::new();
+    for _ in 0..64 {
+        let buffer = Buffer::new(8, 1).unwrap();
+        pointers.push(buffer.as_ptr());
+        reads.push(
+            io.push(Operation::Recv {
+                socket: socket.clone(),
+                buffer,
+            })
+            .unwrap(),
+        );
+    }
+    assert_eq!(io.in_flight(), 64, "SQ capacity does not cap blocked reads");
+    let mut cancels: Vec<_> = reads
+        .iter()
+        .map(|read| io.push(Operation::Cancel(read.cancel_target(&io))).unwrap())
+        .collect();
+    driver.drain().unwrap();
+    for (read, pointer) in reads.iter_mut().zip(pointers) {
+        let done = read.try_complete(&io).unwrap();
+        assert_eq!(
+            done.result.unwrap_err().raw_os_error(),
+            Some(libc::ECANCELED)
+        );
+        assert_eq!(done.operation.buffer().unwrap().as_ptr(), pointer);
+    }
+    for cancel in &mut cancels {
+        cancel.try_complete(&io).unwrap().result.unwrap();
+    }
+    assert_eq!(io.in_flight(), 0);
+}
+
+#[test]
+fn repeated_sq_turnover_retains_all_unconsumed_completions() {
+    let mut driver = Driver::new(2).unwrap();
+    let mut handles: Vec<_> = (0..1024)
+        .map(|_| driver.push(Operation::Nop).unwrap())
+        .collect();
+    driver.drain().unwrap();
+    for handle in &mut handles {
+        handle.try_complete(driver.io()).unwrap().result.unwrap();
+    }
+    assert_eq!(driver.in_flight(), 0);
+}
+
+#[test]
+fn drop_retires_more_blocked_reads_than_ring_capacity_with_retained_pins() {
+    let driver = Driver::new(2).unwrap();
+    let io = driver.io().clone();
+    let (socket, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+    let socket = std::rc::Rc::new(Fd::new(socket).unwrap());
+    let weak = std::rc::Rc::downgrade(&socket);
+    let mut handles: Vec<_> = (0..32)
+        .map(|_| {
+            io.push(Operation::Recv {
+                socket: socket.clone(),
+                buffer: Buffer::new(8, 1).unwrap(),
+            })
+            .unwrap()
+        })
+        .collect();
+    let pin = handles[0].cancel_target(&io);
+    handles[0].release(&io);
+    drop(socket);
+    assert_eq!(io.in_flight(), 32);
+    drop(driver);
+    assert_eq!(io.in_flight(), 0);
+    for handle in &mut handles[1..] {
+        assert_eq!(
+            handle
+                .try_complete(&io)
+                .unwrap()
+                .result
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::ECANCELED)
+        );
+    }
+    assert!(
+        weak.upgrade().is_some(),
+        "unpublished cancellation still pins its target"
+    );
+    drop(pin);
+    assert!(weak.upgrade().is_none());
 }

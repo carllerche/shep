@@ -1,15 +1,13 @@
 //! Driver costs without executor/task allocations or an admission backlog.
 #![forbid(unsafe_code)]
 use criterion::{BenchmarkId, Criterion, Throughput};
-use shep_smp2::io::{Buffer, Driver, Fd, Operation, Progress};
+use shep_smp2::io::{Buffer, Driver, Fd, Operation};
 use std::{hint::black_box, time::Duration};
 
 fn retire(driver: &mut Driver) {
-    let mut progress = Progress::default();
     driver.submit().unwrap();
     while driver.in_flight() != 0 {
-        driver.reap_into(&mut progress);
-        progress.wake();
+        driver.tick();
         if driver.in_flight() != 0 {
             driver.submit_and_wait(None).unwrap();
         }

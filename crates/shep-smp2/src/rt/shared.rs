@@ -1,7 +1,7 @@
 //! Admission and service handles; execution state belongs to the scheduler.
 #![forbid(unsafe_code)]
 
-use super::{context, driver::Handle as DriverHandle, remote::Remote};
+use super::{context, remote::Remote};
 use crate::task::{JoinHandle, LocalOwnedTasks, Notified, TaskId, new_task};
 use std::sync::atomic::Ordering;
 use std::{cell::RefCell, collections::VecDeque, future::Future, sync::Arc};
@@ -10,16 +10,18 @@ pub(crate) struct Shared {
     pub(super) owned: LocalOwnedTasks,
     inject: RefCell<VecDeque<Notified>>,
     pub(super) remote: Arc<Remote>,
-    pub(crate) driver: DriverHandle,
+    pub(crate) io: crate::io::Io,
+    pub(crate) timer: crate::time::Handle,
 }
 
 impl Shared {
-    pub(super) fn new(remote: Arc<Remote>, driver: DriverHandle) -> Self {
+    pub(super) fn new(remote: Arc<Remote>, io: crate::io::Io, timer: crate::time::Handle) -> Self {
         Self {
             owned: LocalOwnedTasks::default(),
             inject: RefCell::default(),
             remote,
-            driver,
+            io,
+            timer,
         }
     }
 

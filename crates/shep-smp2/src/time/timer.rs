@@ -205,7 +205,7 @@ impl Handle {
     ///
     /// Panics outside a runtime context.
     pub(crate) fn current() -> Self {
-        crate::rt::context::with_current(|rt| rt.shared().driver.timer.clone())
+        crate::rt::context::with_current(|rt| rt.shared().timer.clone())
             .expect("timers must be created from within a shep_smp2 runtime")
     }
 }

@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 use shep_smp2::Runtime;
-use shep_smp2::io::{Driver, Operation, Progress};
+use shep_smp2::io::{Driver, Operation};
 use shep_smp2::net::{Buffer, Config, TcpListener, TcpStream};
 use std::{
     future::Future,
@@ -8,7 +8,7 @@ use std::{
     net::{Shutdown, SocketAddr},
     pin::pin,
     task::{Context, Waker},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 fn address() -> SocketAddr {
@@ -21,22 +21,12 @@ fn pair() -> (std::net::TcpStream, std::net::TcpStream) {
     let listener = std::net::TcpListener::bind(address()).unwrap();
     let client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
     let (server, _) = listener.accept().unwrap();
-    client
-        .set_read_timeout(Some(Duration::from_secs(3)))
-        .unwrap();
-    server
-        .set_read_timeout(Some(Duration::from_secs(3)))
-        .unwrap();
     (client, server)
 }
 fn drain(driver: &mut Driver) {
-    let end = Instant::now() + Duration::from_secs(3);
-    let mut progress = Progress::default();
     while driver.io().in_flight() != 0 {
-        assert!(Instant::now() < end, "socket work did not retire");
-        driver.submit_and_wait(Some(end)).unwrap();
-        driver.reap_into(&mut progress);
-        progress.wake();
+        driver.submit_and_wait(None).unwrap();
+        driver.tick();
     }
 }
 
@@ -102,16 +92,13 @@ fn native_connect_accept_and_full_duplex_half_close() {
 }
 
 #[test]
-fn bounds_and_saturation_return_original_buffer_without_closing_socket() {
+fn bounds_return_original_buffer_without_closing_socket() {
     let mut driver = Driver::new(1).unwrap();
     let io = driver.io().clone();
     let (client, _peer) = pair();
     let mut stream = TcpStream::from_std(&io, client, Config { max_buffer_size: 4 }).unwrap();
     let mut noop = io.push(Operation::Nop).unwrap();
-    for (len, kind) in [
-        (5, std::io::ErrorKind::InvalidInput),
-        (4, std::io::ErrorKind::WouldBlock),
-    ] {
+    for (len, kind) in [(5, std::io::ErrorKind::InvalidInput)] {
         let buffer = Buffer::new(len, 1).unwrap();
         let pointer = buffer.as_ptr();
         let mut future = pin!(stream.write(buffer));
@@ -135,7 +122,7 @@ fn bounds_and_saturation_return_original_buffer_without_closing_socket() {
 }
 
 #[test]
-fn dropping_multiple_queued_receives_retires_even_with_cancel_reserve_full() {
+fn dropping_multiple_receives_retires_across_sq_turnover() {
     let mut driver = Driver::new(2).unwrap();
     let io = driver.io().clone();
     let (a, mut peer_a) = pair();
@@ -148,8 +135,8 @@ fn dropping_multiple_queued_receives_retires_even_with_cancel_reserve_full() {
     assert!(first.as_mut().poll(&mut cx).is_pending());
     assert!(second.as_mut().poll(&mut cx).is_pending());
     assert_eq!(io.in_flight(), 2);
-    drop(first); // Occupies the cancellation reserve.
-    drop(second); // Shutdown must work even though Cancel is rejected.
+    drop(first); // Publish cancellation, turning over the SQ if necessary.
+    drop(second); // Concurrent cancellation has no separate outstanding cap.
     drain(&mut driver);
     assert_eq!(peer_a.read(&mut [0; 1]).unwrap(), 0);
     assert_eq!(peer_b.read(&mut [0; 1]).unwrap(), 0);
@@ -194,10 +181,39 @@ fn runtime_shutdown_aborts_live_accept_and_receive_tasks() {
     let mut listener = TcpListener::bind(&io, address(), Config::default()).unwrap();
     let (stream, mut peer) = pair();
     let mut stream = TcpStream::from_std(&io, stream, Config::default()).unwrap();
-    runtime.spawn(async move { listener.accept().await });
-    runtime.spawn(async move { stream.read(Buffer::new(8, 1).unwrap()).await });
+    let (accept_started, accept_ready) = tokio::sync::oneshot::channel();
+    let (read_started, read_ready) = tokio::sync::oneshot::channel();
+    runtime.spawn(async move {
+        let mut accept = pin!(listener.accept());
+        let mut started = Some(accept_started);
+        std::future::poll_fn(|cx| {
+            let result = accept.as_mut().poll(cx);
+            if let Some(started) = started.take() {
+                assert!(result.is_pending());
+                started.send(()).unwrap();
+            }
+            result
+        })
+        .await
+    });
+    runtime.spawn(async move {
+        let mut read = pin!(stream.read(Buffer::new(8, 1).unwrap()));
+        let mut started = Some(read_started);
+        std::future::poll_fn(|cx| {
+            let result = read.as_mut().poll(cx);
+            if let Some(started) = started.take() {
+                assert!(result.is_pending());
+                started.send(()).unwrap();
+            }
+            result
+        })
+        .await
+    });
     runtime
-        .block_on(async { shep_smp2::sleep(Duration::from_millis(5)).await })
+        .block_on(async {
+            accept_ready.await.unwrap();
+            read_ready.await.unwrap();
+        })
         .unwrap();
     runtime.shutdown().unwrap();
     assert_eq!(io.in_flight(), 0);
@@ -270,7 +286,7 @@ fn short_writes_and_write_all_preserve_byte_order_under_backpressure() {
     let expected = bytes.clone();
     let (sent_first, start_reading) = std::sync::mpsc::channel();
     let reader = std::thread::spawn(move || {
-        start_reading.recv_timeout(Duration::from_secs(3)).unwrap();
+        start_reading.recv().unwrap();
         let mut actual = Vec::new();
         peer.read_to_end(&mut actual).unwrap();
         assert_eq!(actual, expected);
@@ -307,7 +323,7 @@ fn short_writes_and_write_all_preserve_byte_order_under_backpressure() {
 }
 
 #[test]
-fn dropping_blocked_sends_retires_without_cancellation_capacity() {
+fn dropping_blocked_sends_retires_under_sq_pressure() {
     let mut driver = Driver::new(2).unwrap();
     let mut streams = Vec::new();
     let mut peers = Vec::new();
@@ -339,7 +355,7 @@ fn dropping_blocked_sends_retires_without_cancellation_capacity() {
 }
 
 #[test]
-fn dropping_connect_waits_at_full_capacity_retires_all_work() {
+fn dropping_connect_waits_retires_all_work_with_a_small_sq() {
     let listener = std::net::TcpListener::bind(address()).unwrap();
     let address = listener.local_addr().unwrap();
     let mut driver = Driver::new(2).unwrap();
@@ -370,13 +386,14 @@ fn write_all_returns_owned_buffer_on_rejection_and_handles_empty_buffers() {
     assert_eq!(buffer.as_ptr(), ptr);
     drop(empty);
     let mut occupied = driver.push(Operation::Nop).unwrap();
+    driver.io().close();
     let buffer = Buffer::from_slice(b"more than the send limit", 64).unwrap();
     let ptr = buffer.as_ptr();
     let mut write = Box::pin(stream.write_all(buffer));
     let std::task::Poll::Ready((result, buffer)) = write.as_mut().poll(&mut cx) else {
         panic!("admission rejection must complete immediately")
     };
-    assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+    assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::BrokenPipe);
     assert_eq!(buffer.as_ptr(), ptr);
     assert_eq!(&*buffer, b"more than the send limit");
     drop(write);
@@ -385,7 +402,7 @@ fn write_all_returns_owned_buffer_on_rejection_and_handles_empty_buffers() {
 }
 
 #[test]
-fn imported_lingering_socket_drops_and_submits_without_waiting_for_the_peer() {
+fn imported_lingering_socket_publishes_detached_close_under_sq_pressure() {
     use std::os::fd::AsRawFd;
 
     let (mut client, peer) = pair();
@@ -403,31 +420,36 @@ fn imported_lingering_socket_drops_and_submits_without_waiting_for_the_peer() {
     }
     assert!(sent > 0);
     let raw = client.as_raw_fd();
-    let mut runtime = runtime();
+    let mut runtime = Runtime::new(shep_smp2::Config {
+        submission_queue_capacity: 2,
+    })
+    .unwrap();
     let io = runtime.io();
+    // The watch plus this blocked receive fill the two-entry SQ. Drop must
+    // submit them and publish CLOSE. Check the accepted request and descriptor
+    // ownership directly; elapsed time cannot distinguish blocking from scheduling.
+    let (blocked, blocked_peer) = pair();
+    let mut blocked_read = io
+        .push(Operation::Recv {
+            socket: std::rc::Rc::new(shep_smp2::io::Fd::new(blocked).unwrap()),
+            buffer: Buffer::new(1, 1).unwrap(),
+        })
+        .unwrap();
     let baseline = io.in_flight();
     let stream = TcpStream::from_std(&io, client, Config::default()).unwrap();
     let enter = runtime.enter();
-    let start = Instant::now();
     drop(stream);
-    assert!(
-        start.elapsed() < Duration::from_secs(1),
-        "Drop waited for linger"
-    );
     assert_eq!(
         io.in_flight(),
         baseline + 1,
         "Drop must publish a detached CLOSE"
     );
     assert!(std::fs::read_link(format!("/proc/self/fd/{raw}")).is_ok());
-    let start = Instant::now();
     runtime.block_on(async {}).unwrap();
-    assert!(
-        start.elapsed() < Duration::from_secs(1),
-        "submit waited for linger"
-    );
     // Release the unread peer so the worker can finish promptly.
     drop(peer);
+    drop(blocked_peer);
+    blocked_read.release(&io);
     runtime.shutdown().unwrap();
     drop(enter);
     assert!(std::fs::read_link(format!("/proc/self/fd/{raw}")).is_err());
@@ -437,30 +459,25 @@ fn imported_lingering_socket_drops_and_submits_without_waiting_for_the_peer() {
 fn socket_drop_falls_back_when_close_cannot_be_published() {
     use std::os::fd::AsRawFd;
 
-    for unavailable in 0..4 {
+    for unavailable in 1..4 {
         let (client, _peer) = pair();
         let raw = client.as_raw_fd();
-        let mut runtime = Some(Runtime::new(shep_smp2::Config { max_in_flight: 1 }).unwrap());
+        let mut runtime = Some(
+            Runtime::new(shep_smp2::Config {
+                submission_queue_capacity: 1,
+            })
+            .unwrap(),
+        );
         let io = runtime.as_ref().unwrap().io();
         let stream = TcpStream::from_std(&io, client, Config::default()).unwrap();
         let enter = (unavailable != 3).then(|| runtime.as_ref().unwrap().enter());
-        let mut occupied = match unavailable {
-            0 => Some(io.push(Operation::Nop).unwrap()),
-            1 => {
-                io.close();
-                None
-            }
-            2 => {
-                drop(runtime.take());
-                None
-            }
-            _ => None, // A live runtime exists, but is not entered.
-        };
+        match unavailable {
+            1 => io.close(),
+            2 => drop(runtime.take()),
+            _ => {} // A live runtime exists, but is not entered.
+        }
         drop(stream);
         assert!(std::fs::read_link(format!("/proc/self/fd/{raw}")).is_err());
-        if let Some(handle) = &mut occupied {
-            handle.release(&io);
-        }
         if let Some(runtime) = &mut runtime {
             runtime.shutdown().unwrap();
         }
