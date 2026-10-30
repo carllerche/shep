@@ -32,7 +32,6 @@ fn drain(driver: &mut Driver) {
 
 fn complete<F: Future>(driver: &mut Driver, future: F) -> F::Output {
     let mut future = pin!(future);
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
         if let std::task::Poll::Ready(output) = future
             .as_mut()
@@ -40,11 +39,9 @@ fn complete<F: Future>(driver: &mut Driver, future: F) -> F::Output {
         {
             return output;
         }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "operation did not retire"
-        );
-        driver.submit_and_wait(Some(deadline)).unwrap();
+        // The runner bounds test execution. Simulated time can jump while I/O
+        // is runnable, so a wall-clock deadline is not a progress assertion.
+        driver.submit_and_wait(None).unwrap();
         driver.tick();
     }
 }
@@ -672,7 +669,6 @@ fn completed_write_cancellation_preserves_success_and_abandoned_accept_closes_re
 
     let mut listener = TcpListener::bind(driver.io(), address(), Config::default()).unwrap();
     let mut peer = std::net::TcpStream::connect(listener.local_addr()).unwrap();
-    peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
     let mut accept = listener.accept();
     assert!(
         std::pin::Pin::new(&mut accept)

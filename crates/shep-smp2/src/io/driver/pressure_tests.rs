@@ -530,7 +530,7 @@ fn network_cancellation_submits_once_then_retries_after_admission_closes() {
 
 #[test]
 fn rejected_network_cancellation_has_no_backlog_and_awaits_natural_completion() {
-    use std::{future::Future, io::Write, pin::Pin, task::Waker, time::Duration};
+    use std::{future::Future, io::Write, pin::Pin, task::Waker};
     for error in [
         None,
         Some(libc::EINTR),
@@ -554,9 +554,6 @@ fn rejected_network_cancellation_has_no_backlog_and_awaits_natural_completion() 
         assert!(io.shared.submit_faults.borrow().is_empty());
         assert_eq!(io.in_flight(), 1, "second publication attempt failed");
         driver.submit().unwrap();
-        driver
-            .submit_and_wait(Some(Instant::now() + Duration::from_millis(5)))
-            .unwrap();
         driver.tick();
         assert!(!io.has_pending(), "there is no deferred cancellation");
         assert_eq!(io.in_flight(), 1, "the receive is still live");
@@ -608,45 +605,78 @@ fn failed_cancellation_publication_releases_pin_and_preserves_fatal_error_handli
 
 #[test]
 fn runtime_shutdown_waits_for_uncanceled_read_on_surviving_socket() {
-    use std::{future::Future, io::Write, pin::Pin, sync::mpsc, task::Waker, time::Duration};
-    let (started, peer_ready) = mpsc::channel();
-    let (finished, done) = mpsc::channel();
-    let worker = std::thread::spawn(move || {
-        let mut runtime = crate::Runtime::new(crate::Config {
-            submission_queue_capacity: 2,
-        })
-        .unwrap();
-        let io = runtime.io();
-        let (mut stream, peer) = network_pair(&io);
-        let mut read = stream.read(Buffer::new(1, 1).unwrap());
-        assert!(
-            Pin::new(&mut read)
-                .poll(&mut Context::from_waker(Waker::noop()))
-                .is_pending()
-        );
-        // Wake watch + receive fill the SQ. Drop cannot publish its cancellation.
-        io.shared.submit_faults.borrow_mut().push_back(SubmitFault {
-            count: 0,
-            error: None,
-        });
-        drop(read);
-        assert!(io.shared.submit_faults.borrow().is_empty());
-        assert_eq!(io.in_flight(), 2);
-        started.send(peer).unwrap();
-        runtime.shutdown().unwrap();
-        assert_eq!(io.in_flight(), 0);
-        finished.send(()).unwrap();
-        drop(stream);
-    });
-    let mut peer = peer_ready.recv_timeout(Duration::from_secs(5)).unwrap();
+    use std::{future::Future, io::Write, pin::Pin, task::Waker};
+
+    struct ReleasePeer {
+        peer: std::net::TcpStream,
+        shutting_down: Rc<Cell<bool>>,
+        released: Rc<Cell<bool>>,
+    }
+    impl Drop for ReleasePeer {
+        fn drop(&mut self) {
+            assert!(
+                self.shutting_down.get(),
+                "peer must remain idle until shutdown"
+            );
+            self.peer.write_all(b"X").unwrap();
+            self.released.set(true);
+        }
+    }
+
+    let mut runtime = crate::Runtime::new(crate::Config {
+        submission_queue_capacity: 4,
+    })
+    .unwrap();
+    let io = runtime.io();
+    let (mut stream, peer) = network_pair(&io);
+    let mut read = stream.read(Buffer::new(1, 1).unwrap());
     assert!(
-        matches!(
-            done.recv_timeout(Duration::from_millis(50)),
-            Err(mpsc::RecvTimeoutError::Timeout)
-        ),
-        "shutdown must not return while the abandoned receive is pending"
+        Pin::new(&mut read)
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending()
     );
-    peer.write_all(b"X").unwrap();
-    done.recv_timeout(Duration::from_secs(5)).unwrap();
-    worker.join().unwrap();
+
+    // Only reaping this NOP releases the peer to finish the receive. Nothing
+    // drives the ring before shutdown, so this is an explicit progress handshake
+    // inside shutdown, independent of elapsed time or thread scheduling.
+    let shutting_down = Rc::new(Cell::new(false));
+    let released = Rc::new(Cell::new(false));
+    let mut signal = on_complete(
+        &io,
+        Operation::Nop,
+        ReleasePeer {
+            peer,
+            shutting_down: shutting_down.clone(),
+            released: released.clone(),
+        },
+    )
+    .unwrap();
+    let mut filler = io.push(Operation::Nop).unwrap();
+
+    // Watch + receive + two NOPs fill the SQ. Drop loses its cancellation.
+    io.shared.submit_faults.borrow_mut().push_back(SubmitFault {
+        count: 0,
+        error: None,
+    });
+    drop(read);
+    assert!(io.shared.submit_faults.borrow().is_empty());
+    assert_eq!(io.in_flight(), 4);
+    assert!(!released.get());
+
+    shutting_down.set(true);
+    runtime.shutdown().unwrap();
+    assert!(
+        released.get(),
+        "shutdown must reap the completion that releases the peer"
+    );
+    assert_eq!(
+        io.in_flight(),
+        0,
+        "shutdown must also retire the abandoned receive"
+    );
+    signal.try_complete().unwrap().result.unwrap();
+    filler.try_complete().unwrap().result.unwrap();
+    // Keep the socket owner alive through shutdown: owner destruction must not
+    // be what causes the receive to finish.
+    drop(stream);
 }
