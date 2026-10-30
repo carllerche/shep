@@ -1,4 +1,4 @@
-use crate::io::{Completion, Fd, Io, Op, OperationData, Recv, Rejected, Send, Value};
+use crate::io::{Completion, Fd, Io, Op, OperationData, Recv, Rejected, Send};
 use crate::net::{Buffer, Config};
 use std::{
     cell::Cell,
@@ -47,42 +47,8 @@ impl Socket {
         self.io.submit(operation).map(|handle| Pending {
             socket: self,
             handle: Some(handle),
+            cancel_requested: false,
         })
-    }
-    pub(super) async fn transfer<T: Transfer>(
-        &self,
-        buffer: Buffer,
-    ) -> (io::Result<usize>, Buffer) {
-        let check = self.check().and_then(|()| {
-            if T::WRITE && self.write_closed.get() {
-                Err(io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    "write direction closed",
-                ))
-            } else if buffer.len() > self.config.max_buffer_size {
-                Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "TCP buffer exceeds configured limit",
-                ))
-            } else {
-                Ok(())
-            }
-        });
-        if let Err(error) = check {
-            return (Err(error), buffer);
-        }
-        if buffer.is_empty() {
-            return (Ok(0), buffer);
-        }
-        let pending = match self.run(T::new(self.file.clone(), buffer)) {
-            Ok(pending) => pending,
-            Err(rejected) => return (Err(rejected.error), rejected.operation.into_buffer()),
-        };
-        let completion = pending.await;
-        (
-            completion.result.map(Value::into_count),
-            completion.operation.into_buffer(),
-        )
     }
 }
 impl Drop for Socket {
@@ -108,11 +74,23 @@ macro_rules! transfers {
 }
 transfers!(Send => true, Recv => false);
 
-/// The awaitable owner is also the abort-on-abandonment guard. There is no
-/// enclosing async frame retaining a second operation argument or poll closure.
+/// Owns the completion claim and requests operation cancellation on abandonment.
 pub(super) struct Pending<'a, T: OperationData> {
     socket: &'a Socket,
     handle: Option<Op<T>>,
+    cancel_requested: bool,
+}
+impl<T: OperationData> Pending<'_, T> {
+    pub(super) fn request_cancel(&mut self) {
+        if !self.cancel_requested {
+            if let Some(handle) = &self.handle {
+                // Cancellation publication is best effort. The original claim
+                // (or its abandonment storage) still owns inputs until completion.
+                let _ = self.socket.io.request_cancel(handle.cancel_target());
+            }
+            self.cancel_requested = true;
+        }
+    }
 }
 impl<T: OperationData> Future for Pending<'_, T> {
     type Output = Completion<T>;
@@ -130,13 +108,7 @@ impl<T: OperationData> Future for Pending<'_, T> {
 }
 impl<T: OperationData> Drop for Pending<'_, T> {
     fn drop(&mut self) {
-        if let Some(mut handle) = self.handle.take() {
-            self.socket.abort();
-            let target = handle.cancel_target();
-            if let Ok(mut cancel) = self.socket.io.submit(target) {
-                cancel.release();
-            }
-            handle.release();
-        }
+        self.request_cancel();
+        // Op's destructor abandons its result, retaining kernel-owned inputs.
     }
 }

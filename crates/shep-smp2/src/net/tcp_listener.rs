@@ -1,9 +1,9 @@
-use crate::io::{Accept, Fd, Io, Value};
-use crate::net::{Config, TcpStream, socket::Socket};
+use crate::io::{Fd, Io};
+use crate::net::{Accept, Config, socket::Socket};
 use std::{io, net::SocketAddr, os::fd::OwnedFd};
 
 /// One local listener. Only one accept may be outstanding.
-/// Canceling an admitted accept closes the listener; bind a new one to resume.
+/// Canceling an accept leaves the listener open; await cancellation before reusing it.
 pub struct TcpListener {
     socket: Socket,
     address: SocketAddr,
@@ -26,21 +26,8 @@ impl TcpListener {
     pub fn local_addr(&self) -> SocketAddr {
         self.address
     }
-    pub async fn accept(&mut self) -> io::Result<TcpStream> {
-        self.socket.check()?;
-        let completion = self
-            .socket
-            .run(Accept {
-                socket: self.socket.file.clone(),
-            })
-            .map_err(|r| r.error)?
-            .await;
-        match completion.result? {
-            Value::File(file) => Ok(TcpStream {
-                socket: Socket::new(&self.socket.io, file, self.socket.config),
-            }),
-            _ => unreachable!("accept returns a descriptor"),
-        }
+    pub fn accept(&mut self) -> Accept<'_> {
+        Accept::new(&self.socket)
     }
     /// Stop accepting. Pending kernel work retains its descriptor until reaped.
     pub fn close(self) {

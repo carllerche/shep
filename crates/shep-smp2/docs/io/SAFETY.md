@@ -266,3 +266,23 @@ pressure, stale cancellation identity, lingering-socket drop under SQ pressure,
 reentrant and panicking wakers, result retention, and parking races.
 Pure lifecycle and buffer tests run under Miri; Miri cannot validate kernel
 accesses. Kernel ABI and io-uring's SQ/CQ implementation remain trusted.
+
+## Best-effort network cancellation
+
+Network operation abandonment and explicit cancel attempt cancellation publication
+once. On SQ pressure they submit existing SQEs and retry once, without reaping
+completions on that path. Transient submission errors still permit the retry;
+fatal errors close admission and wake waiters through existing failure handling.
+There is no software cancellation backlog. A second rejected publication is
+abandoned, leaving the original request and its kernel-owned inputs tracked.
+
+Each cancellation target pins its original operation identity. Successful
+publication transfers the pin to the cancellation record until its CQE; rejection
+releases the unpublished pin. The original terminal completion, never merely a
+cancel CQE, permits returning or destroying the original buffer. Explicit
+`cancel().await` still waits for that result if cancellation could not be published.
+
+Normal runtime shutdown stops tasks and drives accepted work to terminal
+completion. It may wait indefinitely for an uncanceled receive on a surviving
+socket. It does not compensate with a new sweep or free inputs on a deadline.
+The existing driver-destructor cancellation and retirement fallback is unchanged.

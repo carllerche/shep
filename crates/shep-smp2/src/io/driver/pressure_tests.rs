@@ -483,3 +483,170 @@ fn dropping_replaced_waker_can_reap_the_operation_before_poll_returns() {
     );
     assert_eq!(io.in_flight(), 0);
 }
+
+fn network_pair(io: &Io) -> (crate::net::TcpStream, std::net::TcpStream) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (peer, _) = listener.accept().unwrap();
+    let stream = crate::net::TcpStream::from_std(io, client, Default::default()).unwrap();
+    (stream, peer)
+}
+
+#[test]
+fn network_cancellation_submits_once_then_retries_after_admission_closes() {
+    use std::{future::Future, pin::Pin, task::Waker};
+    for error in [
+        None,
+        Some(libc::EINTR),
+        Some(libc::EAGAIN),
+        Some(libc::EBUSY),
+    ] {
+        let mut driver = Driver::new(1).unwrap();
+        let io = driver.io().clone();
+        let (mut stream, _peer) = network_pair(&io);
+        let buffer = Buffer::new(1, 64).unwrap();
+        let ptr = buffer.as_ptr();
+        let mut read = stream.read(buffer);
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(Pin::new(&mut read).poll(&mut cx).is_pending());
+        io.close();
+        io.shared
+            .submit_faults
+            .borrow_mut()
+            .push_back(SubmitFault { count: 1, error });
+        let mut cancellation = Box::pin(read.cancel());
+        assert!(cancellation.as_mut().poll(&mut cx).is_pending());
+        assert!(io.shared.submit_faults.borrow().is_empty());
+        assert_eq!(io.in_flight(), 2, "original and published cancellation");
+        driver.drain().unwrap();
+        let std::task::Poll::Ready((result, buffer)) = cancellation.as_mut().poll(&mut cx) else {
+            panic!("canceled receive must have retired");
+        };
+        assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::ECANCELED));
+        assert_eq!(buffer.as_ptr(), ptr);
+        assert_eq!(io.in_flight(), 0);
+    }
+}
+
+#[test]
+fn rejected_network_cancellation_has_no_backlog_and_awaits_natural_completion() {
+    use std::{future::Future, io::Write, pin::Pin, task::Waker, time::Duration};
+    for error in [
+        None,
+        Some(libc::EINTR),
+        Some(libc::EAGAIN),
+        Some(libc::EBUSY),
+    ] {
+        let mut driver = Driver::new(1).unwrap();
+        let io = driver.io().clone();
+        let (mut stream, mut peer) = network_pair(&io);
+        let buffer = Buffer::new(1, 64).unwrap();
+        let ptr = buffer.as_ptr();
+        let mut read = stream.read(buffer);
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(Pin::new(&mut read).poll(&mut cx).is_pending());
+        io.shared
+            .submit_faults
+            .borrow_mut()
+            .push_back(SubmitFault { count: 0, error });
+        let mut cancellation = Box::pin(read.cancel());
+        assert!(cancellation.as_mut().poll(&mut cx).is_pending());
+        assert!(io.shared.submit_faults.borrow().is_empty());
+        assert_eq!(io.in_flight(), 1, "second publication attempt failed");
+        driver.submit().unwrap();
+        driver
+            .submit_and_wait(Some(Instant::now() + Duration::from_millis(5)))
+            .unwrap();
+        driver.tick();
+        assert!(!io.has_pending(), "there is no deferred cancellation");
+        assert_eq!(io.in_flight(), 1, "the receive is still live");
+        assert!(cancellation.as_mut().poll(&mut cx).is_pending());
+        peer.write_all(b"X").unwrap();
+        driver.drain().unwrap();
+        let std::task::Poll::Ready((result, buffer)) = cancellation.as_mut().poll(&mut cx) else {
+            panic!("natural completion must return the original buffer");
+        };
+        assert_eq!(result.unwrap(), 1);
+        assert_eq!(buffer.as_ptr(), ptr);
+        assert_eq!(&*buffer, b"X");
+    }
+}
+
+#[test]
+fn failed_cancellation_publication_releases_pin_and_preserves_fatal_error_handling() {
+    for error in [None, Some(libc::EIO)] {
+        let mut driver = Driver::new(1).unwrap();
+        let io = driver.io().clone();
+        let weak = Rc::downgrade(&io.shared);
+        let mut original = io.push(Operation::Nop).unwrap();
+        io.shared
+            .submit_faults
+            .borrow_mut()
+            .push_back(SubmitFault { count: 0, error });
+        let rejected = io.request_cancel(original.cancel_target()).unwrap_err();
+        if error.is_some() {
+            assert_eq!(rejected.raw_os_error(), error);
+            assert!(io.is_failed());
+        } else {
+            assert_eq!(rejected.kind(), io::ErrorKind::WouldBlock);
+            assert!(!io.is_failed());
+        }
+        assert_eq!(io.in_flight(), 1);
+        original.release();
+        drop(original);
+        if error.is_none() {
+            driver.drain().unwrap();
+        }
+        // Failed drivers use the existing cancel-and-retire destructor fallback.
+        drop(driver);
+        assert_eq!(io.in_flight(), 0);
+        assert_eq!(io.shared.state.borrow().arena.len(), 0);
+        drop(io);
+        assert!(weak.upgrade().is_none());
+    }
+}
+
+#[test]
+fn runtime_shutdown_waits_for_uncanceled_read_on_surviving_socket() {
+    use std::{future::Future, io::Write, pin::Pin, sync::mpsc, task::Waker, time::Duration};
+    let (started, peer_ready) = mpsc::channel();
+    let (finished, done) = mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let mut runtime = crate::Runtime::new(crate::Config {
+            submission_queue_capacity: 2,
+        })
+        .unwrap();
+        let io = runtime.io();
+        let (mut stream, peer) = network_pair(&io);
+        let mut read = stream.read(Buffer::new(1, 1).unwrap());
+        assert!(
+            Pin::new(&mut read)
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        // Wake watch + receive fill the SQ. Drop cannot publish its cancellation.
+        io.shared.submit_faults.borrow_mut().push_back(SubmitFault {
+            count: 0,
+            error: None,
+        });
+        drop(read);
+        assert!(io.shared.submit_faults.borrow().is_empty());
+        assert_eq!(io.in_flight(), 2);
+        started.send(peer).unwrap();
+        runtime.shutdown().unwrap();
+        assert_eq!(io.in_flight(), 0);
+        finished.send(()).unwrap();
+        drop(stream);
+    });
+    let mut peer = peer_ready.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(
+        matches!(
+            done.recv_timeout(Duration::from_millis(50)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ),
+        "shutdown must not return while the abandoned receive is pending"
+    );
+    peer.write_all(b"X").unwrap();
+    done.recv_timeout(Duration::from_secs(5)).unwrap();
+    worker.join().unwrap();
+}

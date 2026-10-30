@@ -30,6 +30,25 @@ fn drain(driver: &mut Driver) {
     }
 }
 
+fn complete<F: Future>(driver: &mut Driver, future: F) -> F::Output {
+    let mut future = pin!(future);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if let std::task::Poll::Ready(output) = future
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+        {
+            return output;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "operation did not retire"
+        );
+        driver.submit_and_wait(Some(deadline)).unwrap();
+        driver.tick();
+    }
+}
+
 #[test]
 fn native_connect_accept_and_full_duplex_half_close() {
     let mut runtime = runtime();
@@ -138,13 +157,13 @@ fn dropping_multiple_receives_retires_across_sq_turnover() {
     drop(first); // Publish cancellation, turning over the SQ if necessary.
     drop(second); // Concurrent cancellation has no separate outstanding cap.
     drain(&mut driver);
-    assert_eq!(peer_a.read(&mut [0; 1]).unwrap(), 0);
-    assert_eq!(peer_b.read(&mut [0; 1]).unwrap(), 0);
-    let mut future = pin!(a.read(Buffer::new(8, 1).unwrap()));
-    let std::task::Poll::Ready((result, _)) = future.as_mut().poll(&mut cx) else {
-        panic!()
-    };
-    assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::NotConnected);
+    peer_a.write_all(b"a").unwrap();
+    peer_b.write_all(b"b").unwrap();
+    for (stream, expected) in [(&mut a, b'a'), (&mut b, b'b')] {
+        let (result, buffer) = complete(&mut driver, stream.read(Buffer::new(1, 1).unwrap()));
+        assert_eq!(result.unwrap(), 1);
+        assert_eq!(buffer[0], expected);
+    }
 }
 
 #[test]
@@ -164,13 +183,11 @@ fn abandoned_accepts_retire_before_and_after_submission() {
         drop(first);
         drop(second);
         drain(&mut driver);
-        let std::task::Poll::Ready(result) = pin!(a.accept()).poll(&mut cx) else {
-            panic!()
-        };
-        assert_eq!(
-            result.err().unwrap().kind(),
-            std::io::ErrorKind::NotConnected
-        );
+        for listener in [&mut a, &mut b] {
+            let _peer = std::net::TcpStream::connect(listener.local_addr()).unwrap();
+            let stream = complete(&mut driver, listener.accept()).unwrap();
+            drop(stream);
+        }
     }
 }
 
@@ -445,7 +462,7 @@ fn imported_lingering_socket_publishes_detached_close_under_sq_pressure() {
         "Drop must publish a detached CLOSE"
     );
     assert!(std::fs::read_link(format!("/proc/self/fd/{raw}")).is_ok());
-    runtime.block_on(async {}).unwrap();
+    runtime.block_on(async move {}).unwrap();
     // Release the unread peer so the worker can finish promptly.
     drop(peer);
     drop(blocked_peer);
@@ -484,4 +501,228 @@ fn socket_drop_falls_back_when_close_cannot_be_published() {
         drop(enter);
         assert_eq!(io.in_flight(), 0);
     }
+}
+
+#[test]
+fn cancel_unpolled_operations_returns_buffers_without_admission() {
+    let mut driver = Driver::new(2).unwrap();
+    let (client, _peer) = pair();
+    let mut stream = TcpStream::from_std(driver.io(), client, Config::default()).unwrap();
+    let buffer = Buffer::new(8, 64).unwrap();
+    let ptr = buffer.as_ptr();
+    let (result, buffer) = complete(&mut driver, stream.read(buffer).cancel());
+    assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::ECANCELED));
+    assert_eq!(buffer.as_ptr(), ptr);
+    let (result, buffer) = complete(&mut driver, stream.write(buffer).cancel());
+    assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::ECANCELED));
+    assert_eq!(buffer.as_ptr(), ptr);
+    let (result, buffer) = complete(&mut driver, stream.write_all(buffer).cancel());
+    assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::ECANCELED));
+    assert_eq!(buffer.as_ptr(), ptr);
+    let mut listener = TcpListener::bind(driver.io(), address(), Config::default()).unwrap();
+    let error = complete(&mut driver, listener.accept().cancel())
+        .err()
+        .unwrap();
+    assert_eq!(error.raw_os_error(), Some(libc::ECANCELED));
+    assert_eq!(driver.in_flight(), 0);
+    assert!(!driver.has_pending());
+}
+
+#[test]
+fn cancel_read_returns_buffer_and_preserves_both_directions() {
+    let mut runtime = runtime();
+    let (client, mut peer) = pair();
+    let mut stream = TcpStream::from_std(&runtime.io(), client, Config::default()).unwrap();
+    runtime
+        .block_on(async move {
+            let (mut reader, mut writer) = stream.split();
+            let buffer = Buffer::new(4, 64).unwrap();
+            let ptr = buffer.as_ptr();
+            let mut read = reader.read(buffer);
+            assert!(
+                std::pin::Pin::new(&mut read)
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_pending()
+            );
+            let (result, buffer) = read.cancel().await;
+            assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::ECANCELED));
+            assert_eq!(buffer.as_ptr(), ptr);
+            writer
+                .write_all(Buffer::from_slice(b"done", 1).unwrap())
+                .await
+                .0
+                .unwrap();
+            let mut reply = [0; 4];
+            peer.read_exact(&mut reply).unwrap();
+            assert_eq!(&reply, b"done");
+            peer.write_all(b"next").unwrap();
+            let (result, buffer) = reader.read(buffer).await;
+            assert_eq!(result.unwrap(), 4);
+            assert_eq!(&*buffer, b"next");
+        })
+        .unwrap();
+}
+
+#[test]
+fn cancellation_returns_completed_read_and_accept_results() {
+    let mut driver = Driver::new(4).unwrap();
+    let (client, mut peer) = pair();
+    let mut stream = TcpStream::from_std(driver.io(), client, Config::default()).unwrap();
+    peer.write_all(b"race").unwrap();
+    let mut read = stream.read(Buffer::new(4, 1).unwrap());
+    assert!(
+        std::pin::Pin::new(&mut read)
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending()
+    );
+    drain(&mut driver); // Original completed, but its result is still unconsumed.
+    let (result, buffer) = complete(&mut driver, read.cancel());
+    assert_eq!(result.unwrap(), 4);
+    assert_eq!(&*buffer, b"race");
+
+    let mut listener = TcpListener::bind(driver.io(), address(), Config::default()).unwrap();
+    let _peer = std::net::TcpStream::connect(listener.local_addr()).unwrap();
+    let mut accept = listener.accept();
+    assert!(
+        std::pin::Pin::new(&mut accept)
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending()
+    );
+    drain(&mut driver);
+    let _accepted = complete(&mut driver, accept.cancel()).unwrap();
+    driver.drain().unwrap(); // Also retire published cancellation of completed operations.
+    assert!(!driver.has_pending());
+}
+
+#[test]
+fn cancel_accept_then_accept_again_and_drop_cancellation_future() {
+    let mut driver = Driver::new(1).unwrap();
+    let mut listener = TcpListener::bind(driver.io(), address(), Config::default()).unwrap();
+    let mut accept = listener.accept();
+    assert!(
+        std::pin::Pin::new(&mut accept)
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending()
+    );
+    let error = complete(&mut driver, accept.cancel()).err().unwrap();
+    assert_eq!(error.raw_os_error(), Some(libc::ECANCELED));
+    let mut accept = listener.accept();
+    assert!(
+        std::pin::Pin::new(&mut accept)
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending()
+    );
+    let mut cancel = Box::pin(accept.cancel());
+    assert!(
+        cancel
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending()
+    );
+    drop(cancel);
+    drain(&mut driver);
+    let _peer = std::net::TcpStream::connect(listener.local_addr()).unwrap();
+    let _stream = complete(&mut driver, listener.accept()).unwrap();
+}
+
+#[test]
+fn write_all_cancellation_returns_completed_chunks_without_sending_more() {
+    let mut driver = Driver::new(2).unwrap();
+    let (client, mut peer) = pair();
+    let mut stream =
+        TcpStream::from_std(driver.io(), client, Config { max_buffer_size: 2 }).unwrap();
+    let mut write = stream.write_all(Buffer::from_slice(b"abcd", 1).unwrap());
+    assert!(
+        std::pin::Pin::new(&mut write)
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending()
+    );
+    drain(&mut driver); // First chunk completed; second has not been submitted.
+    let (result, buffer) = complete(&mut driver, write.cancel());
+    assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::ECANCELED));
+    assert_eq!(&*buffer, b"abcd");
+    let (result, _) = complete(
+        &mut driver,
+        stream.write(Buffer::from_slice(b"ef", 1).unwrap()),
+    );
+    assert_eq!(result.unwrap(), 2);
+    let mut received = [0; 4];
+    peer.read_exact(&mut received).unwrap();
+    assert_eq!(&received, b"abef");
+}
+
+#[test]
+fn completed_write_cancellation_preserves_success_and_abandoned_accept_closes_result() {
+    let mut driver = Driver::new(2).unwrap();
+    let (client, mut peer) = pair();
+    let mut stream = TcpStream::from_std(driver.io(), client, Config::default()).unwrap();
+    let mut write = stream.write(Buffer::from_slice(b"ok", 1).unwrap());
+    assert!(
+        std::pin::Pin::new(&mut write)
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending()
+    );
+    drain(&mut driver);
+    let (result, buffer) = complete(&mut driver, write.cancel());
+    assert_eq!(result.unwrap(), 2);
+    assert_eq!(&*buffer, b"ok");
+    let mut received = [0; 2];
+    peer.read_exact(&mut received).unwrap();
+    assert_eq!(&received, b"ok");
+
+    let mut listener = TcpListener::bind(driver.io(), address(), Config::default()).unwrap();
+    let mut peer = std::net::TcpStream::connect(listener.local_addr()).unwrap();
+    peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut accept = listener.accept();
+    assert!(
+        std::pin::Pin::new(&mut accept)
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending()
+    );
+    drain(&mut driver);
+    drop(accept.cancel());
+    driver.drain().unwrap();
+    assert_eq!(
+        peer.read(&mut [0]).unwrap(),
+        0,
+        "abandoned successful accept must close its result"
+    );
+}
+
+#[test]
+// Only this task borrows the socket; the outer Rc deliberately keeps its owner
+// alive through task cancellation. No other task accesses the RefCell.
+#[allow(clippy::await_holding_refcell_ref)]
+fn runtime_shutdown_retires_read_even_when_socket_owner_survives() {
+    use std::{cell::RefCell, rc::Rc};
+    let mut runtime = runtime();
+    let (client, mut peer) = pair();
+    let stream = Rc::new(RefCell::new(
+        TcpStream::from_std(&runtime.io(), client, Config::default()).unwrap(),
+    ));
+    let task_stream = stream.clone();
+    let (started, ready) = tokio::sync::oneshot::channel();
+    runtime.spawn(async move {
+        let mut stream = task_stream.borrow_mut();
+        let mut read = stream.read(Buffer::new(1, 1).unwrap());
+        assert!(
+            std::pin::Pin::new(&mut read)
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        started.send(()).unwrap();
+        read.await
+    });
+    runtime
+        .block_on(async move { ready.await.unwrap() })
+        .unwrap();
+    runtime.shutdown().unwrap();
+    assert_eq!(runtime.io().in_flight(), 0);
+    // A surviving socket was not shut down just because its task was canceled.
+    peer.set_nonblocking(true).unwrap();
+    assert_eq!(
+        peer.read(&mut [0]).unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    drop(stream);
 }

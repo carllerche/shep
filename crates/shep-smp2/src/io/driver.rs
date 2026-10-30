@@ -1,7 +1,7 @@
 //! The unsafe SQ publication, ring-driving, and descriptor-adoption boundary.
 #![allow(unsafe_code)]
 use crate::io::{
-    Fd, Io, Op, Operation, OperationData, Rejected, Value,
+    CancelTarget, Fd, Io, Op, Operation, OperationData, Rejected, Value,
     arena::{Arena, Kind, OperationId, Retired},
 };
 use io_uring::{IoUring, opcode, types};
@@ -148,6 +148,36 @@ impl Shared {
             }
         }
         unreachable!()
+    }
+
+    /// Best-effort cancellation publication: try once, submit on SQ pressure,
+    /// then retry once. No backlog and no completion reaping on this path.
+    pub(crate) fn cancel(&self, target: &mut CancelTarget) -> io::Result<OperationId> {
+        match self.try_publish(target) {
+            Ok(id) => return Ok(id),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+            Err(error) => return Err(error),
+        }
+        let result = {
+            let mut state = self
+                .state
+                .try_borrow_mut()
+                .map_err(|_| io::ErrorKind::WouldBlock)?;
+            let ring = state.ring.as_mut().ok_or(io::ErrorKind::BrokenPipe)?;
+            let result = self.submit_ring(ring);
+            if result.as_ref().is_err_and(|error| !transient(error)) {
+                state.arena.fail();
+            }
+            result
+        };
+        if let Err(error) = result
+            && !transient(&error)
+        {
+            self.wake_failed();
+            return Err(error);
+        }
+        // Partial submission or a transient error may still have made space.
+        self.try_publish(target)
     }
 
     /// No callbacks, submission, or reaping after successful publication. This

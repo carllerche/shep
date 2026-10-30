@@ -1,5 +1,5 @@
 use crate::io::{Fd, Io, PollAdd};
-use crate::net::{Buffer, Config, ReadHalf, WriteHalf, socket::Socket};
+use crate::net::{Buffer, Config, Read, ReadHalf, Write, WriteAll, WriteHalf, socket::Socket};
 use std::{io, net::SocketAddr, os::fd::OwnedFd};
 
 /// A local TCP connection, with no hidden write queue or clonable writer.
@@ -53,20 +53,15 @@ impl TcpStream {
             },
         )
     }
-    pub async fn read(&mut self, buffer: Buffer) -> (io::Result<usize>, Buffer) {
-        self.socket.transfer::<crate::io::Recv>(buffer).await
+    pub fn read(&mut self, buffer: Buffer) -> Read<'_> {
+        Read::new(&self.socket, buffer)
     }
-    pub async fn write(&mut self, buffer: Buffer) -> (io::Result<usize>, Buffer) {
-        self.socket.transfer::<crate::io::Send>(buffer).await
+    pub fn write(&mut self, buffer: Buffer) -> Write<'_> {
+        Write::new(&self.socket, buffer)
     }
-    /// Send all owned bytes without copying and return the buffer. Errors may follow partial
-    /// sends; do not retry the whole message without an application protocol.
-    pub async fn write_all(&mut self, buffer: Buffer) -> (io::Result<()>, Buffer) {
-        WriteHalf {
-            socket: &self.socket,
-        }
-        .write_all(buffer)
-        .await
+    /// Send the full buffer. Errors/cancellation may follow partial sends.
+    pub fn write_all(&mut self, buffer: Buffer) -> WriteAll<'_> {
+        WriteAll::new(&self.socket, buffer)
     }
     pub async fn flush(&mut self) -> io::Result<()> {
         self.socket.check()

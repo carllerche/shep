@@ -46,6 +46,13 @@ impl Io {
             Err(error) => Err(Rejected { error, operation }),
         }
     }
+    /// Attempt cancellation publication, submitting once and retrying once on
+    /// SQ pressure. Rejection releases the identity pin; no retry is retained.
+    pub(crate) fn request_cancel(&self, mut target: crate::io::CancelTarget) -> io::Result<()> {
+        let id = self.shared.cancel(&mut target)?;
+        drop(Op::new(self.clone(), id, target));
+        Ok(())
+    }
     /// Count accepted SQEs whose terminal CQEs have not been reaped; pins and
     /// retained completed results do not count. Includes the runtime's watch, if any.
     pub fn in_flight(&self) -> usize {

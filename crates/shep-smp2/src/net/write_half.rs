@@ -1,63 +1,19 @@
-use crate::io::{SendRange, Shutdown};
-use crate::net::{Buffer, socket::Socket};
+use crate::io::Shutdown;
+use crate::net::{Buffer, Write, WriteAll, socket::Socket};
 use std::io;
 
 pub struct WriteHalf<'a> {
     pub(super) socket: &'a Socket,
 }
 impl WriteHalf<'_> {
-    pub async fn write(&mut self, buffer: Buffer) -> (io::Result<usize>, Buffer) {
-        self.socket.transfer::<crate::io::Send>(buffer).await
+    pub fn write(&mut self, buffer: Buffer) -> Write<'_> {
+        Write::new(self.socket, buffer)
     }
-    /// Send the entire owned buffer without copying, returning it on success or error.
-    /// Each send is bounded by Config::max_buffer_size. Errors may follow partial
-    /// progress; retrying the whole buffer can duplicate bytes already sent.
-    pub async fn write_all(&mut self, mut buffer: Buffer) -> (io::Result<()>, Buffer) {
-        if let Err(error) = self.socket.check() {
-            return (Err(error), buffer);
-        }
-        if self.socket.write_closed.get() {
-            return (
-                Err(io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    "write direction closed",
-                )),
-                buffer,
-            );
-        }
-        let mut offset = 0;
-        while offset < buffer.len() {
-            let len = (buffer.len() - offset).min(self.socket.config.max_buffer_size);
-            let operation = SendRange {
-                socket: self.socket.file.clone(),
-                buffer,
-                range: offset..offset + len,
-            };
-            let pending = match self.socket.run(operation) {
-                Ok(pending) => pending,
-                Err(rejected) => return (Err(rejected.error), rejected.operation.buffer),
-            };
-            let completion = pending.await;
-            let result = completion.result.map(crate::io::Value::into_count);
-            buffer = completion.operation.buffer;
-            match result {
-                Ok(0) => {
-                    return (
-                        Err(io::Error::new(
-                            io::ErrorKind::WriteZero,
-                            "TCP send returned zero",
-                        )),
-                        buffer,
-                    );
-                }
-                Ok(count) => offset += count,
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                Err(error) => return (Err(error), buffer),
-            }
-        }
-        (Ok(()), buffer)
+    /// Send the full buffer. Errors/cancellation may follow partial sends.
+    pub fn write_all(&mut self, buffer: Buffer) -> WriteAll<'_> {
+        WriteAll::new(self.socket, buffer)
     }
-    /// There is no adapter backlog; each write awaits its own completion.
+    /// Check connection state; does not wait for abandoned writes.
     pub async fn flush(&mut self) -> io::Result<()> {
         self.socket.check()
     }

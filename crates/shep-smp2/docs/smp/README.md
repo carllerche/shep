@@ -82,6 +82,9 @@ SMP does not own service state, route partitions, manage service dependencies,
 drain requests, or flush application buffers. Shutdown cancellation does not
 establish durability. Applications must await required operations, including
 terminal completion of cancelled indefinite I/O, before stopping workers.
+Workers continue driving accepted I/O to terminal completion during teardown.
+Network cancellation publication is best effort; shutdown can wait indefinitely
+if cancellation fails and an operation does not naturally complete.
 
 Run `cargo bench -p shep-smp2 --bench smp` to measure round-trip throughput with
 2 and 4 shards and 1, 16, 256, or 2048 concurrent calls per shard. Each shard
