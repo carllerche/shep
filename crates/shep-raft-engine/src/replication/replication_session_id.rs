@@ -16,7 +16,7 @@ use crate::type_config::alias::LogIdOf;
 /// A replication session is uniquely identified by the leader's vote and the membership
 /// configuration. When either changes, a new replication session is created.
 ///
-/// See: [ReplicationSession](crate::docs::data::replication_session)
+/// See: [ReplicationSession](https://docs.rs/openraft/0.10.0-alpha.37/openraft/docs/data/replication_session/index.html)
 #[derive(Debug, Clone)]
 #[derive(PartialEq, Eq)]
 pub(crate) struct ReplicationSessionId<C>

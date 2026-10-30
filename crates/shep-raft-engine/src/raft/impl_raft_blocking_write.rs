@@ -40,7 +40,7 @@ where
     /// - When the **joint** config is committed, it proposes a uniform config.
     ///
     /// Read more about the behavior of [joint
-    /// consensus](crate::docs::cluster_control::joint_consensus).
+    /// consensus](https://docs.rs/openraft/0.10.0-alpha.37/openraft/docs/cluster_control/joint_consensus/index.html).
     ///
     /// If `retain` is `true`, then all the members not existing in the new membership
     /// will be turned into learners, otherwise will be removed.

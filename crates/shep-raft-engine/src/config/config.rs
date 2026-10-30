@@ -445,7 +445,7 @@ pub struct Config {
     /// first quorum acknowledgement, the current Vote's last-modified time is used.
     ///
     /// `R` must be at least `leader_lease + election_timeout_max`. See
-    /// [`CheckQuorum`](crate::docs::protocol::check_quorum).
+    /// [`CheckQuorum`](https://docs.rs/openraft/0.10.0-alpha.37/openraft/docs/protocol/check_quorum/index.html).
     #[since(version = "0.10.0", change = "added quorum-loss heartbeat phase interval")]
     #[cfg_attr(feature = "clap", clap(long))]
     #[cfg_attr(feature = "serde", serde(default))]
@@ -596,7 +596,7 @@ pub struct Config {
     ///
     /// See: [`docs::data::log_pointers`].
     ///
-    /// [`docs::data::log_pointers`]: `crate::docs::data::log_pointers#optionally-persisted-committed`
+    /// [`docs::data::log_pointers`]: https://docs.rs/openraft/0.10.0-alpha.37/openraft/docs/data/log_pointers/index.html#optionally-persisted-committed
     // clap 4 requires `num_args = 0..=1`, or it complains about missing arg error
     // https://github.com/clap-rs/clap/discussions/4374
     #[since(version = "0.10.0")]

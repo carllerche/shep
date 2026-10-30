@@ -1,7 +1,7 @@
 #![doc(html_logo_url = "https://raw.githubusercontent.com/databendlabs/openraft/main/assets/logo/openraft-mark.svg")]
 #![doc(html_favicon_url = "https://raw.githubusercontent.com/databendlabs/openraft/main/assets/logo/openraft-mark.svg")]
-#![doc = include_str!("lib_readme.md")]
-#![doc = include_str!("docs/docs.md")]
+//! Raft consensus engine forked from Openraft for Shep.
+//! See the crate's FORK.md for provenance and differences from upstream.
 // Shep: upstream code under Shep's clippy; these two fire only with the
 // `single-threaded` feature, which upstream CI doesn't lint.
 #![allow(clippy::for_kv_map, clippy::arc_with_non_send_sync)]
@@ -60,7 +60,6 @@ pub(crate) mod utime;
 pub mod base;
 #[cfg(feature = "compat")]
 pub mod compat;
-pub mod docs;
 pub mod entry;
 pub mod errors;
 pub mod impls;

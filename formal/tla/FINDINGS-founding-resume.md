@@ -1,6 +1,6 @@
 # Resumed controller-founding investigation (2026-10-22)
 
-Resumes the highest-priority item in `../STATUS.md`, against `759122e`.
+Investigates controller founding against implementation `759122e`.
 Open implementation bugs are in root `BUGS.md`: MODEL-1 (BF1) and MODEL-2
 (BF2/B2). This report distinguishes implementation failures from proposed
 fixes. No implementation fix was made.
@@ -125,5 +125,4 @@ The focused runner completed all nine checks with their expected results.
 Remaining: complete the larger per-message and identical-seed connection
 pledge checks,
 test later terms for the external claim, and model a recovery mechanism
-for the pledge's lost volatile proposal. The rest of the inherited backlog
-in `../STATUS.md` remains pending.
+for the pledge's lost volatile proposal.

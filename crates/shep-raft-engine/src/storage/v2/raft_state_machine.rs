@@ -25,7 +25,7 @@ use crate::type_config::alias::StoredMembershipOf;
 /// - [`RaftNetworkFactory`](crate::network::RaftNetworkFactory) - For network communication
 /// - [`Config`](crate::config::Config) - For configuration options
 ///
-/// See: [`StateMachine`](crate::docs::components::state_machine)
+/// See: [`StateMachine`](https://docs.rs/openraft/0.10.0-alpha.37/openraft/docs/components/state_machine/index.html)
 #[add_async_trait]
 pub trait RaftStateMachine<C>: OptionalSend + OptionalSync + 'static
 where C: RaftTypeConfig
@@ -34,7 +34,7 @@ where C: RaftTypeConfig
     ///
     /// See the [storage chapter of the guide][sto] for details on log compaction / snapshotting.
     ///
-    /// [sto]: crate::docs::getting_started#3-implement-raftlogstorage-and-raftstatemachine
+    /// [sto]: https://docs.rs/openraft/0.10.0-alpha.37/openraft/docs/getting_started/index.html#3-implement-raftlogstorage-and-raftstatemachine
     #[since(version = "0.10.0", change = "moved from RaftTypeConfig to RaftStateMachine")]
     type SnapshotData: OptionalSend + 'static;
 

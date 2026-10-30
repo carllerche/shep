@@ -39,7 +39,7 @@ use crate::base::OptionalFeatures;
 ///
 /// See: [Node IDs must not be reused][node-id-reuse]
 ///
-/// [node-id-reuse]: crate::docs::cluster_control::dynamic_membership#node-ids-must-not-be-reused
+/// [node-id-reuse]: https://docs.rs/openraft/0.10.0-alpha.37/openraft/docs/cluster_control/dynamic_membership/index.html#node-ids-must-not-be-reused
 pub trait NodeId
 where Self: Sized + OptionalFeatures + Eq + PartialEq + Ord + PartialOrd + Debug + Display + Hash + Clone + 'static
 {

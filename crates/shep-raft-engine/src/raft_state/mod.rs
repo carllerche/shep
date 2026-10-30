@@ -402,7 +402,7 @@ where C: RaftTypeConfig
     ///
     /// See [Determine Server State][] for more details about determining the server state.
     ///
-    /// [Determine Server State]: crate::docs::data::vote#vote-and-membership-define-the-server-state
+    /// [Determine Server State]: https://docs.rs/openraft/0.10.0-alpha.37/openraft/docs/data/vote/index.html#vote-and-membership-define-the-server-state
     #[tracing::instrument(level = "debug", skip_all)]
     pub(crate) fn calc_server_state(&self, id: &C::NodeId) -> ServerState {
         tracing::debug!(
@@ -439,7 +439,7 @@ where C: RaftTypeConfig
     /// Note that in Openraft Leader does not have to be a voter. See [Determine Server State][] for
     /// more details about determining the server state.
     ///
-    /// [Determine Server State]: crate::docs::data::vote#vote-and-membership-define-the-server-state
+    /// [Determine Server State]: https://docs.rs/openraft/0.10.0-alpha.37/openraft/docs/data/vote/index.html#vote-and-membership-define-the-server-state
     pub(crate) fn is_leading(&self, id: &C::NodeId) -> bool {
         (self.membership_state.contains(id) || self.membership_state.committed().is_voter(id))
             && self.vote.leader_node_id() == id
@@ -452,7 +452,7 @@ where C: RaftTypeConfig
     /// Note that in Openraft Leader does not have to be a voter. See [Determine Server State][] for
     /// more details about determining the server state.
     ///
-    /// [Determine Server State]: crate::docs::data::vote#vote-and-membership-define-the-server-state
+    /// [Determine Server State]: https://docs.rs/openraft/0.10.0-alpha.37/openraft/docs/data/vote/index.html#vote-and-membership-define-the-server-state
     pub(crate) fn is_leader(&self, id: &C::NodeId) -> bool {
         self.is_leading(id) && self.vote.is_committed()
     }

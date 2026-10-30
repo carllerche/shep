@@ -56,6 +56,3 @@ The shared VM has substantial elapsed-time repeat drift; a single comparison
 does not establish a small performance advantage or regression. Matching core
 algorithms avoids a deliberate representation tradeoff, but timing still needs
 measurement rather than assuming equivalence.
-
-The initial environment, measurements, and validation results are recorded in
-[benches/BASELINE.md](benches/BASELINE.md).

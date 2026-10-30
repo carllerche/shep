@@ -49,7 +49,7 @@ pub type EntriesStreamResult<C> = Result<EntryOf<C>, io::Error>;
 /// This interface is accessed read-only by replication sub-task: `ReplicationCore`.
 ///
 /// A log reader must also be able to read the last saved vote by [`RaftLogStorage::save_vote`],
-/// See: [log-stream](`crate::docs::protocol::replication::log_stream`).
+/// See: [log-stream](https://docs.rs/openraft/0.10.0-alpha.37/openraft/docs/protocol/replication/log_stream/index.html).
 ///
 /// Typically, the log reader implementation as such will be hidden behind an `Arc<T>` and
 /// this interface implemented on the `Arc<T>`. It can be co-implemented with [`RaftLogStorage`]
@@ -228,7 +228,7 @@ where C: RaftTypeConfig
     /// Return the last saved vote by [`RaftLogStorage::save_vote`].
     ///
     /// A log reader must also be able to read the last saved vote by [`RaftLogStorage::save_vote`],
-    /// See: [log-stream](`crate::docs::protocol::replication::log_stream`)
+    /// See: [log-stream](https://docs.rs/openraft/0.10.0-alpha.37/openraft/docs/protocol/replication/log_stream/index.html)
     ///
     /// [`RaftLogStorage::save_vote`]: crate::storage::RaftLogStorage::save_vote
     async fn read_vote(&mut self) -> Result<Option<VoteOf<C>>, io::Error>;

@@ -14,7 +14,7 @@ use crate::vote::RaftVote;
 /// `LogIOId = (CommittedVote, LogId)` ensures monotonicity even when the same [`LogId`] is
 /// truncated and appended multiple times by different leaders.
 ///
-/// For a comprehensive explanation, see: [`LogIOId` documentation](crate::docs::data::log_io_id).
+/// For a comprehensive explanation, see: [`LogIOId` documentation](https://docs.rs/openraft/0.10.0-alpha.37/openraft/docs/data/log_io_id/index.html).
 ///
 /// [`LogId`]: crate::log_id::LogId
 #[derive(Debug, Clone)]

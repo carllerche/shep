@@ -51,7 +51,7 @@ where
     ///
     /// Prefer using this variant instead of `SetNodes` whenever possible, as `AddNodes` ensures
     /// safety, whereas incorrect usage of `SetNodes` can result in a brain split.
-    /// See: [Update-Node](`crate::docs::cluster_control::dynamic_membership#update-node`)
+    /// See: [Update-Node](https://docs.rs/openraft/0.10.0-alpha.37/openraft/docs/cluster_control/dynamic_membership/index.html#update-node)
     AddNodes(BTreeMap<NID, N>),
 
     /// Add or replace nodes in membership config.
@@ -60,7 +60,7 @@ where
     ///
     /// Prefer using `AddNodes` instead of `SetNodes` whenever possible, as `AddNodes` ensures
     /// safety, whereas incorrect usage of `SetNodes` can result in a brain split.
-    /// See: [Update-Node](`crate::docs::cluster_control::dynamic_membership#update-node`)
+    /// See: [Update-Node](https://docs.rs/openraft/0.10.0-alpha.37/openraft/docs/cluster_control/dynamic_membership/index.html#update-node)
     SetNodes(BTreeMap<NID, N>),
 
     /// Remove nodes from membership.

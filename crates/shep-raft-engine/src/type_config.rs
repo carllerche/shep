@@ -176,7 +176,7 @@ pub trait RaftTypeConfig:
 ///
 /// Aliases are enabled by the feature flag [`type-alias`].
 ///
-/// [`type-alias`]: crate::docs::feature_flags#feature-flag-type-alias
+/// [`type-alias`]: https://docs.rs/openraft/0.10.0-alpha.37/openraft/docs/feature_flags/index.html#feature-flag-type-alias
 pub mod alias {
     use openraft_macros::since;
 

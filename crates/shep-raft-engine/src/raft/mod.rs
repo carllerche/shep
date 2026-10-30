@@ -1175,7 +1175,7 @@ where
     ///
     /// // Then proceed with the state machine read
     /// ```
-    /// Read more about how it works: [Read Operation](crate::docs::protocol::read)
+    /// Read more about how it works: [Read Operation](https://docs.rs/openraft/0.10.0-alpha.37/openraft/docs/protocol/read/index.html)
     #[since(
         version = "0.10.0",
         change = "accept `impl Into<LinearizerOption>` instead of `ReadPolicy`"
@@ -1269,7 +1269,7 @@ where
     /// let val = my_raft.with_state_machine(|sm| { sm.read("foo") }).await?;
     /// ```
     ///
-    /// See: [Read Operation](crate::docs::protocol::read)
+    /// See: [Read Operation](https://docs.rs/openraft/0.10.0-alpha.37/openraft/docs/protocol/read/index.html)
     #[since(
         version = "0.10.0",
         change = "accept `impl Into<LinearizerOption>` instead of `ReadPolicy`"
@@ -1961,17 +1961,17 @@ where
     /// first replaced any uncommitted tail with the leader's log. Applying up to that commit
     /// restores every durable log entry that could have contributed to the pre-restart state. This
     /// is the same `read_log_id` argument that makes linearizable reads safe: see [the read
-    /// protocol](crate::docs::protocol::read) for the read-safety argument and [the commit
-    /// protocol](crate::docs::protocol::commit) for why `cluster_committed` is never a value
+    /// protocol](https://docs.rs/openraft/0.10.0-alpha.37/openraft/docs/protocol/read/index.html) for the read-safety argument and [the commit
+    /// protocol](https://docs.rs/openraft/0.10.0-alpha.37/openraft/docs/protocol/commit/index.html) for why `cluster_committed` is never a value
     /// restored from storage. A node that did not persist `committed` can use this in place of, or
-    /// together with, saving it (see [log pointers](crate::docs::data::log_pointers)).
+    /// together with, saving it (see [log pointers](https://docs.rs/openraft/0.10.0-alpha.37/openraft/docs/data/log_pointers/index.html)).
     ///
     /// # Limitation: a follower may still recover a stale state
     ///
     /// The soundness above is bounded by what this node made **durable**. A follower may apply an
     /// entry the cluster has committed before it flushes that entry locally — apply is gated on the
     /// cluster commit, not on the local flush (the invariant is `applied ≤ committed ≤ submitted`,
-    /// not `applied ≤ flushed`; see [log pointers](crate::docs::data::log_pointers)). If the node
+    /// not `applied ≤ flushed`; see [log pointers](https://docs.rs/openraft/0.10.0-alpha.37/openraft/docs/data/log_pointers/index.html)). If the node
     /// restarts while such an entry is applied but still unflushed, and its applied state was not
     /// otherwise persisted, the restart reverts three tracking points at once: the durable log tail
     /// falls back to `flushed`, the state machine falls back to an earlier applied state, and

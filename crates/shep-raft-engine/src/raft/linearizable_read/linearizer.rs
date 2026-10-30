@@ -15,7 +15,7 @@ use crate::type_config::alias::LogIdOf;
 
 /// Represents a linearization operation for read.
 ///
-/// See the [read protocol documentation](crate::docs::protocol::read) for more details.
+/// See the [read protocol documentation](https://docs.rs/openraft/0.10.0-alpha.37/openraft/docs/protocol/read/index.html) for more details.
 ///
 /// This struct is the result returned from [`Raft::get_read_linearizer()`],
 /// which is the implementation of awaiting the applied log entries.

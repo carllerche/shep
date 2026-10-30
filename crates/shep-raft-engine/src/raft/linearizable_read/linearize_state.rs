@@ -86,7 +86,7 @@ where C: RaftTypeConfig
     /// Return the `read_log_id` of this read operation.
     ///
     /// It is the max of the current leader noop-log-id and the last committed log id.
-    /// See: [`read` docs](crate::docs::protocol::read).
+    /// See: [`read` docs](https://docs.rs/openraft/0.10.0-alpha.37/openraft/docs/protocol/read/index.html).
     #[since(version = "0.10.0", change = "return ReadLogId instead of LogId")]
     #[since(version = "0.10.0")]
     pub fn read_log_id(&self) -> &ReadLogId<C> {

@@ -18,7 +18,7 @@ use crate::storage::RaftStateMachine;
 ///
 /// See the [Engine and Runtime Architecture guide] for the write flow and command/event loop.
 ///
-/// [Engine and Runtime Architecture guide]: crate::docs::components::engine_runtime
+/// [Engine and Runtime Architecture guide]: https://docs.rs/openraft/0.10.0-alpha.37/openraft/docs/components/engine_runtime/index.html
 #[add_async_trait]
 pub(crate) trait RaftRuntime<C, SM = ()>
 where

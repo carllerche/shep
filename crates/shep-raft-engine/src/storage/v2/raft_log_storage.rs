@@ -92,9 +92,9 @@ where C: RaftTypeConfig
     ///
     /// See: [`docs::data::log_pointers`], [`docs::protocol::read`] and [`docs::protocol::commit`].
     ///
-    /// [`docs::data::log_pointers`]: `crate::docs::data::log_pointers#optionally-persisted-committed`
-    /// [`docs::protocol::read`]: `crate::docs::protocol::read`
-    /// [`docs::protocol::commit`]: `crate::docs::protocol::commit`
+    /// [`docs::data::log_pointers`]: https://docs.rs/openraft/0.10.0-alpha.37/openraft/docs/data/log_pointers/index.html#optionally-persisted-committed
+    /// [`docs::protocol::read`]: https://docs.rs/openraft/0.10.0-alpha.37/openraft/docs/protocol/read/index.html
+    /// [`docs::protocol::commit`]: https://docs.rs/openraft/0.10.0-alpha.37/openraft/docs/protocol/commit/index.html
     /// [`Raft::wait_for_recovery`]: `crate::Raft::wait_for_recovery`
     async fn save_committed(&mut self, _committed: Option<LogIdOf<C>>) -> Result<(), io::Error> {
         // By default `committed` log id is not saved

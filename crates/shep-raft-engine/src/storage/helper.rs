@@ -225,7 +225,7 @@ where
             // The initial value for `vote` is the minimal possible value.
             // See: [Conditions for initialization][precondition]
             //
-            // [precondition]: crate::docs::cluster_control::cluster_formation#preconditions-for-initialization
+            // [precondition]: https://docs.rs/openraft/0.10.0-alpha.37/openraft/docs/cluster_control/cluster_formation/index.html#preconditions-for-initialization
             //
             // TODO: If the lease reverted upon restart,
             //       the lease based linearizable read consistency will be broken.

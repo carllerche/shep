@@ -21,8 +21,8 @@
 //! persistence for Raft. These implementations are passed to [`Raft::new()`](crate::Raft::new)
 //! to create a Raft node.
 //!
-//! See the [Getting Started Guide](crate::docs::getting_started) and
-//! [State Machine Component](crate::docs::components::state_machine) documentation
+//! See the [Getting Started Guide](https://docs.rs/openraft/0.10.0-alpha.37/openraft/docs/getting_started/index.html) and
+//! [State Machine Component](https://docs.rs/openraft/0.10.0-alpha.37/openraft/docs/components/state_machine/index.html) documentation
 //! for implementation details and examples.
 
 mod callback;

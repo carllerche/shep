@@ -6,7 +6,6 @@ extern crate shep_raft_engine as openraft;
 mod fixtures;
 
 // The number indicate the preferred running order for these case.
-// See ./README.md
 
 mod t10_client_write_many;
 mod t10_client_write_quorum_lease;

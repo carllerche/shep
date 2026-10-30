@@ -16,8 +16,10 @@ use crate::task::{
 use std::sync::Arc;
 
 /// Non-owning token used by local Task, JoinHandle, and Notified references.
-/// Copying this token does not acquire a reference. See docs/task/SAFETY.md for the
-/// allocation, matching-vtable and final-release invariants.
+// Copying this token does not acquire a reference. Task and JoinHandle start
+// with one local reference each; Notified acquires its own while Task is live.
+// Each owner releases once; only the final release deallocates through the
+// vtable selected for the original Cell<F>. Wakers own no cell reference.
 pub(crate) struct RawTask {
     ptr: NonNull<Header>,
 }
@@ -75,7 +77,7 @@ impl RawTask {
         unsafe { self.ptr.as_ref() }
     }
 
-    /// Safety: mutual exclusion is required to call this function.
+    // The owner must exclude overlapping polling, cancellation and stage access.
     pub(crate) fn poll(self) {
         let vtable = self.header().vtable;
         // SAFETY: Task::run or Notified::run checked notification and has exclusive
@@ -91,8 +93,7 @@ impl RawTask {
         }
     }
 
-    /// Safety: `dst` must be a `*mut Poll<Result<T::Output, JoinError>>` where `T`
-    /// is the future stored by the task.
+    // dst must point to Poll<Result<T::Output, JoinError>> for the stored future.
     pub(crate) unsafe fn try_read_output(self, dst: *mut (), waker: &Waker) {
         let vtable = self.header().vtable;
         // SAFETY: The caller supplies the matching output slot; this token

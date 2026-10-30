@@ -13,7 +13,7 @@ use crate::network::NetVote;
 /// A trait defining the interface for a Raft network factory to create connections between cluster
 /// members.
 ///
-/// See the [network chapter of the guide](crate::docs::getting_started#4-implement-raftnetwork)
+/// See the [network chapter of the guide](https://docs.rs/openraft/0.10.0-alpha.37/openraft/docs/getting_started/index.html#4-implement-raftnetwork)
 /// for details and discussion on this trait and how to implement it.
 ///
 /// ## Related Types

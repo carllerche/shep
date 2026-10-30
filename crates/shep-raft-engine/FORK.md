@@ -35,3 +35,5 @@ Changes from upstream are listed below.
   which fire only under `single-threaded`.
 - `rustfmt.toml` in each vendored crate disables formatting: upstream formats
   with nightly-only options, and the sources stay as upstream wrote them.
+- Removed upstream narrative documentation and its documentation-only Rust
+  modules and generators. API comments link to the pinned upstream documentation.

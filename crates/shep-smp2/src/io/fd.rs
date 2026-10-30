@@ -11,7 +11,7 @@ use std::{
 
 /// A thread-local owned descriptor that can be consumed by io_uring CLOSE.
 ///
-/// This type is neither Send nor Sync. Shared local ownership uses Rc<Fd>.
+/// This type is neither Send nor Sync. Shared local ownership uses `Rc<Fd>`.
 /// ```compile_fail
 /// fn assert_send<T: Send>() {}
 /// assert_send::<shep_smp2::io::Fd>();

@@ -68,7 +68,7 @@ use crate::type_config::alias::VoteOf;
 /// - [`NetTransferLeader`] — TransferLeader notification
 /// - [`NetBackoff`] — backoff strategy on `Unreachable`
 ///
-/// See the [network chapter of the guide](crate::docs::getting_started#4-implement-raftnetwork)
+/// See the [network chapter of the guide](https://docs.rs/openraft/0.10.0-alpha.37/openraft/docs/getting_started/index.html#4-implement-raftnetwork)
 /// for details and discussion on this trait and how to implement it.
 ///
 /// # RPC timeouts
@@ -100,7 +100,7 @@ use crate::type_config::alias::VoteOf;
 /// [`NetTransferLeader`]: crate::network::NetTransferLeader
 /// [`NetBackoff`]: crate::network::NetBackoff
 /// [`RaftNetworkFactory::Network`]: crate::network::RaftNetworkFactory::Network
-/// [correct-node]: `crate::docs::cluster_control::dynamic_membership#ensure-connection-to-the-correct-node`
+/// [correct-node]: https://docs.rs/openraft/0.10.0-alpha.37/openraft/docs/cluster_control/dynamic_membership/index.html#ensure-connection-to-the-correct-node
 #[since(version = "0.10.0")]
 #[add_async_trait]
 pub trait RaftNetworkV2<C>: OptionalSend + OptionalSync + 'static

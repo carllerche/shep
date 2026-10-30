@@ -223,7 +223,7 @@ where
 
     /// Installs a full snapshot on a follower or learner node.
     ///
-    /// Refer to [`snapshot_replication`](crate::docs::protocol::replication::snapshot_replication)
+    /// Refer to [`snapshot_replication`](https://docs.rs/openraft/0.10.0-alpha.37/openraft/docs/protocol/replication/snapshot_replication/index.html)
     /// for the reason the following workflow is needed.
     ///
     /// The method processes the given `snapshot` and updates the internal state of the node based

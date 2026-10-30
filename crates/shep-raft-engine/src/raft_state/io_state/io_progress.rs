@@ -12,7 +12,7 @@ use validit::less_equal;
 /// Invariant: `flushed <= submitted <= accepted`
 ///
 /// For a comprehensive explanation of the three-stage tracking and examples, see:
-/// [Log I/O Progress](crate::docs::data::log_io_progress).
+/// [Log I/O Progress](https://docs.rs/openraft/0.10.0-alpha.37/openraft/docs/data/log_io_progress/index.html).
 ///
 /// [`LogIOId`]: crate::raft_state::io_state::log_io_id::LogIOId
 #[derive(Debug, Clone)]

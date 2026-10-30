@@ -177,7 +177,7 @@ where
 
     /// Get the log id for a linearizable read.
     ///
-    /// See: [Read Operation](crate::docs::protocol::read)
+    /// See: [Read Operation](https://docs.rs/openraft/0.10.0-alpha.37/openraft/docs/protocol/read/index.html)
     pub(crate) fn get_read_log_id(&self) -> ReadLogId<C> {
         ReadLogId::new(self.leader.noop_log_id.clone(), self.state.local_committed().cloned())
     }

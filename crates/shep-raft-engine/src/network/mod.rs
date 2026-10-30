@@ -19,7 +19,7 @@
 //! for communicating with each remote Raft node. The factory is passed to
 //! [`Raft::new()`](crate::Raft::new) when creating a Raft instance.
 //!
-//! See the [Getting Started Guide](crate::docs::getting_started) for implementation
+//! See the [Getting Started Guide](https://docs.rs/openraft/0.10.0-alpha.37/openraft/docs/getting_started/index.html) for implementation
 //! details and examples.
 
 mod append_trait;

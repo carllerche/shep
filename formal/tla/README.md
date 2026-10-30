@@ -1,7 +1,8 @@
 # TLA+ models of Shep's version, log, and change protocols
 
-Models of the protocols in `docs/design.md` §8–§13. Findings, counterexamples,
-and proposed design changes are in [FINDINGS.md](FINDINGS.md).
+Models of the protocols in `docs/design.md`. Topic-specific `FINDINGS-*.md`
+reports record counterexamples, checked bounds, and proposed design changes.
+Early findings already incorporated into the design are available in Git history.
 
 The resumed implementation investigation is in
 [FINDINGS-founding-resume.md](FINDINGS-founding-resume.md); confirmed bugs
@@ -45,8 +46,8 @@ expected one.
 ## Configs and expected results
 
 "Pass" means TLC finds no error. "Fail" configs are kept failing on purpose:
-each one is the counterexample for a finding (F#) or an interpretation (I#)
-in FINDINGS.md. None of the passing configs weakens an invariant; they turn
+each one demonstrates a missing safeguard or checks reachability. Historical
+F#/I# identifiers refer to the original report in Git history. Passing configs turn
 on the proposed fix instead.
 
 | Config | Expected | Bounds | Checks |
@@ -78,4 +79,4 @@ on the proposed fix instead.
 | `SlackRT_connect.cfg` | fail | | F4: a listener attached at a newer snapshot gets a push at an older version |
 | `SlackRT_token.cfg` | fail | | F5: resuming from "the last token received" from any response |
 
-State counts and run times from the last full run are in FINDINGS.md.
+Historical state counts and run times are available in Git history.

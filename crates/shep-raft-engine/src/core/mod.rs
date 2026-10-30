@@ -20,7 +20,7 @@
 //! - [`ServerState`] - Server state (Leader, Follower, Candidate, Learner)
 //! - [`ApplyResult`] - Result of applying log entries to state machine
 //!
-//! See the [Engine/Runtime architecture guide](crate::docs::components::engine_runtime) for
+//! See the [Engine/Runtime architecture guide](https://docs.rs/openraft/0.10.0-alpha.37/openraft/docs/components/engine_runtime/index.html) for
 //! details.
 
 pub(crate) mod balancer;

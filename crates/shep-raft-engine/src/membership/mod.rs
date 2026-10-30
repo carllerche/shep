@@ -17,8 +17,8 @@
 //! Membership changes use joint consensus to ensure safety during configuration transitions.
 //!
 //! See also:
-//! - [Dynamic membership guide](crate::docs::cluster_control::dynamic_membership)
-//! - [Joint consensus guide](crate::docs::cluster_control::joint_consensus)
+//! - [Dynamic membership guide](https://docs.rs/openraft/0.10.0-alpha.37/openraft/docs/cluster_control/dynamic_membership/index.html)
+//! - [Joint consensus guide](https://docs.rs/openraft/0.10.0-alpha.37/openraft/docs/cluster_control/joint_consensus/index.html)
 
 mod into_nodes;
 #[allow(clippy::module_inception)]

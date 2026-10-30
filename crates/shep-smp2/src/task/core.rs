@@ -18,6 +18,8 @@ use super::{
 };
 use crate::task::{JoinError, Schedule, TaskId};
 
+// Header must stay first: RawTask erases Cell<T> to its header pointer, and
+// the matching T vtable restores that original allocation for final destruction.
 #[repr(C)]
 pub(crate) struct Cell<T: Future> {
     pub(crate) header: Header,

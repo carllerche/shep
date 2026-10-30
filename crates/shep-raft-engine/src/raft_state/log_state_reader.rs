@@ -8,7 +8,7 @@ use crate::vote::RaftCommittedLeaderId;
 
 /// APIs to get significant log ids reflecting the raft state.
 ///
-/// See: [`log_pointers`](`crate::docs::data::log_pointers`).
+/// See: [`log_pointers`](https://docs.rs/openraft/0.10.0-alpha.37/openraft/docs/data/log_pointers/index.html).
 pub(crate) trait LogStateReader<CLID>
 where CLID: RaftCommittedLeaderId
 {

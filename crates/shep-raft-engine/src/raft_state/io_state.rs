@@ -52,7 +52,7 @@ pub(crate) mod monotonic;
 /// **Note**: `apply.accepted` does not require `log.flushed`. A log only needs to be submitted
 /// (not flushed) to be applied, since `RaftLogStorage` can read submitted entries.
 ///
-/// For comprehensive details, see: [Log I/O Progress](crate::docs::data::log_io_progress).
+/// For comprehensive details, see: [Log I/O Progress](https://docs.rs/openraft/0.10.0-alpha.37/openraft/docs/data/log_io_progress/index.html).
 ///
 /// Invariants:
 ///
@@ -80,7 +80,7 @@ where C: RaftTypeConfig
     /// Tracks log I/O progress to local storage (vote + log entries).
     ///
     /// Uses `IOProgress<IOId>` to track both non-committed vote I/O and log I/O.
-    /// See: [`IOId`](crate::docs::data::io_id)
+    /// See: [`IOId`](https://docs.rs/openraft/0.10.0-alpha.37/openraft/docs/data/io_id/index.html)
     pub(crate) log_progress: Valid<IOProgress<IOId<C>>>,
 
     /// Tracks applying committed logs to state machine.
@@ -118,7 +118,7 @@ where C: RaftTypeConfig
     ///   separately allows for alternative synchronization approaches in theory
     ///
     /// **For detailed explanation** with timeline examples, see:
-    /// [Cluster-Committed vs Local Committed](crate::docs::protocol::commit)
+    /// [Cluster-Committed vs Local Committed](https://docs.rs/openraft/0.10.0-alpha.37/openraft/docs/protocol/commit/index.html)
     ///
     /// ## Update Conditions
     ///
@@ -239,7 +239,7 @@ where C: RaftTypeConfig
     /// assertion.
     ///
     /// **For detailed explanation** with timeline examples, see:
-    /// [Cluster-Committed vs Local Committed](crate::docs::protocol::commit)
+    /// [Cluster-Committed vs Local Committed](https://docs.rs/openraft/0.10.0-alpha.37/openraft/docs/protocol/commit/index.html)
     pub(crate) fn calculate_local_committed(&mut self) -> Option<LogIdOf<C>> {
         let local_committed = self.do_calculate_local_committed();
 

@@ -89,7 +89,7 @@ where C: RaftTypeConfig
     /// Each value is a [`SendStamp`]: the sending time plus a heartbeat round that orders RPCs sent
     /// at the same time.
     ///
-    /// [`docs::leader_lease`]: `crate::docs::protocol::replication::leader_lease`
+    /// [`docs::leader_lease`]: https://docs.rs/openraft/0.10.0-alpha.37/openraft/docs/protocol/replication/leader_lease/index.html
     pub(crate) clock_progress: Valid<VecProgress<IdVal<C::NodeId, Option<SendStamp<InstantOf<C>>>>, QS>>,
 }
 

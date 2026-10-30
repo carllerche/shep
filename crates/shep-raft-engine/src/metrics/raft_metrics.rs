@@ -101,7 +101,7 @@ pub struct RaftMetrics<C: RaftTypeConfig> {
     /// frontier) due to network delays or out-of-order RPC delivery. See [`commit`] for the full
     /// explanation of the distinction.
     ///
-    /// [`commit`]: crate::docs::protocol::commit
+    /// [`commit`]: https://docs.rs/openraft/0.10.0-alpha.37/openraft/docs/protocol/commit/index.html
     #[since(version = "0.10.0")]
     pub local_committed: Option<LogIdOf<C>>,
 
@@ -112,7 +112,7 @@ pub struct RaftMetrics<C: RaftTypeConfig> {
     /// [`local_committed`](Self::local_committed) on a node that has not yet received the
     /// corresponding log entries. See [`commit`] for the full explanation of the distinction.
     ///
-    /// [`commit`]: crate::docs::protocol::commit
+    /// [`commit`]: https://docs.rs/openraft/0.10.0-alpha.37/openraft/docs/protocol/commit/index.html
     #[since(version = "0.10.0")]
     pub cluster_committed: Option<LogIdOf<C>>,
 
@@ -316,7 +316,7 @@ pub struct RaftDataMetrics<C: RaftTypeConfig> {
     /// frontier) due to network delays or out-of-order RPC delivery. See [`commit`] for the full
     /// explanation of the distinction.
     ///
-    /// [`commit`]: crate::docs::protocol::commit
+    /// [`commit`]: https://docs.rs/openraft/0.10.0-alpha.37/openraft/docs/protocol/commit/index.html
     #[since(version = "0.10.0")]
     pub local_committed: Option<LogIdOf<C>>,
     /// The last log ID known to be committed by a quorum of the cluster, as last reported by the
@@ -326,7 +326,7 @@ pub struct RaftDataMetrics<C: RaftTypeConfig> {
     /// [`local_committed`](Self::local_committed) on a node that has not yet received the
     /// corresponding log entries. See [`commit`] for the full explanation of the distinction.
     ///
-    /// [`commit`]: crate::docs::protocol::commit
+    /// [`commit`]: https://docs.rs/openraft/0.10.0-alpha.37/openraft/docs/protocol/commit/index.html
     #[since(version = "0.10.0")]
     pub cluster_committed: Option<LogIdOf<C>>,
     /// The last log ID known to this node as committed.

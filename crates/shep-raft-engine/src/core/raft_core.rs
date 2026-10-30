@@ -880,7 +880,7 @@ where
     /// It is allowed to initialize only when `last_log_id.is_none()` and `vote==(0,0)`.
     /// See: [Conditions for initialization][precondition]
     ///
-    /// [precondition]: crate::docs::cluster_control::cluster_formation#preconditions-for-initialization
+    /// [precondition]: https://docs.rs/openraft/0.10.0-alpha.37/openraft/docs/cluster_control/cluster_formation/index.html#preconditions-for-initialization
     #[tracing::instrument(level = "debug", skip(self, tx))]
     pub(crate) fn handle_initialize(
         &mut self,

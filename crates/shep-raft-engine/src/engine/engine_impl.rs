@@ -230,7 +230,7 @@ where
     /// follower. This step is not confined by the consensus protocol and has to be dealt with
     /// differently.
     ///
-    /// [precondition]: crate::docs::cluster_control::cluster_formation#preconditions-for-initialization
+    /// [precondition]: https://docs.rs/openraft/0.10.0-alpha.37/openraft/docs/cluster_control/cluster_formation/index.html#preconditions-for-initialization
     #[tracing::instrument(level = "debug", skip_all)]
     pub(crate) fn initialize(&mut self, membership: Membership<C::NodeId, C::Node>) -> Result<(), InitializeError<C>> {
         self.check_initialize()?;
@@ -720,7 +720,7 @@ where
     ///
     /// A Leader demoted to a learner that is still in the membership config is not affected:
     /// openraft allows a learner to act as Leader. See: [Determine Server
-    /// State](crate::docs::data::vote#vote-and-membership-define-the-server-state).
+    /// State](https://docs.rs/openraft/0.10.0-alpha.37/openraft/docs/data/vote/index.html#vote-and-membership-define-the-server-state).
     #[tracing::instrument(level = "debug", skip_all)]
     pub(crate) fn refresh_server_state(&mut self) {
         tracing::debug!("{}: node_id: {}", func_name!(), self.config.id);

@@ -209,7 +209,7 @@ where C: RaftTypeConfig
     ///    collapses to [`Inflight::None`]. Pipeline mode is not affected: [`Inflight::LogsSince`]
     ///    is an open-ended stream, and an empty tail is valid.
     ///
-    /// [algo]: crate::docs::protocol::replication::log_replication#algorithm-to-find-the-last-matching-log-id-on-a-follower
+    /// [algo]: https://docs.rs/openraft/0.10.0-alpha.37/openraft/docs/protocol/replication/log_replication/index.html#algorithm-to-find-the-last-matching-log-id-on-a-follower
     /// [`Updater::update_conflicting`]: crate::progress::entry::update::Updater::update_conflicting
     pub(crate) fn next_send(
         &mut self,

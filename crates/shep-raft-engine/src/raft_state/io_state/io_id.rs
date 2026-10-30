@@ -22,7 +22,7 @@ use crate::vote::ref_vote::RefVote;
 /// Operations like [`purge()`] and [`truncate_after()`] are excluded as they remove logs.
 ///
 /// For details on when to use `IOId` vs [`LogIOId`], see: [`IOId`
-/// documentation](crate::docs::data::io_id).
+/// documentation](https://docs.rs/openraft/0.10.0-alpha.37/openraft/docs/data/io_id/index.html).
 ///
 /// [`RaftLogStorage`]: `crate::storage::RaftLogStorage`
 /// [`save_vote()`]: `crate::storage::RaftLogStorage::save_vote()`

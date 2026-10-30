@@ -3,12 +3,6 @@
 The timer now uses slab-owned entries and forbids unsafe code. The benchmark
 uses only public APIs, explicit advancement, and Criterion 0.8 with plotting
 and parallel analysis disabled. It performs no I/O or wall-clock sleeps.
-Historical measurements are in [BASELINE.md](BASELINE.md); the ownership
-migration's timing and heap measurements are in [ARENA.md](ARENA.md).
-Instruction, memory-reference, inlining, and page-fault attribution is in
-[ATTRIBUTION.md](ATTRIBUTION.md), with a fixed-work probe and gated perf runner.
-Applied optimizations and their measurements are in
-[OPPORTUNITIES.md](OPPORTUNITIES.md).
 
 ## Running
 
@@ -32,25 +26,6 @@ Keep source, compiler, flags, CPU affinity, sample settings, and background load
 fixed. Affinity within this VM does not isolate the host CPU. Unchanged-binary
 repeats previously drifted substantially; confirm small differences on a stable
 machine or with additional instruction/cache evidence.
-
-Preserve named historical baselines: `intrusive-b0a64f3` predates the entry
-cleanup; `specialized-entry-list` captures the pointer-based implementation
-after that cleanup; `slab-owned-arena` captures the initial ownership change;
-`slab-owned-optimized` captures the subsequent three hot-path optimizations.
-The new rearm cases and selected hot paths also have a focused
-`before-arena-matched` baseline from an isolated copy of commit b5b9a22.
-
-To replay a comparison without new timing, filter to cases present in both:
-
-```sh
-cargo bench -p shep-smp2 --bench timers -- \
-  '^(register|cancel|reset_extend|reset_shorten|churn|poll_pending|is_elapsed)/' \
-  --load-baseline slab-owned-arena --baseline specialized-entry-list --noplot
-```
-
-[Criterion's guide](https://criterion-rs.github.io/book/user_guide/command_line_options.html#baselines)
-describes baseline options. Separate worktrees should keep compiled Cargo targets
-separate and set `CRITERION_HOME` to the same absolute results directory.
 
 Useful shorter checks:
 
@@ -101,18 +76,6 @@ Wheel-only cases use a noop waker. The Arc counter case measures real wake
 lifetime work separately; executor cases use the task module's actual wakers and
 queue. This is component integration without reactor I/O or OS wake latency.
 Preflight assertions and benchmark smoke runs check fixture behavior.
-
-## Retained heap snapshots
-
-These snapshots came from a one-shot `arena_memory` example that forgot the
-selected owners so DHAT's end-of-process live heap represented one phase (empty,
-live, expired, or freed consumers). The example has been removed; recover it
-from git history to rerun the measurement.
-
-The historical snapshots used 48-byte Sleep values. Sharing the epoch now makes
-`size_of::<Sleep>()` 32 bytes; each reserved slot still uses 56 bytes on x86_64. The full arena can reduce total live bytes, but reservations
-and the high-water capacity remain allocated after consumers disappear. See
-[the measured table](ARENA.md) before interpreting future size as total savings.
 
 ## Correctness
 

@@ -301,7 +301,7 @@ where
     ///
     /// If the effective membership is from a conflicting log,
     /// the membership state has to revert to the last committed membership config.
-    /// See: [Effective-membership](crate::docs::data::effective_membership)
+    /// See: [Effective-membership](https://docs.rs/openraft/0.10.0-alpha.37/openraft/docs/data/effective_membership/index.html)
     ///
     /// ```text
     /// committed_membership, ... since, ... effective_membership // log

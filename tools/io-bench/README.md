@@ -6,11 +6,6 @@ not a Kafka, Raft, record-format, or recovery benchmark. Redpanda's existing
 `segment_appender_rpbench` uses a fake in-memory file, so it cannot answer the
 real-disk question.
 
-The [initial measured results](RESULTS.md) include native-polling and
-parked-reactor runs, latency/CPU tradeoffs, and the exact reproduction commands.
-The [streaming investigation](STREAMING.md) adds longer runs, a CPU-bound
-diagnostic, and an isolated test of cooperative scheduling.
-
 ## Run
 
 Install Bazelisk and Redpanda's system build prerequisites using the instructions

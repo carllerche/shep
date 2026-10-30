@@ -22,7 +22,7 @@
 //! - [`leader_id_std`] - Standard Raft: one leader per term
 //! - [`leader_id_adv`] - Advanced mode: multiple leaders per term (reduces election conflicts)
 //!
-//! See the [leader ID documentation](crate::docs::data::leader_id) for details.
+//! See the [leader ID documentation](https://docs.rs/openraft/0.10.0-alpha.37/openraft/docs/data/leader_id/index.html) for details.
 
 pub(crate) mod committed;
 pub(crate) mod leader_id;

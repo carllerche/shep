@@ -15,7 +15,7 @@ Unsupported initialization and opcode errors are returned without a fallback.
 The io module denies unsafe code; only its private driver and fd modules opt in.
 Io, arena, lifecycle, operations and buffers each forbid unsafe code. Both higher layers
 forbid unsafe code too. The three unsafe blocks publish operation/cancellation SQEs and adopt owned
-file descriptors. See [the safety boundary](../crates/shep-smp2/docs/io/SAFETY.md).
+file descriptors. Public ownership and shutdown contracts are documented in `shep_smp2::io`.
 Production dependencies have no Tokio runtime. Existing task internals retain
 their separate unsafe implementation and upstream attribution.
 
@@ -211,9 +211,7 @@ ownership. The [13-case runtime benchmarks](../crates/shep-smp2/benches/README.m
 cover scheduling, timers, foreign handoff, file batches and parking.
 [Thirteen driver-only cases](../crates/shep-smp2/benches/io/README.md) isolate
 batching, owned-buffer reuse, ignored completions, identity pins and real
-cancellation at several abandonment rates. Historical
-archives retain their original source paths and hashes, including the former
-io2-core crate and former core module. They are measurement records.
+cancellation at several abandonment rates.
 
 Correctness tests synchronize on observable events: first pending polls,
 completion retirement, worker-job fences, and producer/consumer acknowledgements.
@@ -233,36 +231,3 @@ filesystem resource close/flush APIs, filesystem metadata policy, RPC integratio
 and shep-smp-io-scheduler2. Native thread-per-core orchestration and `submit_to`
 are implemented in `shep_smp2::smp`; service lifecycle and consumer migration
 remain higher-level work.
-
-## Operation ownership changes
-
-The Monoio ownership proposal is implemented with these decisions:
-
-- Keep concrete inputs in typed owners during normal execution; box only inputs
-  needed after unfinished abandonment. Adopt returned descriptors at retirement.
-- Remove file activity accounting, File::shutdown and generic completion guards.
-  Application shutdown coordination belongs above smp.
-- Keep safe RefCell borrowing, per-CQE effects outside borrows, cancellation pins,
-  bounded publication pressure, and owned inputs on rejection.
-- Require callers to coordinate completion before shutdown. Keep best-effort
-  cancellation and terminal retirement in driver destruction as the memory-safety
-  fallback; abort the process if teardown fails to establish safe retirement.
-  Unresolved work alone does not trigger immediate abort. Runtime shutdown remains
-  an explicit higher-level coordinator; it cancels its watch before drain. Closing
-  the ring alone is not proof that kernel access to inputs has ended.
-- Use sealed conversions through the existing Operation dispatcher at publication;
-  no custom raw-SQE or unsafe buffer interface is added.
-
-On x86_64 with rustc 1.97.1, Record and its slab slot shrink from 128 to 48 bytes.
-Op<ReadAt> is 72 bytes (56 bytes of data plus owner bookkeeping), while the enum
-owner is 88 bytes. Thus minimal read bookkeeping is 120 bytes, versus the old
-128-byte record + 16-byte Pending + 8-byte guard allocation = 152 bytes. These
-figures exclude buffer storage, shared resources, allocator overhead and enclosing
-future frames; the owner data has moved, not disappeared. See the driver benchmark
-README for complete future sizes and validation.
-
-Native allocation tests reserve arena capacity and construct buffers/resources
-before measuring. Normal typed read/write submission, retirement and consumption
-allocate zero times. Unfinished read abandonment allocates once; completed pinned
-abandonment allocates zero times. Explicit cancellation and abandonment of the
-cancellation owner allocate zero times. Arena growth remains amortized allocation.
